@@ -1,0 +1,34 @@
+[package]
+name = "opencode-bill"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Generate a bill for an OpenCode session"
+
+[package.metadata]
+section = "Utilities"
+
+[package.metadata.generate-rpm]
+name = "opencode-bill"
+release = "1"
+license = "MIT"
+description = "Generate a bill for OpenCode sessions"
+vendor = "julian"
+url = "https://github.com/juliankahlert/opencode-bill"
+
+[[package.metadata.generate-rpm.assets]]
+dest = "/usr/bin/"
+source = "target/release/opencode-bill"
+
+[dependencies]
+clap = "4.6.1"
+directories = "6.0.0"
+env_logger = "0.11.11"
+log = "0.4.33"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tempfile = "3.27.0"
