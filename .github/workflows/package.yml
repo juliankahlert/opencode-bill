@@ -57,75 +57,19 @@ jobs:
           version: 0.15.2
 
       - name: Install system tools
-        run: |
-          set -eu
-
-          sudo apt-get update
-          sudo apt-get install --yes binutils cpio rpm
+        run: sh scripts/ci/package.sh install-system-tools
 
       - name: Install Cargo tools
-        run: |
-          set -eu
-
-          cargo install --locked cargo-zigbuild@0.23.0
-          cargo install --locked cargo-deb@3.7.0
-          cargo install --locked cargo-generate-rpm@0.21.0
+        run: sh scripts/ci/package.sh install-cargo-tools
 
       - name: Build static binary
-        run: |
-          set -eu
-
-          cargo zigbuild --locked --release --target "$TARGET"
-          test -x "$BINARY"
-          readelf -hW "$BINARY" | grep -q "Machine:.*$ELF_MACHINE"
-
-          if readelf -lW "$BINARY" | grep -q INTERP; then
-            printf '%s\n' "binary has a dynamic interpreter" >&2
-            exit 1
-          fi
-
-          if readelf -dW "$BINARY" | grep -q '(NEEDED)'; then
-            printf '%s\n' "binary has a shared-library dependency" >&2
-            exit 1
-          fi
+        run: sh scripts/ci/package.sh build
 
       - name: Build packages
-        run: |
-          set -eu
-
-          mkdir -p dist
-          cargo deb --locked --no-build --no-strip --target "$TARGET" --output dist
-          cargo generate-rpm --target "$TARGET" --arch "$RPM_ARCH" --auto-req disabled --output dist
+        run: sh scripts/ci/package.sh package
 
       - name: Verify packages
-        run: |
-          set -eu
-
-          set -- dist/*.deb
-          test "$#" -eq 1
-          test -f "$1"
-          deb=$1
-
-          set -- dist/*.rpm
-          test "$#" -eq 1
-          test -f "$1"
-          rpm=$1
-
-          test "$(dpkg-deb --field "$deb" Architecture)" = "$DEB_ARCH"
-          test "$(rpm --query --package --queryformat '%{ARCH}' "$rpm")" = "$RPM_ARCH"
-
-          verify_dir=$(mktemp -d)
-          trap 'rm -rf "$verify_dir"' 0 HUP INT TERM
-          mkdir -p "$verify_dir/deb-root" "$verify_dir/rpm-root"
-          dpkg-deb --extract "$deb" "$verify_dir/deb-root"
-          rpm2cpio "$rpm" > "$verify_dir/package.cpio"
-          (
-            cd "$verify_dir/rpm-root"
-            cpio --quiet -id < "$verify_dir/package.cpio"
-          )
-
-          cmp "$BINARY" "$verify_dir/deb-root/usr/bin/opencode-bill"
-          cmp "$BINARY" "$verify_dir/rpm-root/usr/bin/opencode-bill"
+        run: sh scripts/ci/package.sh verify
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
