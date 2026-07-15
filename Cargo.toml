@@ -8,17 +8,33 @@ description = "Generate a bill for an OpenCode session"
 [package.metadata]
 section = "Utilities"
 
+[package.metadata.deb]
+maintainer = "Julian Kahlert <90937526+juliankahlert@users.noreply.github.com>"
+copyright = "2026, Julian Kahlert"
+extended-description = "Generates a plain-text bill summarizing usage and cost for an OpenCode AI coding session."
+revision = "1"
+section = "utils"
+priority = "optional"
+depends = []
+assets = [
+    ["target/release/opencode-bill", "usr/bin/opencode-bill", "755"],
+]
+
 [package.metadata.generate-rpm]
 name = "opencode-bill"
 release = "1"
 license = "MIT"
-description = "Generate a bill for OpenCode sessions"
-vendor = "julian"
+summary = "Generate a bill for OpenCode sessions"
+vendor = "Julian Kahlert"
 url = "https://github.com/juliankahlert/opencode-bill"
+auto-req = "disabled"
+require-sh = false
 
 [[package.metadata.generate-rpm.assets]]
-dest = "/usr/bin/"
 source = "target/release/opencode-bill"
+dest = "/usr/bin/opencode-bill"
+mode = "755"
+
 [profile.release]
 strip = "symbols"
 
