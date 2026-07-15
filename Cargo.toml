@@ -19,6 +19,8 @@ url = "https://github.com/juliankahlert/opencode-bill"
 [[package.metadata.generate-rpm.assets]]
 dest = "/usr/bin/"
 source = "target/release/opencode-bill"
+[profile.release]
+strip = "symbols"
 
 [dependencies]
 clap = "4.6.1"
