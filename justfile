@@ -48,7 +48,7 @@ install-rpm:
         echo "No .rpm found. Run: just build-rpm"; \
         exit 1; \
     fi; \
-    sudo rpm -U "$rpm"
+    sudo rpm -U --replacepkgs "$rpm"
 
 # Uninstall the package
 uninstall:
