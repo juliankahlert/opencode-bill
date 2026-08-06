@@ -3,17 +3,33 @@ opencode-bill
 
 Generate a plain-text bill for an OpenCode AI coding session.
 
-Reads token usage from OpenCode's SQLite session database (or legacy
-JSON storage), looks up pricing from the GitHub Copilot model pricing
+Reads token usage and timing from OpenCode's SQLite session database (or
+legacy JSON storage), looks up pricing from the GitHub Copilot model pricing
 page, and prints a formatted bill to stdout.
 
 Sections in the bill include:
 
   * Session ID, title, and message count
-  * Usage per provider / model (tokens and cost)
-  * Usage per agent (tokens and cost)
+  * Usage per provider / model (tokens, cost, API time, wall time)
+  * Usage per agent (tokens, cost, API time, wall time)
   * Pricing table for each model used
-  * Totals
+  * Totals, including total API time, session start and end, and wall time
+
+Timing is derived from the `time.created` / `time.completed` timestamps that
+OpenCode records per message, and the `state.time.start` / `state.time.end`
+timestamps it records per tool part. API time is the summed duration of every
+assistant (model) call, minus the time those calls spent waiting on tools:
+only time spent waiting on the model endpoint is counted. Tool calls that run
+in parallel are merged before being subtracted, and a tool that outlives its
+message is clamped to it. Wall time in the TOTAL section is the span from the
+first to the last message of the session, including user messages. Wall time
+in the per-model and per-agent rows is the span from the first to the last
+assistant call of that model or agent class; because sub-agents run in
+parallel these spans overlap, so they do not add up to the session wall time.
+
+The session start and end timestamps are printed in the local time zone of the
+machine rendering the bill, with the UTC offset appended. Systems without a
+usable time zone fall back to UTC.
 
 Install
 -------
