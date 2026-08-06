@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use chrono::{DateTime, Local};
 use directories::BaseDirs;
 use log::{debug, warn};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -18,6 +19,7 @@ const HTTP_TIMEOUT_SECONDS: u64 = 5;
 const MINIMUM_REFERENCE_LENGTH: usize = 6;
 const MODELS_FILE: &str = "models.json";
 const USER_AGENT: &str = concat!("opencode-bill/", env!("CARGO_PKG_VERSION"));
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S %:z";
 const THOUSAND: u64 = 1_000;
 const MILLION: u64 = 1_000_000;
 
@@ -161,9 +163,12 @@ enum SessionData {
         session_count: usize,
         session_agents: BTreeMap<String, String>,
         messages: Vec<MessageUsage>,
+        wall_start: Option<u64>,
+        wall_end: Option<u64>,
     },
 }
 
+#[derive(Clone)]
 enum MessageUsage {
     Assistant {
         session_id: String,
@@ -176,7 +181,20 @@ enum MessageUsage {
         cache_read: u64,
         cache_write: u64,
         cost: f64,
+        api_ms: u64,
+        created: Option<u64>,
+        completed: Option<u64>,
     },
+}
+
+/// Millisecond spans of the tool calls made from one assistant message.
+type ToolSpans = BTreeMap<String, Vec<(u64, u64)>>;
+
+/// Assistant messages plus the wall-clock bounds of every message read.
+struct MessageLoad {
+    messages: Vec<MessageUsage>,
+    wall_start: Option<u64>,
+    wall_end: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +206,9 @@ struct Totals {
     cache_read: u64,
     cache_write: u64,
     cost: f64,
+    api_ms: u64,
+    wall_start: Option<u64>,
+    wall_end: Option<u64>,
 }
 
 enum MissingTotals {}
@@ -202,6 +223,9 @@ struct TotalsBuilder<State> {
     cache_read: u64,
     cache_write: u64,
     cost: f64,
+    api_ms: u64,
+    wall_start: Option<u64>,
+    wall_end: Option<u64>,
     state: PhantomData<State>,
 }
 
@@ -220,6 +244,9 @@ impl Totals {
             cache_read: 0,
             cache_write: 0,
             cost: 0.0,
+            api_ms: 0,
+            wall_start: None,
+            wall_end: None,
             state: PhantomData,
         }
     }
@@ -235,6 +262,9 @@ impl TotalsBuilder<MissingTotals> {
             cache_read: self.cache_read,
             cache_write: self.cache_write,
             cost: self.cost,
+            api_ms: self.api_ms,
+            wall_start: self.wall_start,
+            wall_end: self.wall_end,
             state: PhantomData,
         }
     }
@@ -250,6 +280,9 @@ impl TotalsBuilder<TotalsSet> {
             cache_read: self.cache_read,
             cache_write: self.cache_write,
             cost: self.cost,
+            api_ms: self.api_ms,
+            wall_start: self.wall_start,
+            wall_end: self.wall_end,
         }
     }
 }
@@ -307,7 +340,11 @@ fn load_database_session(path: &Path, reference: &str) -> Result<SessionData, Bi
     let title = database_title(&connection, path, &id)?;
     let session_count = database_session_count(&connection, path, &id)?;
     let session_agents = database_session_agents(&connection, path, &id)?;
-    let messages = database_messages(&connection, path, &id, &session_agents)?;
+    let MessageLoad {
+        messages,
+        wall_start,
+        wall_end,
+    } = database_messages(&connection, path, &id, &session_agents)?;
 
     debug!(
         "loaded {} assistant messages from {session_count} SQLite sessions",
@@ -319,6 +356,8 @@ fn load_database_session(path: &Path, reference: &str) -> Result<SessionData, Bi
         session_count,
         session_agents,
         messages,
+        wall_start,
+        wall_end,
     })
 }
 
@@ -360,7 +399,7 @@ fn database_messages(
     path: &Path,
     id: &str,
     session_agents: &BTreeMap<String, String>,
-) -> Result<Vec<MessageUsage>, BillError> {
+) -> Result<MessageLoad, BillError> {
     let mut statement = connection
         .prepare(
             r#"WITH RECURSIVE descendants(id) AS (
@@ -369,9 +408,89 @@ fn database_messages(
                    SELECT session.id FROM session
                    JOIN descendants ON session.parent_id = descendants.id
                )
-               SELECT message.session_id, message.data FROM message
+               SELECT message.id, message.session_id, message.data FROM message
                JOIN descendants ON message.session_id = descendants.id
                ORDER BY message.time_created, message.id"#,
+        )
+        .map_err(|source| database_error(path, source))?;
+    let rows = statement
+        .query_map(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|source| database_error(path, source))?;
+    let location = path.display().to_string();
+    let tools = database_tool_spans(connection, path, id)?;
+    let mut messages = Vec::new();
+    let mut wall_start = None;
+    let mut wall_end = None;
+
+    for row in rows {
+        let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
+        let value = parse_json(&json, &location)?;
+        let (created, completed) = message_time(&value);
+
+        wall_start = earliest(wall_start, created);
+        wall_end = latest(wall_end, completed.or(created));
+
+        if let Some(message) = parse_assistant(
+            &value,
+            &location,
+            &session_id,
+            session_agents.get(&session_id).map(String::as_str),
+            tools.get(&message_id).map_or(&[][..], Vec::as_slice),
+        )? {
+            messages.push(message);
+        }
+    }
+
+    Ok(MessageLoad {
+        messages,
+        wall_start,
+        wall_end,
+    })
+}
+
+fn database_has_table(
+    connection: &Connection,
+    path: &Path,
+    table: &str,
+) -> Result<bool, BillError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(|source| database_error(path, source))
+}
+
+/// Collects the tool-call spans of every message in the session tree.
+fn database_tool_spans(
+    connection: &Connection,
+    path: &Path,
+    id: &str,
+) -> Result<ToolSpans, BillError> {
+    if !database_has_table(connection, path, "part")? {
+        warn!("no 'part' table: API time will still include tool calls");
+        return Ok(ToolSpans::new());
+    }
+
+    let mut statement = connection
+        .prepare(
+            r#"WITH RECURSIVE descendants(id) AS (
+                   SELECT id FROM session WHERE id = ?1
+                   UNION
+                   SELECT session.id FROM session
+                   JOIN descendants ON session.parent_id = descendants.id
+               )
+               SELECT part.message_id, part.data FROM part
+               JOIN descendants ON part.session_id = descendants.id"#,
         )
         .map_err(|source| database_error(path, source))?;
     let rows = statement
@@ -380,22 +499,18 @@ fn database_messages(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let mut messages = Vec::new();
+    let mut spans = ToolSpans::new();
 
     for row in rows {
-        let (session_id, json) = row.map_err(|source| database_error(path, source))?;
+        let (message_id, json) = row.map_err(|source| database_error(path, source))?;
+        let value = parse_json(&json, &location)?;
 
-        if let Some(message) = parse_message(
-            &json,
-            &location,
-            &session_id,
-            session_agents.get(&session_id).map(String::as_str),
-        )? {
-            messages.push(message);
+        if let Some(span) = tool_span(&value) {
+            spans.entry(message_id).or_default().push(span);
         }
     }
 
-    Ok(messages)
+    Ok(spans)
 }
 
 fn database_session_agents(
@@ -490,9 +605,19 @@ fn load_legacy_session(storage: &Path, reference: &str) -> Result<SessionData, B
     let session_ids = legacy_descendant_ids(&session_root, &id)?;
     let session_agents = BTreeMap::new();
     let mut messages = Vec::new();
+    let mut wall_start = None;
+    let mut wall_end = None;
 
     for session_id in &session_ids {
-        messages.extend(legacy_messages(storage, session_id)?);
+        let MessageLoad {
+            messages: loaded,
+            wall_start: start,
+            wall_end: end,
+        } = legacy_messages(storage, session_id)?;
+
+        messages.extend(loaded);
+        wall_start = earliest(wall_start, start);
+        wall_end = latest(wall_end, end);
     }
 
     debug!(
@@ -506,6 +631,8 @@ fn load_legacy_session(storage: &Path, reference: &str) -> Result<SessionData, B
         session_count: session_ids.len(),
         session_agents,
         messages,
+        wall_start,
+        wall_end,
     })
 }
 
@@ -579,12 +706,18 @@ fn legacy_descendant_ids(root: &Path, root_id: &str) -> Result<BTreeSet<String>,
     Ok(descendants)
 }
 
-fn legacy_messages(storage: &Path, session_id: &str) -> Result<Vec<MessageUsage>, BillError> {
+fn legacy_messages(storage: &Path, session_id: &str) -> Result<MessageLoad, BillError> {
     let root = storage.join("message").join(session_id);
     let mut messages = Vec::new();
+    let mut wall_start = None;
+    let mut wall_end = None;
 
     if !root.is_dir() {
-        return Ok(messages);
+        return Ok(MessageLoad {
+            messages,
+            wall_start,
+            wall_end,
+        });
     }
 
     for entry in read_directory(&root)? {
@@ -596,14 +729,54 @@ fn legacy_messages(storage: &Path, session_id: &str) -> Result<Vec<MessageUsage>
         }
 
         let json = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
+        let location = path.display().to_string();
+        let value = parse_json(&json, &location)?;
+        let (created, completed) = message_time(&value);
 
-        if let Some(message) = parse_message(&json, &path.display().to_string(), session_id, None)?
-        {
+        wall_start = earliest(wall_start, created);
+        wall_end = latest(wall_end, completed.or(created));
+
+        let message_id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let tools = legacy_tool_spans(storage, message_id)?;
+
+        if let Some(message) = parse_assistant(&value, &location, session_id, None, &tools)? {
             messages.push(message);
         }
     }
 
-    Ok(messages)
+    Ok(MessageLoad {
+        messages,
+        wall_start,
+        wall_end,
+    })
+}
+
+/// Collects the tool-call spans stored alongside one legacy JSON message.
+fn legacy_tool_spans(storage: &Path, message_id: &str) -> Result<Vec<(u64, u64)>, BillError> {
+    let root = storage.join("part").join(message_id);
+    let mut spans = Vec::new();
+
+    if !root.is_dir() {
+        return Ok(spans);
+    }
+
+    for entry in read_directory(&root)? {
+        let entry = entry.map_err(|source| read_error(&root, source))?;
+        let path = entry.path();
+
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+
+        if let Some(span) = tool_span(&read_json(&path)?) {
+            spans.push(span);
+        }
+    }
+
+    Ok(spans)
 }
 
 fn read_directory(path: &Path) -> Result<fs::ReadDir, BillError> {
@@ -673,17 +846,93 @@ impl MatchName for PathBuf {
     }
 }
 
-fn parse_message(
-    json: &str,
+fn parse_json(json: &str, location: &str) -> Result<Value, BillError> {
+    serde_json::from_str(json).map_err(|failure| BillError::InvalidData {
+        location: location.to_owned(),
+        detail: failure.to_string(),
+    })
+}
+
+fn message_time(value: &Value) -> (Option<u64>, Option<u64>) {
+    let time = value.get("time");
+
+    (
+        time.and_then(|value| value.get("created"))
+            .and_then(Value::as_u64),
+        time.and_then(|value| value.get("completed"))
+            .and_then(Value::as_u64),
+    )
+}
+
+fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+    [first, second].into_iter().flatten().min()
+}
+
+fn latest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+    [first, second].into_iter().flatten().max()
+}
+
+/// Returns the busy span of a tool part, if it ran to completion.
+fn tool_span(value: &Value) -> Option<(u64, u64)> {
+    if value.get("type").and_then(Value::as_str) != Some("tool") {
+        return None;
+    }
+
+    let time = value.get("state").and_then(|state| state.get("time"))?;
+    let start = time.get("start").and_then(Value::as_u64)?;
+    let end = time.get("end").and_then(Value::as_u64)?;
+
+    (end > start).then_some((start, end))
+}
+
+/// API time of one assistant message: its span minus the time spent in tools.
+///
+/// Tool spans overlap when calls run in parallel, so they are merged before
+/// being subtracted. Spans are clamped to the message so a tool that outlives
+/// its message cannot push the result below zero.
+fn message_api_ms(created: Option<u64>, completed: Option<u64>, tools: &[(u64, u64)]) -> u64 {
+    let (start, end) = match (created, completed) {
+        (Some(start), Some(end)) if end > start => (start, end),
+        _ => return 0,
+    };
+    let mut spans = tools
+        .iter()
+        .map(|(open, close)| ((*open).clamp(start, end), (*close).clamp(start, end)))
+        .filter(|(open, close)| close > open)
+        .collect::<Vec<_>>();
+
+    spans.sort_unstable();
+
+    let mut busy: u64 = 0;
+    let mut current: Option<(u64, u64)> = None;
+
+    for (open, close) in spans {
+        match current {
+            Some((_, ref mut merged_close)) if open <= *merged_close => {
+                *merged_close = (*merged_close).max(close);
+            }
+            Some((merged_open, merged_close)) => {
+                busy += merged_close - merged_open;
+                current = Some((open, close));
+            }
+            None => current = Some((open, close)),
+        }
+    }
+
+    if let Some((merged_open, merged_close)) = current {
+        busy += merged_close - merged_open;
+    }
+
+    (end - start).saturating_sub(busy)
+}
+
+fn parse_assistant(
+    value: &Value,
     location: &str,
     session_id: &str,
     session_agent: Option<&str>,
+    tools: &[(u64, u64)],
 ) -> Result<Option<MessageUsage>, BillError> {
-    let value: Value = serde_json::from_str(json).map_err(|failure| BillError::InvalidData {
-        location: location.to_owned(),
-        detail: failure.to_string(),
-    })?;
-
     if value.get("role").and_then(Value::as_str) != Some("assistant") {
         return Ok(None);
     }
@@ -694,9 +943,9 @@ fn parse_message(
     let cache = tokens
         .get("cache")
         .ok_or_else(|| invalid_field(location, "tokens.cache"))?;
-    let provider = required_string(&value, "providerID", location)?;
-    let model = required_string(&value, "modelID", location)?;
-    let cost = required_f64(&value, "cost", location)?;
+    let provider = required_string(value, "providerID", location)?;
+    let model = required_string(value, "modelID", location)?;
+    let cost = required_f64(value, "cost", location)?;
     let input = required_u64(tokens, "input", location)?;
     let output = required_u64(tokens, "output", location)?;
     let reasoning = required_u64(tokens, "reasoning", location)?;
@@ -708,6 +957,7 @@ fn parse_message(
         .filter(|agent| !agent.is_empty())
         .unwrap_or("unknown")
         .to_owned();
+    let (created, completed) = message_time(value);
 
     if !cost.is_finite() || cost < 0.0 {
         return Err(invalid_field(
@@ -727,6 +977,9 @@ fn parse_message(
         cache_read,
         cache_write,
         cost,
+        api_ms: message_api_ms(created, completed, tools),
+        created,
+        completed,
     }))
 }
 
@@ -954,6 +1207,8 @@ fn render_bill(context: &StorageContext, session: SessionData) -> Result<String,
         session_count,
         session_agents,
         messages,
+        wall_start,
+        wall_end,
     } = session;
     let agent_usage = aggregate_agents(&messages, &session_agents);
     let usage = aggregate(messages);
@@ -979,6 +1234,8 @@ fn render_bill(context: &StorageContext, session: SessionData) -> Result<String,
             "CACHE WRITE",
             "OUTPUT",
             "REASONING",
+            "API TIME",
+            "WALL TIME",
             "COST (USD)",
         ],
         &usage_rows,
@@ -997,6 +1254,8 @@ fn render_bill(context: &StorageContext, session: SessionData) -> Result<String,
             "CACHE WRITE",
             "OUTPUT",
             "REASONING",
+            "API TIME",
+            "WALL TIME",
             "COST (USD)",
         ],
         &agent_rows,
@@ -1034,6 +1293,13 @@ fn render_bill(context: &StorageContext, session: SessionData) -> Result<String,
         "Reasoning:   {}\n",
         compact_count(total.reasoning)
     ));
+    output.push_str(&format!("Started:     {}\n", format_timestamp(wall_start)));
+    output.push_str(&format!("Ended:       {}\n", format_timestamp(wall_end)));
+    output.push_str(&format!("API time:    {}\n", format_duration(total.api_ms)));
+    output.push_str(&format!(
+        "Wall time:   {}\n",
+        format_duration(span_ms(wall_start, wall_end))
+    ));
     output.push_str(&format!("Amount due:  ${:.6} USD\n", total.cost));
     Ok(output)
 }
@@ -1049,6 +1315,8 @@ fn usage_row(entry: (&ModelKey, &Totals)) -> Vec<String> {
         compact_count(totals.cache_write),
         compact_count(totals.output),
         compact_count(totals.reasoning),
+        format_duration(totals.api_ms),
+        format_duration(span_ms(totals.wall_start, totals.wall_end)),
         format!("${:.6}", totals.cost),
     ]
 }
@@ -1066,6 +1334,8 @@ fn agent_row(entry: (&String, &AgentUsage)) -> Vec<String> {
         compact_count(totals.cache_write),
         compact_count(totals.output),
         compact_count(totals.reasoning),
+        format_duration(totals.api_ms),
+        format_duration(span_ms(totals.wall_start, totals.wall_end)),
         format!("${:.6}", totals.cost),
     ]
 }
@@ -1182,6 +1452,9 @@ fn aggregate(messages: Vec<MessageUsage>) -> BTreeMap<ModelKey, Totals> {
             cache_read,
             cache_write,
             cost,
+            api_ms,
+            created,
+            completed,
         } = message;
         let totals = usage
             .entry((provider, model))
@@ -1194,6 +1467,9 @@ fn aggregate(messages: Vec<MessageUsage>) -> BTreeMap<ModelKey, Totals> {
         totals.cache_read += cache_read;
         totals.cache_write += cache_write;
         totals.cost += cost;
+        totals.api_ms = totals.api_ms.saturating_add(api_ms);
+        totals.wall_start = earliest(totals.wall_start, created);
+        totals.wall_end = latest(totals.wall_end, completed.or(created));
     }
 
     usage
@@ -1221,6 +1497,9 @@ fn aggregate_agents(
             cache_read,
             cache_write,
             cost,
+            api_ms,
+            created,
+            completed,
             ..
         } = message;
         let entry = agent_usage_entry(&mut usage, agent);
@@ -1233,6 +1512,9 @@ fn aggregate_agents(
         entry.totals.cache_read += cache_read;
         entry.totals.cache_write += cache_write;
         entry.totals.cost += cost;
+        entry.totals.api_ms = entry.totals.api_ms.saturating_add(*api_ms);
+        entry.totals.wall_start = earliest(entry.totals.wall_start, *created);
+        entry.totals.wall_end = latest(entry.totals.wall_end, completed.or(*created));
     }
 
     usage
@@ -1256,12 +1538,63 @@ fn add_totals(mut sum: Totals, value: &Totals) -> Totals {
     sum.cache_read += value.cache_read;
     sum.cache_write += value.cache_write;
     sum.cost += value.cost;
+    sum.api_ms = sum.api_ms.saturating_add(value.api_ms);
+    sum.wall_start = earliest(sum.wall_start, value.wall_start);
+    sum.wall_end = latest(sum.wall_end, value.wall_end);
     sum
+}
+
+fn span_ms(start: Option<u64>, end: Option<u64>) -> u64 {
+    match (start, end) {
+        (Some(start), Some(end)) if end > start => end - start,
+        _ => 0,
+    }
+}
+
+/// Renders a Unix millisecond timestamp in the local time zone.
+///
+/// The UTC offset is always printed, so a bill stays readable when it is sent
+/// to somebody in another zone. Systems without a usable zone fall back to
+/// UTC, which prints as `+00:00`.
+fn format_timestamp(millis: Option<u64>) -> String {
+    millis
+        .and_then(|value| i64::try_from(value).ok())
+        .and_then(DateTime::from_timestamp_millis)
+        .map_or_else(
+            || "-".to_owned(),
+            |instant| {
+                instant
+                    .with_timezone(&Local)
+                    .format(TIMESTAMP_FORMAT)
+                    .to_string()
+            },
+        )
+}
+
+fn format_duration(millis: u64) -> String {
+    let seconds = millis / 1000;
+
+    if millis < 1000 {
+        return format!("{millis}ms");
+    }
+
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+
+    let minutes = seconds / 60;
+
+    if minutes < 60 {
+        return format!("{minutes}m {}s", seconds % 60);
+    }
+
+    format!("{}h {}m", minutes / 60, minutes % 60)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::FixedOffset;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -1273,7 +1606,9 @@ mod tests {
         connection.execute_batch(
             "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT);\
              CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,\
-             time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+             time_created INTEGER NOT NULL, data TEXT NOT NULL);\
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,\
+             session_id TEXT NOT NULL, data TEXT NOT NULL);",
         )?;
         connection.execute(
             "INSERT INTO session (id, title) VALUES (?1, ?2)",
@@ -1320,6 +1655,8 @@ mod tests {
                 "1",
                 "4",
                 "2",
+                "0ms",
+                "0ms",
                 "$0.125000"
             ]
         ));
@@ -1334,6 +1671,293 @@ mod tests {
         assert_eq!(compact_count(48_579), "48.6k");
         assert_eq!(compact_count(1_000_000), "1.0M");
         assert_eq!(compact_count(1_958_181), "2.0M");
+    }
+
+    #[test]
+    fn formats_timestamps() {
+        // The zone of the test machine is unknown, so the rendering itself is
+        // checked against explicit offsets.
+        let rendered = |millis, hours| {
+            DateTime::from_timestamp_millis(millis)
+                .unwrap()
+                .with_timezone(&FixedOffset::east_opt(hours * 3600).unwrap())
+                .format(TIMESTAMP_FORMAT)
+                .to_string()
+        };
+
+        assert_eq!(format_timestamp(None), "-");
+        assert_eq!(rendered(1_786_027_829_613, 0), "2026-08-06 14:50:29 +00:00");
+        assert_eq!(rendered(1_786_027_829_613, 2), "2026-08-06 16:50:29 +02:00");
+        // A local date one day behind UTC.
+        assert_eq!(
+            rendered(1_709_164_800_000, -5),
+            "2024-02-28 19:00:00 -05:00"
+        );
+        assert!(format_timestamp(Some(1_786_027_829_613)).starts_with("2026-08-0"));
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(format_duration(0), "0ms");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(3_200), "3s");
+        assert_eq!(format_duration(65_000), "1m 5s");
+        assert_eq!(format_duration(3_661_000), "1h 1m");
+    }
+
+    #[test]
+    fn reports_api_and_wall_time() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute("ALTER TABLE session ADD COLUMN agent TEXT", [])?;
+        connection.execute(
+            "UPDATE session SET agent = ?1 WHERE id = ?2",
+            params!["build", "ses_abcdef123456"],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_2",
+                "ses_abcdef123456",
+                2,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.125,"time":{"created":2000,"completed":5000},"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_3",
+                "ses_abcdef123456",
+                3,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.125,"time":{"created":3000,"completed":7000},"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_bill(&context, "ses_abcdef")?;
+
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "3",
+                "30",
+                "18",
+                "3",
+                "12",
+                "6",
+                "7s",
+                "5s",
+                "$0.375000"
+            ]
+        ));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "build",
+                "1",
+                "3",
+                "30",
+                "18",
+                "3",
+                "12",
+                "6",
+                "7s",
+                "5s",
+                "$0.375000"
+            ]
+        ));
+        assert!(bill.contains("API time:    7s"));
+        assert!(bill.contains("Wall time:   5s"));
+        Ok(())
+    }
+
+    #[test]
+    fn excludes_tool_calls_from_api_time() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "UPDATE message SET data = ?1 WHERE id = ?2",
+            params![
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.125,"time":{"created":1000,"completed":11000},"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#,
+                "msg_1"
+            ],
+        )?;
+
+        // Two overlapping tool calls spanning 2000..6000 plus one from 8000..9000
+        // leave 10s - 5s = 5s of API time.
+        for (id, data) in [
+            (
+                "prt_1",
+                r#"{"type":"tool","state":{"status":"completed","time":{"start":2000,"end":5000}}}"#,
+            ),
+            (
+                "prt_2",
+                r#"{"type":"tool","state":{"status":"completed","time":{"start":3000,"end":6000}}}"#,
+            ),
+            (
+                "prt_3",
+                r#"{"type":"tool","state":{"status":"completed","time":{"start":8000,"end":9000}}}"#,
+            ),
+            ("prt_4", r#"{"type":"text","text":"not a tool call"}"#),
+        ] {
+            connection.execute(
+                "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+                params![id, "msg_1", "ses_abcdef123456", data],
+            )?;
+        }
+        drop(connection);
+
+        let bill = generate_bill(&context, "ses_abcdef")?;
+
+        assert!(bill.contains("API time:    5s"));
+        assert!(bill.contains("Wall time:   10s"));
+        Ok(())
+    }
+
+    #[test]
+    fn caps_tool_time_at_the_message_span() {
+        // A tool that outlives its message cannot drive API time negative.
+        assert_eq!(message_api_ms(Some(0), Some(1000), &[(500, 9000)]), 500);
+        assert_eq!(message_api_ms(Some(0), Some(1000), &[(0, 9000)]), 0);
+        // An unfinished message has no measurable API time.
+        assert_eq!(message_api_ms(Some(0), None, &[]), 0);
+    }
+
+    #[test]
+    fn includes_user_messages_in_wall_time() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_user",
+                "ses_abcdef123456",
+                0,
+                r#"{"role":"user","time":{"created":500}}"#
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_2",
+                "ses_abcdef123456",
+                2,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.125,"time":{"created":2000,"completed":5000},"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_3",
+                "ses_abcdef123456",
+                3,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.125,"time":{"created":3000,"completed":7000},"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_user_end",
+                "ses_abcdef123456",
+                4,
+                r#"{"role":"user","time":{"created":9000}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_bill(&context, "ses_abcdef")?;
+
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "3",
+                "30",
+                "18",
+                "3",
+                "12",
+                "6",
+                "7s",
+                "5s",
+                "$0.375000"
+            ]
+        ));
+        assert!(bill.contains("API time:    7s"));
+        assert!(bill.contains("Wall time:   8s"));
+        Ok(())
+    }
+
+    #[test]
+    fn saturates_api_time_on_extreme_spans() {
+        let message = MessageUsage::Assistant {
+            session_id: "ses".to_owned(),
+            agent: "build".to_owned(),
+            provider: "openai".to_owned(),
+            model: "gpt-test".to_owned(),
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost: 0.0,
+            api_ms: u64::MAX,
+            created: Some(0),
+            completed: Some(u64::MAX),
+        };
+
+        let usage = aggregate(vec![message.clone(), message.clone()]);
+        let total = usage
+            .values()
+            .fold(Totals::builder().zeroed().build(), add_totals);
+
+        assert_eq!(total.api_ms, u64::MAX);
+    }
+
+    #[test]
+    fn reports_time_from_legacy_json() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let session_id = "ses_legacy123456";
+        let session_dir = temporary.path().join("storage/session/project");
+        let message_dir = temporary.path().join("storage/message").join(session_id);
+
+        fs::create_dir_all(&session_dir)?;
+        fs::create_dir_all(&message_dir)?;
+        fs::write(
+            session_dir.join(format!("{session_id}.json")),
+            format!(r#"{{"id":"{session_id}","title":"Legacy session"}}"#),
+        )?;
+        fs::write(
+            message_dir.join("msg_1.json"),
+            r#"{"role":"assistant","agent":"legacy-agent","providerID":"anthropic","modelID":"legacy","cost":0.25,"time":{"created":1000,"completed":4000},"tokens":{"input":20,"output":8,"reasoning":1,"cache":{"read":4,"write":2}}}"#,
+        )?;
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .build()?;
+        let bill = generate_bill(&context, "ses_legacy")?;
+
+        assert!(has_table_row(
+            &bill,
+            &[
+                "anthropic / legacy",
+                "1",
+                "20",
+                "4",
+                "2",
+                "8",
+                "1",
+                "3s",
+                "3s",
+                "$0.250000"
+            ]
+        ));
+        assert!(bill.contains("API time:    3s"));
+        assert!(bill.contains("Wall time:   3s"));
+        Ok(())
     }
 
     #[test]
@@ -1452,6 +2076,8 @@ mod tests {
                 "2",
                 "8",
                 "1",
+                "0ms",
+                "0ms",
                 "$0.250000"
             ]
         ));
@@ -1465,6 +2091,8 @@ mod tests {
                 "1",
                 "16",
                 "5",
+                "0ms",
+                "0ms",
                 "$0.625000"
             ]
         ));
@@ -1473,11 +2101,35 @@ mod tests {
         assert!(bill.contains("USAGE BY AGENT CLASS"));
         assert!(has_table_row(
             &bill,
-            &["build", "1", "1", "10", "6", "1", "4", "2", "$0.125000"]
+            &[
+                "build",
+                "1",
+                "1",
+                "10",
+                "6",
+                "1",
+                "4",
+                "2",
+                "0ms",
+                "0ms",
+                "$0.125000"
+            ]
         ));
         assert!(has_table_row(
             &bill,
-            &["explore", "2", "2", "50", "11", "2", "20", "4", "$0.750000"]
+            &[
+                "explore",
+                "2",
+                "2",
+                "50",
+                "11",
+                "2",
+                "20",
+                "4",
+                "0ms",
+                "0ms",
+                "$0.750000"
+            ]
         ));
         Ok(())
     }
@@ -1558,6 +2210,8 @@ mod tests {
                 "2",
                 "8",
                 "1",
+                "0ms",
+                "0ms",
                 "$0.250000"
             ]
         ));
@@ -1572,6 +2226,8 @@ mod tests {
                 "2",
                 "8",
                 "1",
+                "0ms",
+                "0ms",
                 "$0.250000"
             ]
         ));
@@ -1617,6 +2273,8 @@ mod tests {
                 "1",
                 "10",
                 "2",
+                "0ms",
+                "0ms",
                 "$0.750000"
             ]
         ));
