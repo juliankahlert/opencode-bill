@@ -9,6 +9,15 @@ the GitHub Copilot model pricing page, falls back to a built-in generic
 models.dev-style price list for well-known models when no API pricing is
 available, and prints a formatted bill to stdout.
 
+Pricing is looked up in this order: the local models.json catalog, the
+GitHub Copilot pricing page (for github-copilot provider usage), the
+built-in generic models.dev-style price list, and finally the pricing page
+again by model name regardless of provider. Usage whose recorded cost is
+zero - typical for subscription models, which carry no per-call price - is
+billed at the best known rate for its provider/model pair, so subscription
+usage shows an estimated cost instead of a zero row. Provider corrections
+with negative costs are clamped to zero and never re-priced.
+
 Sections in the bill include:
 
   * Session ID, title, and message count
