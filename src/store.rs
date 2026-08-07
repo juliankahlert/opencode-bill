@@ -3,23 +3,24 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use chrono::NaiveDate;
+
 use crate::data::UsageRecord;
 use crate::error::BillError;
+use crate::report::BillHeader;
 
 /// A session reference must contain at least this many characters.
 const MINIMUM_REFERENCE_LENGTH: usize = 6;
 
-/// One OpenCode session tree with every assistant message it contains.
-pub(crate) struct Session {
-    /// Root session ID.
-    pub(crate) id: String,
-    /// Root session title.
-    pub(crate) title: String,
-    /// Root plus descendant session count.
+/// Everything one bill needs: the period header, usage records, and bounds.
+pub(crate) struct BillInput {
+    /// Identifies the billed period (session tree or calendar month).
+    pub(crate) header: BillHeader,
+    /// Number of sessions that produced the billed usage.
     pub(crate) session_count: usize,
-    /// Agent class declared by each descendant session.
+    /// Agent class declared by each billed session.
     pub(crate) session_agents: BTreeMap<String, String>,
-    /// Every assistant call in the session tree.
+    /// Every assistant call in the billed period.
     pub(crate) messages: Vec<UsageRecord>,
     /// Earliest message timestamp (Unix millis).
     pub(crate) wall_start: Option<u64>,
@@ -27,10 +28,56 @@ pub(crate) struct Session {
     pub(crate) wall_end: Option<u64>,
 }
 
+/// One calendar month of one year, as a billing window.
+pub(crate) struct CalendarMonth {
+    /// Human label, e.g. "February 2026".
+    pub(crate) label: String,
+    /// First millisecond of the month (Unix time).
+    pub(crate) start_ms: u64,
+    /// First millisecond after the month (Unix time).
+    pub(crate) end_ms: u64,
+}
+
+impl CalendarMonth {
+    /// Builds the calendar month with its exact millisecond window.
+    pub(crate) fn new(year: u32, month: u32) -> Result<Self, BillError> {
+        let first = first_day(year, month)?;
+        let (next_year, next_month_number) = if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        };
+        let next_month = first_day(next_year, next_month_number)?;
+        let start_ms = month_midnight(first, year, month)?;
+        let end_ms = month_midnight(next_month, next_year, next_month_number)?;
+
+        Ok(Self {
+            label: first.format("%B %Y").to_string(),
+            start_ms,
+            end_ms,
+        })
+    }
+}
+
+/// First day of a month, or an error when the month does not exist.
+fn first_day(year: u32, month: u32) -> Result<NaiveDate, BillError> {
+    NaiveDate::from_ymd_opt(year as i32, month, 1)
+        .ok_or_else(|| BillError::InvalidMonth(format!("{year}-{month}")))
+}
+
+/// Midnight of a day as Unix milliseconds.
+fn month_midnight(date: NaiveDate, year: u32, month: u32) -> Result<u64, BillError> {
+    date.and_hms_opt(0, 0, 0)
+        .map(|time| time.and_utc().timestamp_millis() as u64)
+        .ok_or_else(|| BillError::InvalidMonth(format!("{year}-{month}")))
+}
+
 /// Wherever session data lives (SQLite or legacy JSON), it loads the same way.
 pub(crate) trait SessionStore {
     /// Resolves a session reference and loads the whole session tree.
-    fn load(&self, reference: &str) -> Result<Session, BillError>;
+    fn load(&self, reference: &str) -> Result<BillInput, BillError>;
+    /// Loads every message recorded in one calendar month.
+    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError>;
 }
 
 /// Assistant messages plus the wall-clock bounds of every message read.

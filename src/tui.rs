@@ -19,7 +19,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use opencode_bill::{BillReport, StorageContext, load_report_with_progress};
+use opencode_bill::{
+    BillHeader, BillReport, StorageContext, load_month_report_with_progress,
+    load_report_with_progress,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Rect};
@@ -58,10 +61,24 @@ enum Progress {
 }
 
 /// Runs the worker that loads the report in the background.
-fn worker(context: StorageContext, reference: String, sender: mpsc::Sender<Progress>) {
-    let result = load_report_with_progress(&context, &reference, |task| {
-        let _ = sender.send(Progress::Task(task.to_owned()));
-    });
+fn worker(
+    context: StorageContext,
+    request: crate::Request,
+    providers: Vec<String>,
+    sender: mpsc::Sender<Progress>,
+) {
+    let result = match request {
+        crate::Request::Session(reference) => {
+            load_report_with_progress(&context, &reference, &providers, |task| {
+                let _ = sender.send(Progress::Task(task.to_owned()));
+            })
+        }
+        crate::Request::Month(year, month) => {
+            load_month_report_with_progress(&context, year, month, &providers, |task| {
+                let _ = sender.send(Progress::Task(task.to_owned()));
+            })
+        }
+    };
 
     let _ = sender.send(Progress::Done(
         result.map_err(|failure| failure.to_string()),
@@ -99,9 +116,14 @@ pub enum TuiOutcome {
 }
 
 /// Runs the TUI and returns an error message when something fails.
-pub fn run(context: StorageContext, reference: String) -> Result<TuiOutcome, String> {
+pub fn run(
+    context: StorageContext,
+    request: crate::Request,
+    providers: Vec<String>,
+) -> Result<TuiOutcome, String> {
     let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || worker(context, reference, sender));
+
+    thread::spawn(move || worker(context, request, providers, sender));
 
     let mut guard = TerminalGuard::enter()?;
     // Start on a fresh row so the viewport does not overwrite the shell prompt line.
@@ -412,6 +434,11 @@ fn draw_failure(frame: &mut Frame, failure: &str) {
 fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
     let mut rows = Vec::new();
 
+    // Month bills carry their label; session bills have no header row here.
+    if let BillHeader::Month { label } = &report.header {
+        rows.push(title_row(label));
+    }
+
     rows.push(header_row(&[
         "PROVIDER / MODEL",
         "REQUESTS",
@@ -421,7 +448,6 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "OUTPUT",
         "REASONING",
         "API TIME",
-        "WALL TIME",
         "COST (USD)",
     ]));
     rows.extend(data_rows(&report.usage_rows));
@@ -438,7 +464,6 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "OUTPUT",
         "REASONING",
         "API TIME",
-        "WALL TIME",
         "COST (USD)",
     ]));
     rows.extend(data_rows(&report.agent_rows));
@@ -659,8 +684,10 @@ mod tests {
 
     fn fixture_report() -> BillReport {
         BillReport {
-            session_id: "ses_abcdef123456".to_owned(),
-            session_title: "Test session".to_owned(),
+            header: BillHeader::Session {
+                id: "ses_abcdef123456".to_owned(),
+                title: "Test session".to_owned(),
+            },
             session_count: 1,
             usage_rows: vec![vec![
                 "openai / gpt-test".to_owned(),
@@ -670,7 +697,6 @@ mod tests {
                 "1".to_owned(),
                 "4".to_owned(),
                 "2".to_owned(),
-                "0ms".to_owned(),
                 "0ms".to_owned(),
                 "$0.125000".to_owned(),
             ]],
@@ -683,7 +709,6 @@ mod tests {
                 "1".to_owned(),
                 "4".to_owned(),
                 "2".to_owned(),
-                "0ms".to_owned(),
                 "0ms".to_owned(),
                 "$0.125000".to_owned(),
             ]],
@@ -702,6 +727,29 @@ mod tests {
         // usage header + row + blank, agent title + header + row + blank,
         // total title + 2 rows.
         assert_eq!(rows.len(), 10);
+    }
+
+    #[test]
+    fn prepends_month_label_row() {
+        let mut report = fixture_report();
+
+        report.header = BillHeader::Month {
+            label: "February 2026".to_owned(),
+        };
+        let rows = build_rows(&report);
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 11));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 11),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let label = render_row(&table_buffer, 0, table_natural_width());
+
+        assert!(label.contains("February 2026"), "label: {label}");
     }
 
     #[test]

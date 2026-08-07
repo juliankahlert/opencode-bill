@@ -80,7 +80,6 @@ pub(crate) fn parse_assistant(
         .ok_or_else(|| invalid_field(location, "tokens.cache"))?;
     let provider = required_string(value, "providerID", location)?;
     let model = required_string(value, "modelID", location)?;
-    let cost = required_f64(value, "cost", location)?;
     let usage = Tokens {
         input: required_u64(tokens, "input", location)?,
         output: required_u64(tokens, "output", location)?,
@@ -95,13 +94,15 @@ pub(crate) fn parse_assistant(
         .unwrap_or("unknown")
         .to_owned();
     let (created, completed) = message_time(value);
+    let cost = required_f64(value, "cost", location)?;
 
-    if !cost.is_finite() || cost < 0.0 {
-        return Err(invalid_field(
-            location,
-            "cost must be finite and non-negative",
-        ));
+    if !cost.is_finite() {
+        return Err(invalid_field(location, "cost must be finite"));
     }
+
+    // Providers correct over-counted usage with a negative charge; a bill
+    // cannot show negative usage, so clamp the charge to zero.
+    let cost = cost.max(0.0);
 
     Ok(Some(UsageRecord {
         session_id: session_id.to_owned(),
@@ -130,11 +131,15 @@ pub(crate) fn required_string(
         .ok_or_else(|| invalid_field(location, field))
 }
 
-/// Reads a required integer field.
+/// Reads a required integer field, clamping negative corrections to zero.
 fn required_u64(value: &Value, field: &str, location: &str) -> Result<u64, BillError> {
     value
         .get(field)
-        .and_then(Value::as_u64)
+        .and_then(|count| {
+            count
+                .as_u64()
+                .or_else(|| count.as_i64().filter(|count| *count < 0).map(|_| 0))
+        })
         .ok_or_else(|| invalid_field(location, field))
 }
 

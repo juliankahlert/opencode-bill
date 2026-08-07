@@ -1,19 +1,28 @@
 //! Plain-text bill rendering from the structured report data.
 
 use crate::error::BillError;
-use crate::report::BillReport;
+use crate::report::{BillHeader, BillReport};
 
-/// Renders the full bill for one session.
+/// Renders the full bill for one session or calendar month.
 pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
     let mut output = String::new();
 
-    output.push_str("OPENCODE SESSION BILL\n");
-    output.push_str(&format!("Session: {}\n", report.session_id));
-    output.push_str(&format!("Title:   {}\n", report.session_title));
-    output.push_str(&format!(
-        "Sessions: {} (root + descendants)\n\n",
-        report.session_count
-    ));
+    match &report.header {
+        BillHeader::Session { id, title } => {
+            output.push_str("OPENCODE SESSION BILL\n");
+            output.push_str(&format!("Session: {id}\n"));
+            output.push_str(&format!("Title:   {title}\n"));
+            output.push_str(&format!(
+                "Sessions: {} (root + descendants)\n\n",
+                report.session_count
+            ));
+        }
+        BillHeader::Month { label } => {
+            output.push_str("OPENCODE MONTHLY BILL\n");
+            output.push_str(&format!("Month:   {label}\n"));
+            output.push_str(&format!("Sessions: {}\n\n", report.session_count));
+        }
+    }
     output.push_str(&render_table(
         &[
             "PROVIDER / MODEL",
@@ -24,7 +33,6 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
             "OUTPUT",
             "REASONING",
             "API TIME",
-            "WALL TIME",
             "COST (USD)",
         ],
         &report.usage_rows,
@@ -42,7 +50,6 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
             "OUTPUT",
             "REASONING",
             "API TIME",
-            "WALL TIME",
             "COST (USD)",
         ],
         &report.agent_rows,

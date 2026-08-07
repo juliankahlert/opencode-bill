@@ -9,7 +9,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::data::ToolSpans;
 use crate::error::BillError;
 use crate::parse::{message_time, parse_assistant, parse_json, tool_span};
-use crate::store::{MessageLoad, Session, SessionStore, unique_match};
+use crate::report::BillHeader;
+use crate::store::{BillInput, CalendarMonth, MessageLoad, SessionStore, unique_match};
 use crate::timing::{earliest, latest};
 
 /// Sessions stored in OpenCode's SQLite database.
@@ -24,7 +25,7 @@ impl SqliteStore {
 }
 
 impl SessionStore for SqliteStore {
-    fn load(&self, reference: &str) -> Result<Session, BillError> {
+    fn load(&self, reference: &str) -> Result<BillInput, BillError> {
         let connection = open_database(&self.path)?;
         let matches = database_matches(&connection, &self.path, reference)?;
         let id = unique_match(reference, matches)?;
@@ -41,9 +42,35 @@ impl SessionStore for SqliteStore {
             "loaded {} assistant messages from {session_count} SQLite sessions",
             messages.len()
         );
-        Ok(Session {
-            id,
-            title,
+        Ok(BillInput {
+            header: BillHeader::Session { id, title },
+            session_count,
+            session_agents,
+            messages,
+            wall_start,
+            wall_end,
+        })
+    }
+
+    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError> {
+        let connection = open_database(&self.path)?;
+        let session_agents = database_month_agents(&connection, &self.path, month)?;
+        let MessageLoad {
+            messages,
+            wall_start,
+            wall_end,
+        } = database_month_messages(&connection, &self.path, month, &session_agents)?;
+        let session_count = database_month_session_count(&connection, &self.path, month)?;
+
+        debug!(
+            "loaded {} assistant messages from {session_count} SQLite sessions in {}",
+            messages.len(),
+            month.label
+        );
+        Ok(BillInput {
+            header: BillHeader::Month {
+                label: month.label.clone(),
+            },
             session_count,
             session_agents,
             messages,
@@ -127,22 +154,7 @@ fn database_session_agents(
     path: &Path,
     id: &str,
 ) -> Result<BTreeMap<String, String>, BillError> {
-    let mut columns = connection
-        .prepare("PRAGMA table_info(session)")
-        .map_err(|source| database_error(path, source))?;
-    let names = columns
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|source| database_error(path, source))?;
-    let mut has_agent = false;
-
-    for name in names {
-        if name.map_err(|source| database_error(path, source))? == "agent" {
-            has_agent = true;
-            break;
-        }
-    }
-
-    if !has_agent {
+    if !database_has_column(connection, path, "session", "agent")? {
         return Ok(BTreeMap::new());
     }
 
@@ -161,6 +173,42 @@ fn database_session_agents(
         .map_err(|source| database_error(path, source))?;
     let rows = statement
         .query_map(params![id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|source| database_error(path, source))?;
+    let mut agents = BTreeMap::new();
+
+    for row in rows {
+        let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
+
+        if let Some(agent) = agent.filter(|agent| !agent.is_empty()) {
+            agents.insert(session_id, agent);
+        }
+    }
+
+    Ok(agents)
+}
+
+/// Agent class of every session that has a message in the month window.
+fn database_month_agents(
+    connection: &Connection,
+    path: &Path,
+    month: &CalendarMonth,
+) -> Result<BTreeMap<String, String>, BillError> {
+    if !database_has_column(connection, path, "session", "agent")? {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut statement = connection
+        .prepare(
+            r#"SELECT DISTINCT session.id, session.agent FROM session
+               JOIN message ON message.session_id = session.id
+               WHERE message.time_created >= ?1 AND message.time_created < ?2
+               ORDER BY session.id"#,
+        )
+        .map_err(|source| database_error(path, source))?;
+    let rows = statement
+        .query_map(params![month.start_ms, month.end_ms], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .map_err(|source| database_error(path, source))?;
@@ -238,6 +286,77 @@ fn database_messages(
     })
 }
 
+/// Every assistant message recorded in one calendar month, plus the bounds.
+fn database_month_messages(
+    connection: &Connection,
+    path: &Path,
+    month: &CalendarMonth,
+    session_agents: &BTreeMap<String, String>,
+) -> Result<MessageLoad, BillError> {
+    let mut statement = connection
+        .prepare(
+            r#"SELECT message.id, message.session_id, message.data FROM message
+               WHERE message.time_created >= ?1 AND message.time_created < ?2
+               ORDER BY message.time_created, message.id"#,
+        )
+        .map_err(|source| database_error(path, source))?;
+    let rows = statement
+        .query_map(params![month.start_ms, month.end_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|source| database_error(path, source))?;
+    let location = path.display().to_string();
+    let tools = database_month_tool_spans(connection, path, month)?;
+    let mut messages = Vec::new();
+    let mut wall_start = None;
+    let mut wall_end = None;
+
+    for row in rows {
+        let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
+        let value = parse_json(&json, &location)?;
+        let (created, completed) = message_time(&value);
+
+        wall_start = earliest(wall_start, created);
+        wall_end = latest(wall_end, completed.or(created));
+
+        if let Some(message) = parse_assistant(
+            &value,
+            &location,
+            &session_id,
+            session_agents.get(&session_id).map(String::as_str),
+            tools.get(&message_id).map_or(&[][..], Vec::as_slice),
+        )? {
+            messages.push(message);
+        }
+    }
+
+    Ok(MessageLoad {
+        messages,
+        wall_start,
+        wall_end,
+    })
+}
+
+/// Number of distinct sessions with at least one message in the month window.
+fn database_month_session_count(
+    connection: &Connection,
+    path: &Path,
+    month: &CalendarMonth,
+) -> Result<usize, BillError> {
+    connection
+        .query_row(
+            "SELECT COUNT(DISTINCT session_id) FROM message \
+             WHERE time_created >= ?1 AND time_created < ?2",
+            params![month.start_ms, month.end_ms],
+            |row| row.get(0),
+        )
+        .map_err(|source| database_error(path, source))
+}
+
 /// Collects the tool-call spans of every message in the session tree.
 fn database_tool_spans(
     connection: &Connection,
@@ -281,6 +400,44 @@ fn database_tool_spans(
     Ok(spans)
 }
 
+/// Tool-call spans of every message recorded in one calendar month.
+fn database_month_tool_spans(
+    connection: &Connection,
+    path: &Path,
+    month: &CalendarMonth,
+) -> Result<ToolSpans, BillError> {
+    if !database_has_table(connection, path, "part")? {
+        warn!("no 'part' table: API time will still include tool calls");
+        return Ok(ToolSpans::new());
+    }
+
+    let mut statement = connection
+        .prepare(
+            r#"SELECT part.message_id, part.data FROM part
+               JOIN message ON part.message_id = message.id
+               WHERE message.time_created >= ?1 AND message.time_created < ?2"#,
+        )
+        .map_err(|source| database_error(path, source))?;
+    let rows = statement
+        .query_map(params![month.start_ms, month.end_ms], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| database_error(path, source))?;
+    let location = path.display().to_string();
+    let mut spans = ToolSpans::new();
+
+    for row in rows {
+        let (message_id, json) = row.map_err(|source| database_error(path, source))?;
+        let value = parse_json(&json, &location)?;
+
+        if let Some(span) = tool_span(&value) {
+            spans.entry(message_id).or_default().push(span);
+        }
+    }
+
+    Ok(spans)
+}
+
 /// Whether the database has a table with the given name.
 fn database_has_table(
     connection: &Connection,
@@ -296,6 +453,29 @@ fn database_has_table(
         .optional()
         .map(|found| found.is_some())
         .map_err(|source| database_error(path, source))
+}
+
+/// Whether a table has a column with the given name.
+fn database_has_column(
+    connection: &Connection,
+    path: &Path,
+    table: &str,
+    column: &str,
+) -> Result<bool, BillError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| database_error(path, source))?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| database_error(path, source))?;
+
+    for name in names {
+        if name.map_err(|source| database_error(path, source))? == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Maps a SQLite failure onto the bill error type.

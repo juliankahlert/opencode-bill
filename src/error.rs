@@ -15,6 +15,10 @@ pub enum BillError {
     #[error("invalid session reference: {0}")]
     InvalidSessionReference(String),
 
+    /// The month window does not exist in the calendar.
+    #[error("invalid month: {0}")]
+    InvalidMonth(String),
+
     /// No session matched the supplied reference.
     #[error("session '{0}' was not found")]
     SessionNotFound(String),

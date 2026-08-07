@@ -8,7 +8,7 @@ use directories::BaseDirs;
 use crate::database::SqliteStore;
 use crate::error::BillError;
 use crate::legacy::LegacyStore;
-use crate::store::{Session, SessionStore};
+use crate::store::{BillInput, CalendarMonth, SessionStore};
 
 /// Name of OpenCode's SQLite session database.
 pub(crate) const DATABASE_FILE: &str = "opencode.db";
@@ -53,10 +53,17 @@ pub(crate) enum Store {
 }
 
 impl SessionStore for Store {
-    fn load(&self, reference: &str) -> Result<Session, BillError> {
+    fn load(&self, reference: &str) -> Result<BillInput, BillError> {
         match self {
             Store::Database(store) => store.load(reference),
             Store::Legacy(store) => store.load(reference),
+        }
+    }
+
+    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError> {
+        match self {
+            Store::Database(store) => store.load_month(month),
+            Store::Legacy(store) => store.load_month(month),
         }
     }
 }

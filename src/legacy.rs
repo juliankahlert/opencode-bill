@@ -8,7 +8,8 @@ use log::debug;
 
 use crate::error::BillError;
 use crate::parse::{message_time, parse_assistant, read_json, required_string, tool_span};
-use crate::store::{MessageLoad, Session, SessionStore, unique_match};
+use crate::report::BillHeader;
+use crate::store::{BillInput, CalendarMonth, MessageLoad, SessionStore, unique_match};
 use crate::timing::{earliest, latest};
 
 /// Sessions stored in OpenCode's legacy JSON directory layout.
@@ -23,7 +24,7 @@ impl LegacyStore {
 }
 
 impl SessionStore for LegacyStore {
-    fn load(&self, reference: &str) -> Result<Session, BillError> {
+    fn load(&self, reference: &str) -> Result<BillInput, BillError> {
         let session_root = self.storage.join("session");
         let matches = legacy_matches(&session_root, reference)?;
         let session_path = unique_match(reference, matches)?;
@@ -53,11 +54,96 @@ impl SessionStore for LegacyStore {
             messages.len(),
             session_ids.len()
         );
-        Ok(Session {
-            id,
-            title,
+        Ok(BillInput {
+            header: BillHeader::Session { id, title },
             session_count: session_ids.len(),
             session_agents,
+            messages,
+            wall_start,
+            wall_end,
+        })
+    }
+
+    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError> {
+        let message_root = self.storage.join("message");
+        let mut messages = Vec::new();
+        let mut sessions = BTreeSet::new();
+        let mut wall_start = None;
+        let mut wall_end = None;
+
+        if message_root.is_dir() {
+            for entry in read_directory(&message_root)? {
+                let entry =
+                    entry.map_err(|source| crate::parse::read_error(&message_root, source))?;
+                let session_path = entry.path();
+
+                if !session_path.is_dir() {
+                    continue;
+                }
+
+                let session_id = session_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let mut found = false;
+
+                for message in read_directory(&session_path)? {
+                    let message = message
+                        .map_err(|source| crate::parse::read_error(&session_path, source))?;
+                    let path = message.path();
+
+                    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                        continue;
+                    }
+
+                    let value = read_json(&path)?;
+                    let (created, completed) = message_time(&value);
+                    let created = match created {
+                        Some(created) if created >= month.start_ms && created < month.end_ms => {
+                            created
+                        }
+                        _ => continue,
+                    };
+
+                    found = true;
+                    wall_start = earliest(wall_start, Some(created));
+                    wall_end = latest(wall_end, completed.or(Some(created)));
+
+                    let message_id = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    let tools = legacy_tool_spans(&self.storage, message_id)?;
+
+                    if let Some(message) = parse_assistant(
+                        &value,
+                        &path.display().to_string(),
+                        session_id,
+                        None,
+                        &tools,
+                    )? {
+                        messages.push(message);
+                    }
+                }
+
+                if found {
+                    sessions.insert(session_id.to_owned());
+                }
+            }
+        }
+
+        debug!(
+            "loaded {} assistant messages from {} legacy JSON sessions in {}",
+            messages.len(),
+            sessions.len(),
+            month.label
+        );
+        Ok(BillInput {
+            header: BillHeader::Month {
+                label: month.label.clone(),
+            },
+            session_count: sessions.len(),
+            session_agents: BTreeMap::new(),
             messages,
             wall_start,
             wall_end,

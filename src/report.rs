@@ -3,19 +3,34 @@
 use std::collections::BTreeMap;
 
 use crate::data::{AgentUsage, ModelKey, ModelRates, Totals};
-use crate::store::Session;
+use crate::store::BillInput;
 use crate::timing::{format_duration, format_timestamp, span_ms};
 
 const MILLION: u64 = 1_000_000;
 const THOUSAND: u64 = 1_000;
 
-/// Everything a renderer needs to show one session bill.
+/// Identifies the period a bill covers.
+#[derive(Clone)]
+pub enum BillHeader {
+    /// One session tree, identified by its root session.
+    Session {
+        /// Root session ID.
+        id: String,
+        /// Root session title.
+        title: String,
+    },
+    /// One calendar month, identified by its label.
+    Month {
+        /// Label like "February 2026".
+        label: String,
+    },
+}
+
+/// Everything a renderer needs to show one bill.
 pub struct BillReport {
-    /// Root session ID.
-    pub session_id: String,
-    /// Root session title.
-    pub session_title: String,
-    /// Root plus descendant session count.
+    /// Identifies the billed period.
+    pub header: BillHeader,
+    /// Number of sessions that produced the billed usage.
     pub session_count: usize,
     /// One usage row per provider/model pair.
     pub usage_rows: Vec<Vec<String>>,
@@ -29,20 +44,19 @@ pub struct BillReport {
 
 /// Builds the report data from aggregated usage.
 pub(crate) fn build_report(
-    session: &Session,
+    input: &BillInput,
     by_model: &BTreeMap<ModelKey, Totals>,
     by_agent: &BTreeMap<String, AgentUsage>,
     total: &Totals,
     pricing: &BTreeMap<ModelKey, ModelRates>,
 ) -> BillReport {
     BillReport {
-        session_id: session.id.clone(),
-        session_title: session.title.clone(),
-        session_count: session.session_count,
+        header: input.header.clone(),
+        session_count: input.session_count,
         usage_rows: by_model.iter().map(usage_row).collect(),
         agent_rows: by_agent.iter().map(agent_row).collect(),
         pricing_rows: pricing.iter().map(pricing_row).collect(),
-        totals: total_rows(session, total),
+        totals: total_rows(input, total),
     }
 }
 
@@ -59,7 +73,6 @@ fn usage_row(entry: (&ModelKey, &Totals)) -> Vec<String> {
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format_duration(span_ms(totals.wall_start, totals.wall_end)),
         format!("${:.6}", totals.cost),
     ]
 }
@@ -79,7 +92,6 @@ fn agent_row(entry: (&String, &AgentUsage)) -> Vec<String> {
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format_duration(span_ms(totals.wall_start, totals.wall_end)),
         format!("${:.6}", totals.cost),
     ]
 }
@@ -98,8 +110,13 @@ fn pricing_row(entry: (&ModelKey, &ModelRates)) -> Vec<String> {
 }
 
 /// Label/value pairs of the TOTAL section.
-fn total_rows(session: &Session, total: &Totals) -> Vec<(String, String)> {
-    vec![
+///
+/// Session bills carry the wall-clock bounds (Started, Ended, Wall time);
+/// month bills skip them because they span many unrelated sessions.
+fn total_rows(input: &BillInput, total: &Totals) -> Vec<(String, String)> {
+    let is_session = matches!(input.header, BillHeader::Session { .. });
+
+    let mut rows = vec![
         ("Requests:".to_owned(), compact_count(total.requests)),
         ("Input:".to_owned(), compact_count(total.tokens.input)),
         (
@@ -115,15 +132,23 @@ fn total_rows(session: &Session, total: &Totals) -> Vec<(String, String)> {
             "Reasoning:".to_owned(),
             compact_count(total.tokens.reasoning),
         ),
-        ("Started:".to_owned(), format_timestamp(session.wall_start)),
-        ("Ended:".to_owned(), format_timestamp(session.wall_end)),
-        ("API time:".to_owned(), format_duration(total.api_ms)),
-        (
+    ];
+
+    if is_session {
+        rows.push(("Started:".to_owned(), format_timestamp(input.wall_start)));
+        rows.push(("Ended:".to_owned(), format_timestamp(input.wall_end)));
+    }
+    rows.push(("API time:".to_owned(), format_duration(total.api_ms)));
+
+    if is_session {
+        rows.push((
             "Wall time:".to_owned(),
-            format_duration(span_ms(session.wall_start, session.wall_end)),
-        ),
-        ("Amount due:".to_owned(), format!("${:.6} USD", total.cost)),
-    ]
+            format_duration(span_ms(input.wall_start, input.wall_end)),
+        ));
+    }
+    rows.push(("Amount due:".to_owned(), format!("${:.6} USD", total.cost)));
+
+    rows
 }
 
 /// Renders a rate as dollars, or `-` when unknown.
@@ -159,22 +184,51 @@ mod tests {
 
     #[test]
     fn builds_total_rows() {
-        let session = Session {
-            id: "ses".to_owned(),
-            title: "Test".to_owned(),
+        let input = BillInput {
+            header: BillHeader::Session {
+                id: "ses".to_owned(),
+                title: "Test".to_owned(),
+            },
             session_count: 1,
             session_agents: BTreeMap::new(),
             messages: Vec::new(),
             wall_start: None,
             wall_end: None,
         };
-        let rows = total_rows(&session, &Totals::default());
+        let rows = total_rows(&input, &Totals::default());
 
         assert_eq!(rows.len(), 11);
         assert_eq!(rows[0], ("Requests:".to_owned(), "0".to_owned()));
         assert_eq!(rows[6], ("Started:".to_owned(), "-".to_owned()));
         assert_eq!(
             rows[10],
+            ("Amount due:".to_owned(), "$0.000000 USD".to_owned())
+        );
+    }
+
+    #[test]
+    fn omits_wall_bounds_from_month_total() {
+        let input = BillInput {
+            header: BillHeader::Month {
+                label: "February 2026".to_owned(),
+            },
+            session_count: 1,
+            session_agents: BTreeMap::new(),
+            messages: Vec::new(),
+            wall_start: None,
+            wall_end: None,
+        };
+        let rows = total_rows(&input, &Totals::default());
+
+        assert_eq!(rows.len(), 8);
+        assert!(
+            rows.iter().all(|(label, _)| {
+                !matches!(label.as_str(), "Started:" | "Ended:" | "Wall time:")
+            })
+        );
+        assert_eq!(rows[6], ("API time:".to_owned(), "0ms".to_owned()));
+        assert_eq!(
+            rows[7],
             ("Amount due:".to_owned(), "$0.000000 USD".to_owned())
         );
     }
