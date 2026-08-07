@@ -1,4 +1,5 @@
-//! Model pricing: local catalog first, then the GitHub Copilot pricing page.
+//! Model pricing: local catalog, then the GitHub Copilot pricing page, then
+//! the generic models.dev fallback.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,6 +10,7 @@ use serde_json::Value;
 
 use crate::data::{ModelKey, ModelRates};
 use crate::error::BillError;
+use crate::models_dev::{EFFORT_SUFFIXES, ModelsDevFallback};
 use crate::parse::read_json;
 
 /// GitHub documentation page that lists Copilot model rates.
@@ -90,18 +92,20 @@ impl GithubSource {
     }
 }
 
-/// Collects rates for the requested models: catalog, then GitHub.
+/// Collects rates for the requested models: catalog, GitHub, then generic.
 pub(crate) fn load_pricing<'a>(
     models_file: Option<&Path>,
     keys: impl Iterator<Item = &'a ModelKey>,
 ) -> Result<BTreeMap<ModelKey, ModelRates>, BillError> {
     let mut catalog = CatalogSource::new(models_file)?;
     let mut github = GithubSource::default();
+    let mut fallback = ModelsDevFallback;
     let pricing = keys
         .filter_map(|key| {
             catalog
                 .rates(&key.0, &key.1)
                 .or_else(|| github.rates(&key.0, &key.1))
+                .or_else(|| fallback.rates(&key.0, &key.1))
                 .map(|rates| (key.clone(), rates))
         })
         .collect();
@@ -225,7 +229,6 @@ fn is_default_tier(fields: &BTreeMap<&str, &str>) -> bool {
 
 /// Normalizes a model ID, stripping effort suffixes like `-high`.
 fn normalized_model_id(model: &str) -> String {
-    const EFFORT_SUFFIXES: [&str; 5] = ["-xhigh", "-high", "-medium", "-low", "-none"];
     let base = EFFORT_SUFFIXES
         .iter()
         .find_map(|suffix| model.strip_suffix(suffix))
@@ -273,6 +276,55 @@ mod tests {
                 cache_write: None,
                 output: Some(30.0),
             })
+        );
+    }
+
+    #[test]
+    fn load_pricing_falls_back_to_generic_catalog() {
+        let keys = [
+            ("openai".to_owned(), "gpt-4o".to_owned()),
+            ("openai".to_owned(), "unknown-model-9000".to_owned()),
+        ];
+
+        let pricing = load_pricing(None, keys.iter()).unwrap();
+
+        assert_eq!(pricing.len(), 1);
+        assert_eq!(
+            pricing[&("openai".to_owned(), "gpt-4o".to_owned())],
+            ModelRates {
+                input: Some(2.50),
+                cache_read: None,
+                cache_write: None,
+                output: Some(10.00),
+            }
+        );
+    }
+
+    #[test]
+    fn load_pricing_prefers_catalog_over_fallback() {
+        use std::fs;
+
+        let temporary = tempfile::TempDir::new().unwrap();
+        let models_file = temporary.path().join("models.json");
+
+        fs::write(
+            &models_file,
+            r#"{"openai":{"models":{"gpt-4o":{"cost":{"input":1.25,"output":5,"cache_read":0.125}}}}}"#,
+        )
+        .unwrap();
+
+        let keys = [("openai".to_owned(), "gpt-4o".to_owned())];
+
+        let pricing = load_pricing(Some(&models_file), keys.iter()).unwrap();
+
+        assert_eq!(
+            pricing[&("openai".to_owned(), "gpt-4o".to_owned())],
+            ModelRates {
+                input: Some(1.25),
+                cache_read: Some(0.125),
+                cache_write: None,
+                output: Some(5.00),
+            }
         );
     }
 }
