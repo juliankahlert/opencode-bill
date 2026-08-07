@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use chrono::Datelike;
+use chrono::{Datelike, NaiveDate};
 use clap::Parser;
 use log::debug;
 use opencode_bill::{StorageContext, generate_bill, generate_monthly_bill};
@@ -17,8 +17,9 @@ mod tui;
     about = "Generate a bill for an OpenCode session or calendar month"
 )]
 struct Arguments {
-    /// Full OpenCode session ID or a unique ID prefix
-    #[arg(required_unless_present = "month", conflicts_with = "month")]
+    /// Full OpenCode session ID or a unique ID prefix; with no session and
+    /// no --month the current month is billed
+    #[arg(conflicts_with = "month")]
     session: Option<String>,
 
     /// OpenCode data directory (defaults to the platform data directory)
@@ -42,6 +43,7 @@ struct Arguments {
 }
 
 /// What the user asked to bill.
+#[derive(Debug, PartialEq)]
 enum Request {
     /// One session tree, by ID or prefix.
     Session(String),
@@ -56,19 +58,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => StorageContext::builder().data_dir(path).build()?,
         None => StorageContext::builder().platform_data_dir()?.build()?,
     };
-    let request = match arguments.month {
-        Some(0) => {
-            let today = chrono::Local::now().date_naive();
-
-            Request::Month(today.year() as u32, today.month())
-        }
-        Some(month) => Request::Month(current_year(), month as u32),
-        None => Request::Session(
-            arguments
-                .session
-                .ok_or("clap did not provide the required session argument")?,
-        ),
-    };
+    let today = chrono::Local::now().date_naive();
+    let request = resolve_request(arguments.month, arguments.session, today);
 
     if io::stdout().is_terminal() {
         return match tui::run(context, request, arguments.providers)? {
@@ -89,9 +80,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Year of the current local date.
-fn current_year() -> u32 {
-    chrono::Local::now().date_naive().year() as u32
+/// Map the CLI arguments to one bill request.
+///
+/// `--month` without a value (clap delivers `Some(0)`) and no arguments at
+/// all both mean the current calendar month.
+fn resolve_request(month: Option<u8>, session: Option<String>, today: NaiveDate) -> Request {
+    match (month, session) {
+        (Some(0), _) | (None, None) => Request::Month(today.year() as u32, today.month()),
+        (Some(month), _) => Request::Month(today.year() as u32, month as u32),
+        (None, Some(session)) => Request::Session(session),
+    }
 }
 
 fn main() -> ExitCode {
@@ -104,4 +102,46 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_arguments_bills_current_month() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(resolve_request(None, None, today), Request::Month(2026, 8));
+    }
+
+    #[test]
+    fn month_without_value_bills_current_month() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            resolve_request(Some(0), None, today),
+            Request::Month(2026, 8)
+        );
+    }
+
+    #[test]
+    fn month_with_value_bills_that_month_of_current_year() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            resolve_request(Some(2), None, today),
+            Request::Month(2026, 2)
+        );
+    }
+
+    #[test]
+    fn session_argument_bills_session() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            resolve_request(None, Some("abc123".to_string()), today),
+            Request::Session("abc123".to_string())
+        );
+    }
 }
