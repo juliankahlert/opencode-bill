@@ -36,7 +36,14 @@ dest = "/usr/bin/opencode-bill"
 mode = "755"
 
 [profile.release]
-strip = "symbols"
+# Aggressive size optimization for the release binary.
+opt-level = "z"        # optimize for size
+lto = "fat"            # fat LTO across all crates
+codegen-units = 1      # single codegen unit maximizes LTO benefit
+strip = true           # strip symbols and debug info
+panic = "abort"        # no unwind tables or panic runtime
+# debug defaults to off in release; kept explicit for clarity
+debug = false
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
