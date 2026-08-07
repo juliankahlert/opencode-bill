@@ -77,6 +77,13 @@ Examples:
     opencode-bill abc123def456
     opencode-bill abc123 --data-dir /tmp/opencode-data
 
+When stdout is a terminal the report is shown in an interactive TUI: a
+loading indicator lists the current step (session load, aggregation,
+pricing lookup) until the report is ready, then the report is rendered as
+a scrollable table. Scroll with the arrow keys, `j`/`k` (vertical) and
+`h`/`l` or the arrow keys (horizontal), and quit with `q`. When stdout is
+piped or redirected the plain-text bill is printed as before.
+
 Build from source
 -----------------
 
