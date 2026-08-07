@@ -19,6 +19,12 @@ const GITHUB_COPILOT_PRICING_URL: &str = "https://docs.github.com/api/article/bo
 const HTTP_TIMEOUT_SECONDS: u64 = 5;
 /// HTTP user agent for pricing fetches.
 const USER_AGENT: &str = concat!("opencode-bill/", env!("CARGO_PKG_VERSION"));
+/// Whether the pricing page may be fetched over the network.
+///
+/// Unit tests stay hermetic: the page parser is exercised with pre-seeded
+/// markdown (see `GithubSource::with_markdown`), so test builds never
+/// attempt a network fetch.
+const NETWORK_FETCH_ALLOWED: bool = cfg!(not(test));
 
 /// Looks up pricing for a provider/model pair.
 pub(crate) trait PricingSource {
@@ -79,16 +85,39 @@ impl GithubSource {
     fn markdown(&mut self) -> Option<&str> {
         if !self.fetched {
             self.fetched = true;
-            self.markdown = match fetch_github_pricing() {
-                Ok(markdown) => Some(markdown),
-                Err(failure) => {
-                    warn!("could not fetch GitHub Copilot pricing: {failure}");
-                    None
-                }
-            };
+
+            if NETWORK_FETCH_ALLOWED {
+                self.markdown = match fetch_github_pricing() {
+                    Ok(markdown) => Some(markdown),
+                    Err(failure) => {
+                        warn!("could not fetch GitHub Copilot pricing: {failure}");
+                        None
+                    }
+                };
+            }
         }
 
         self.markdown.as_deref()
+    }
+
+    /// Rates for a model from the pricing page, regardless of provider.
+    ///
+    /// Last resort of the pricing chain: the page lists current list prices
+    /// for well-known models, so a model used under any provider can reuse
+    /// them when nothing more specific is known.
+    pub(crate) fn rates_for_model(&mut self, model: &str) -> Option<ModelRates> {
+        let markdown = self.markdown()?;
+
+        github_model_pricing(markdown, model)
+    }
+
+    /// A source pre-seeded with page markdown, for tests.
+    #[cfg(test)]
+    fn with_markdown(markdown: &str) -> Self {
+        Self {
+            fetched: true,
+            markdown: Some(markdown.to_owned()),
+        }
     }
 }
 
@@ -106,6 +135,7 @@ pub(crate) fn load_pricing<'a>(
                 .rates(&key.0, &key.1)
                 .or_else(|| github.rates(&key.0, &key.1))
                 .or_else(|| fallback.rates(&key.0, &key.1))
+                .or_else(|| github.rates_for_model(&key.1))
                 .map(|rates| (key.clone(), rates))
         })
         .collect();
@@ -259,17 +289,17 @@ fn normalize_model_name(name: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_github_pricing_for_effort_variant() {
-        let markdown = r#"
+    const PAGE_MARKDOWN: &str = r#"
 | Model         | Release status | Category | Tier         | Threshold | Input | Cached input | Output |
 | ------------- | -------------- | -------- | ------------ | --------- | ----: | -----------: | -----: |
 | GPT-5.6 Sol   | GA             | Powerful | Default      | <= 272K   | $5.00 |        $0.50 | $30.00 |
 | GPT-5.6 Sol   | GA             | Powerful | Long context | > 272K    | $10.00 |        $1.00 | $45.00 |
 "#;
 
+    #[test]
+    fn parses_github_pricing_for_effort_variant() {
         assert_eq!(
-            github_model_pricing(markdown, "gpt-5.6-sol-low"),
+            github_model_pricing(PAGE_MARKDOWN, "gpt-5.6-sol-low"),
             Some(ModelRates {
                 input: Some(5.0),
                 cache_read: Some(0.5),
@@ -277,6 +307,28 @@ mod tests {
                 output: Some(30.0),
             })
         );
+    }
+
+    #[test]
+    fn rates_for_model_ignores_provider() {
+        let mut github = GithubSource::with_markdown(PAGE_MARKDOWN);
+
+        assert_eq!(
+            github.rates_for_model("gpt-5.6-sol-medium"),
+            Some(ModelRates {
+                input: Some(5.0),
+                cache_read: Some(0.5),
+                cache_write: None,
+                output: Some(30.0),
+            })
+        );
+    }
+
+    #[test]
+    fn rates_for_model_misses_unknown_model() {
+        let mut github = GithubSource::with_markdown(PAGE_MARKDOWN);
+
+        assert_eq!(github.rates_for_model("nonexistent-model-9000"), None);
     }
 
     #[test]
