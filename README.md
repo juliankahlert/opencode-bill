@@ -73,17 +73,20 @@ Or do it manually:
 Usage
 -----
 
-    opencode-bill <session-id-or-prefix> [--data-dir PATH]
+    opencode-bill [<session-id-or-prefix>] [--data-dir PATH]
     opencode-bill [--month [MONTH]] [--data-dir PATH]
 
   session-id-or-prefix   Full OpenCode session ID or a unique prefix
-                         (minimum 6 characters). Not needed with --month.
+                         (minimum 6 characters). With no session argument
+                         and no --month, the current month is billed.
 
   --month [MONTH]        Bill the calendar month (1-12) of the current
                          year instead of one session and its sub-agents.
                          With no value the current month is billed, so
                          every session with messages in that window is
-                         included; no session argument is required.
+                         included; no session argument is required. This
+                         is also what a bare `opencode-bill` (no arguments)
+                         does.
 
   --provider PROVIDER    Only include usage from this provider; repeatable.
                          When at least one is given, the usage, agent,
@@ -106,6 +109,7 @@ corrections occurred.
 
 Examples:
 
+    opencode-bill
     opencode-bill abc123def456
     opencode-bill abc123 --data-dir /tmp/opencode-data
     opencode-bill --month
