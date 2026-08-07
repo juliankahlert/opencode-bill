@@ -1,33 +1,18 @@
-//! Plain-text bill rendering from already-aggregated data.
+//! Plain-text bill rendering from the structured report data.
 
-use std::collections::BTreeMap;
-
-use crate::data::{AgentUsage, ModelKey, ModelRates, Totals};
 use crate::error::BillError;
-use crate::store::Session;
-use crate::timing::{format_duration, format_timestamp, span_ms};
-
-const MILLION: u64 = 1_000_000;
-const THOUSAND: u64 = 1_000;
+use crate::report::BillReport;
 
 /// Renders the full bill for one session.
-pub(crate) fn render_bill(
-    session: &Session,
-    by_model: &BTreeMap<ModelKey, Totals>,
-    by_agent: &BTreeMap<String, AgentUsage>,
-    total: &Totals,
-    pricing: &BTreeMap<ModelKey, ModelRates>,
-) -> Result<String, BillError> {
-    let usage_rows = by_model.iter().map(usage_row).collect::<Vec<_>>();
-    let agent_rows = by_agent.iter().map(agent_row).collect::<Vec<_>>();
+pub(crate) fn render_bill(report: &BillReport) -> Result<String, BillError> {
     let mut output = String::new();
 
     output.push_str("OPENCODE SESSION BILL\n");
-    output.push_str(&format!("Session: {}\n", session.id));
-    output.push_str(&format!("Title:   {}\n", session.title));
+    output.push_str(&format!("Session: {}\n", report.session_id));
+    output.push_str(&format!("Title:   {}\n", report.session_title));
     output.push_str(&format!(
         "Sessions: {} (root + descendants)\n\n",
-        session.session_count
+        report.session_count
     ));
     output.push_str(&render_table(
         &[
@@ -42,7 +27,7 @@ pub(crate) fn render_bill(
             "WALL TIME",
             "COST (USD)",
         ],
-        &usage_rows,
+        &report.usage_rows,
     )?);
 
     output.push_str("\nUSAGE BY AGENT CLASS\n");
@@ -60,12 +45,10 @@ pub(crate) fn render_bill(
             "WALL TIME",
             "COST (USD)",
         ],
-        &agent_rows,
+        &report.agent_rows,
     )?);
 
-    if !pricing.is_empty() {
-        let pricing_rows = pricing.iter().map(pricing_row).collect::<Vec<_>>();
-
+    if !report.pricing_rows.is_empty() {
         output.push_str("\nMODEL PRICING (USD / 1M TOKENS)\n");
         output.push_str(&render_table(
             &[
@@ -75,103 +58,17 @@ pub(crate) fn render_bill(
                 "CACHE WRITE",
                 "OUTPUT",
             ],
-            &pricing_rows,
+            &report.pricing_rows,
         )?);
     }
 
     output.push_str("\nTOTAL\n");
-    output.push_str(&format!("Requests:    {}\n", compact_count(total.requests)));
-    output.push_str(&format!(
-        "Input:       {}\n",
-        compact_count(total.tokens.input)
-    ));
-    output.push_str(&format!(
-        "Cache read:  {}\n",
-        compact_count(total.tokens.cache_read)
-    ));
-    output.push_str(&format!(
-        "Cache write: {}\n",
-        compact_count(total.tokens.cache_write)
-    ));
-    output.push_str(&format!(
-        "Output:      {}\n",
-        compact_count(total.tokens.output)
-    ));
-    output.push_str(&format!(
-        "Reasoning:   {}\n",
-        compact_count(total.tokens.reasoning)
-    ));
-    output.push_str(&format!(
-        "Started:     {}\n",
-        format_timestamp(session.wall_start)
-    ));
-    output.push_str(&format!(
-        "Ended:       {}\n",
-        format_timestamp(session.wall_end)
-    ));
-    output.push_str(&format!("API time:    {}\n", format_duration(total.api_ms)));
-    output.push_str(&format!(
-        "Wall time:   {}\n",
-        format_duration(span_ms(session.wall_start, session.wall_end))
-    ));
-    output.push_str(&format!("Amount due:  ${:.6} USD\n", total.cost));
+    for (label, value) in &report.totals {
+        // Labels are left-padded to 13 columns; keep every label short enough.
+        debug_assert!(label.len() <= 13, "total label too wide: {label}");
+        output.push_str(&format!("{label:<13}{value}\n"));
+    }
     Ok(output)
-}
-
-/// One provider/model usage row.
-fn usage_row(entry: (&ModelKey, &Totals)) -> Vec<String> {
-    let ((provider, model), totals) = entry;
-
-    vec![
-        format!("{provider} / {model}"),
-        compact_count(totals.requests),
-        compact_count(totals.tokens.input),
-        compact_count(totals.tokens.cache_read),
-        compact_count(totals.tokens.cache_write),
-        compact_count(totals.tokens.output),
-        compact_count(totals.tokens.reasoning),
-        format_duration(totals.api_ms),
-        format_duration(span_ms(totals.wall_start, totals.wall_end)),
-        format!("${:.6}", totals.cost),
-    ]
-}
-
-/// One agent-class usage row.
-fn agent_row(entry: (&String, &AgentUsage)) -> Vec<String> {
-    let (agent, usage) = entry;
-    let totals = &usage.totals;
-
-    vec![
-        agent.clone(),
-        compact_count(usage.sessions.len() as u64),
-        compact_count(totals.requests),
-        compact_count(totals.tokens.input),
-        compact_count(totals.tokens.cache_read),
-        compact_count(totals.tokens.cache_write),
-        compact_count(totals.tokens.output),
-        compact_count(totals.tokens.reasoning),
-        format_duration(totals.api_ms),
-        format_duration(span_ms(totals.wall_start, totals.wall_end)),
-        format!("${:.6}", totals.cost),
-    ]
-}
-
-/// One model pricing row.
-fn pricing_row(entry: (&ModelKey, &ModelRates)) -> Vec<String> {
-    let ((provider, model), rates) = entry;
-
-    vec![
-        format!("{provider} / {model}"),
-        format_rate(rates.input),
-        format_rate(rates.cache_read),
-        format_rate(rates.cache_write),
-        format_rate(rates.output),
-    ]
-}
-
-/// Renders a rate as dollars, or `-` when unknown.
-fn format_rate(rate: Option<f64>) -> String {
-    rate.map_or_else(|| "-".to_owned(), |value| format!("${value:.3}"))
 }
 
 /// Renders a plain-text table with left-aligned text and right-aligned numbers.
@@ -246,19 +143,6 @@ fn render_error(detail: &str) -> BillError {
     }
 }
 
-/// Compacts a large token or request count to a short human string.
-fn compact_count(value: u64) -> String {
-    if value >= MILLION {
-        return format!("{:.1}M", value as f64 / MILLION as f64);
-    }
-
-    if value >= THOUSAND {
-        return format!("{:.1}k", value as f64 / THOUSAND as f64);
-    }
-
-    value.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,14 +166,5 @@ mod tests {
             "MODEL      | REQUESTS |   COST\n-----------+----------+-------\nshort      |        2 |  $1.00\nlong model |       10 | $12.00\n"
         );
         Ok(())
-    }
-
-    #[test]
-    fn compacts_large_usage_counts() {
-        assert_eq!(compact_count(999), "999");
-        assert_eq!(compact_count(1_000), "1.0k");
-        assert_eq!(compact_count(48_579), "48.6k");
-        assert_eq!(compact_count(1_000_000), "1.0M");
-        assert_eq!(compact_count(1_958_181), "2.0M");
     }
 }

@@ -1,4 +1,4 @@
-//! Orchestration: load a session, summarize it, and render the bill.
+//! Orchestration: load a session, summarize it, and build the report.
 
 use crate::aggregate::{aggregate, aggregate_agents};
 use crate::context::StorageContext;
@@ -6,22 +6,45 @@ use crate::data::Totals;
 use crate::error::BillError;
 use crate::pricing;
 use crate::render::render_bill;
+use crate::report::{BillReport, build_report};
 use crate::store::{SessionStore, validate_reference};
 
 /// Generates a deterministic plain-text bill for one OpenCode session.
 pub fn generate_bill(context: &StorageContext, reference: &str) -> Result<String, BillError> {
+    let report = load_report_with_progress(context, reference, |_| {})?;
+
+    render_bill(&report)
+}
+
+/// Loads a session and builds the report data, reporting each work step.
+///
+/// `on_task` runs before every phase (loading, aggregation, pricing, report
+/// building) so a UI can show which step is currently in progress.
+pub fn load_report_with_progress(
+    context: &StorageContext,
+    reference: &str,
+    mut on_task: impl FnMut(&str),
+) -> Result<BillReport, BillError> {
     validate_reference(reference)?;
 
+    on_task("Loading session data");
     let session = context.store().load(reference)?;
+
+    on_task("Aggregating usage");
     let by_model = aggregate(&session.messages);
     let by_agent = aggregate_agents(&session.messages, &session.session_agents);
     let total = by_model.values().fold(Totals::default(), |mut sum, row| {
         sum.merge(row);
         sum
     });
+
+    on_task("Loading model pricing");
     let pricing = pricing::load_pricing(context.models_file.as_deref(), by_model.keys())?;
 
-    render_bill(&session, &by_model, &by_agent, &total, &pricing)
+    on_task("Building report");
+    Ok(build_report(
+        &session, &by_model, &by_agent, &total, &pricing,
+    ))
 }
 
 #[cfg(test)]
@@ -95,6 +118,34 @@ mod tests {
             ]
         ));
         assert!(bill.contains("Amount due:  $0.125000 USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn reports_progress_steps_and_report_data() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let mut tasks = Vec::new();
+
+        let report = load_report_with_progress(&context, "ses_abcdef", |task| {
+            tasks.push(task.to_owned());
+        })?;
+
+        assert_eq!(
+            tasks,
+            [
+                "Loading session data",
+                "Aggregating usage",
+                "Loading model pricing",
+                "Building report",
+            ]
+        );
+        assert_eq!(report.session_id, "ses_abcdef123456");
+        assert_eq!(report.session_title, "Test session");
+        assert_eq!(report.session_count, 1);
+        assert_eq!(report.usage_rows.len(), 1);
+        assert_eq!(report.agent_rows.len(), 1);
+        assert!(report.pricing_rows.is_empty());
+        assert_eq!(report.totals.len(), 11);
         Ok(())
     }
 
