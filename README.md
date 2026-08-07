@@ -4,8 +4,10 @@ opencode-bill
 Generate a plain-text bill for an OpenCode AI coding session.
 
 Reads token usage and timing from OpenCode's SQLite session database (or
-legacy JSON storage), looks up pricing from the GitHub Copilot model pricing
-page, and prints a formatted bill to stdout.
+legacy JSON storage), looks up pricing from a local models.json catalog or
+the GitHub Copilot model pricing page, falls back to a built-in generic
+models.dev-style price list for well-known models when no API pricing is
+available, and prints a formatted bill to stdout.
 
 Sections in the bill include:
 
