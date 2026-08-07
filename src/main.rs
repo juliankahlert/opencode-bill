@@ -1,10 +1,12 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Arg, Command, value_parser};
 use log::debug;
 use opencode_bill::{StorageContext, generate_bill};
+
+mod tui;
 
 fn command() -> Command {
     Command::new("opencode-bill")
@@ -34,6 +36,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => StorageContext::builder().data_dir(path).build()?,
         None => StorageContext::builder().platform_data_dir()?.build()?,
     };
+
+    if io::stdout().is_terminal() {
+        return match tui::run(context, session.clone())? {
+            tui::TuiOutcome::Success => Ok(()),
+            tui::TuiOutcome::Failed(failure) => Err(failure.into()),
+        };
+    }
+
     let bill = generate_bill(&context, session)?;
     let mut stdout = io::stdout().lock();
 
