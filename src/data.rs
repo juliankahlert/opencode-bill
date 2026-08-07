@@ -51,6 +51,12 @@ pub(crate) struct UsageRecord {
     pub(crate) tokens: Tokens,
     /// Cost of the call in USD.
     pub(crate) cost: f64,
+    /// Whether the recorded cost is zero because no price was known.
+    ///
+    /// Subscription usage usually carries no per-call price; such calls can
+    /// be billed at a known rate instead of showing a zero row.  Negative
+    /// provider corrections also clamp to zero but are never re-priced.
+    pub(crate) cost_unknown: bool,
     /// Time the model endpoint was busy, in milliseconds.
     pub(crate) api_ms: u64,
     /// Message creation timestamp (Unix millis).

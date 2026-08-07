@@ -8,7 +8,7 @@ use std::time::Duration;
 use log::warn;
 use serde_json::Value;
 
-use crate::data::{ModelKey, ModelRates};
+use crate::data::{ModelKey, ModelRates, Tokens};
 use crate::error::BillError;
 use crate::models_dev::{EFFORT_SUFFIXES, ModelsDevFallback};
 use crate::parse::read_json;
@@ -141,6 +141,20 @@ pub(crate) fn load_pricing<'a>(
         .collect();
 
     Ok(pricing)
+}
+
+/// Estimated USD cost of one call from token usage and per-M token rates.
+///
+/// Reasoning tokens bill at the output rate; missing rates contribute
+/// nothing.  Used to price calls whose recorded cost is unknown (zero).
+pub(crate) fn estimated_cost(tokens: &Tokens, rates: &ModelRates) -> f64 {
+    let per_million = 1_000_000.0;
+
+    tokens.input as f64 * rates.input.unwrap_or(0.0) / per_million
+        + tokens.cache_read as f64 * rates.cache_read.unwrap_or(0.0) / per_million
+        + tokens.cache_write as f64 * rates.cache_write.unwrap_or(0.0) / per_million
+        + (tokens.output as f64 + tokens.reasoning as f64) * rates.output.unwrap_or(0.0)
+            / per_million
 }
 
 /// Reads the four rates out of a catalog `cost` object.
@@ -288,6 +302,7 @@ fn normalize_model_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::Tokens;
 
     const PAGE_MARKDOWN: &str = r#"
 | Model         | Release status | Category | Tier         | Threshold | Input | Cached input | Output |
@@ -329,6 +344,44 @@ mod tests {
         let mut github = GithubSource::with_markdown(PAGE_MARKDOWN);
 
         assert_eq!(github.rates_for_model("nonexistent-model-9000"), None);
+    }
+
+    #[test]
+    fn estimated_cost_bills_usage_at_rates() {
+        let tokens = Tokens {
+            input: 1_000_000,
+            output: 1_000_000,
+            reasoning: 500_000,
+            cache_read: 2_000_000,
+            cache_write: 500_000,
+        };
+        let rates = ModelRates {
+            input: Some(1.0),
+            cache_read: Some(0.5),
+            cache_write: Some(2.0),
+            output: Some(3.0),
+        };
+
+        assert_eq!(estimated_cost(&tokens, &rates), 7.5);
+    }
+
+    #[test]
+    fn estimated_cost_ignores_missing_rates() {
+        let tokens = Tokens {
+            input: 1_000_000,
+            output: 1_000_000,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        let rates = ModelRates {
+            input: Some(2.0),
+            cache_read: None,
+            cache_write: None,
+            output: None,
+        };
+
+        assert_eq!(estimated_cost(&tokens, &rates), 2.0);
     }
 
     #[test]

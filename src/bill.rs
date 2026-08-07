@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::aggregate::{aggregate, aggregate_agents};
 use crate::context::StorageContext;
-use crate::data::{AgentUsage, Totals, UsageRecord};
+use crate::data::{AgentUsage, ModelKey, ModelRates, Totals, UsageRecord};
 use crate::error::BillError;
 use crate::pricing;
 use crate::render::render_bill;
@@ -89,7 +89,17 @@ fn summarize(
 ) -> Result<BillReport, BillError> {
     let input = filter_providers(input, providers);
 
+    on_task("Loading model pricing");
+    let keys = input
+        .messages
+        .iter()
+        .map(|record| (record.provider.clone(), record.model.clone()))
+        .collect::<BTreeSet<_>>();
+    let pricing = pricing::load_pricing(context.models_file.as_deref(), keys.iter())?;
+
     on_task("Aggregating usage");
+    let messages = estimate_zero_costs(input.messages, &pricing);
+    let input = BillInput { messages, ..input };
     let by_model = aggregate(&input.messages);
     let by_agent = aggregate_agents(&input.messages, &input.session_agents);
     let by_agent = keep_agents_with_usage(by_agent, providers, &input.messages);
@@ -98,11 +108,32 @@ fn summarize(
         sum
     });
 
-    on_task("Loading model pricing");
-    let pricing = pricing::load_pricing(context.models_file.as_deref(), by_model.keys())?;
-
     on_task("Building report");
     Ok(build_report(&input, &by_model, &by_agent, &total, &pricing))
+}
+
+/// Fills in an estimated cost for calls whose recorded cost is unknown.
+///
+/// Subscription usage often has no per-call price recorded; when a rate is
+/// known for the provider/model pair, the call is billed at that rate
+/// instead of leaving a zero row.  Provider corrections are never re-priced.
+fn estimate_zero_costs(
+    messages: Vec<UsageRecord>,
+    pricing: &BTreeMap<ModelKey, ModelRates>,
+) -> Vec<UsageRecord> {
+    messages
+        .into_iter()
+        .map(|mut record| {
+            if record.cost_unknown {
+                let key = (record.provider.clone(), record.model.clone());
+
+                if let Some(rates) = pricing.get(&key) {
+                    record.cost = pricing::estimated_cost(&record.tokens, rates);
+                }
+            }
+            record
+        })
+        .collect()
 }
 
 /// Restricts the bill to the given providers, keeping the full period when
@@ -258,8 +289,8 @@ mod tests {
             tasks,
             [
                 "Loading session data",
-                "Aggregating usage",
                 "Loading model pricing",
+                "Aggregating usage",
                 "Building report",
             ]
         );
@@ -927,6 +958,131 @@ Amount due:  $0.125000 USD
                 "0",
                 "1.9k",
                 "0",
+                "0ms",
+                "$0.000000"
+            ]
+        ));
+        assert!(bill.contains("Amount due:  $0.000000 USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn estimates_zero_cost_usage_from_known_rates() -> Result<(), Box<dyn std::error::Error>> {
+        let (temporary, _) = fixture()?;
+        let models_file = temporary.path().join("models.json");
+
+        fs::write(
+            &models_file,
+            r#"{"openai":{"models":{"gpt-test":{"cost":{"input":1.25,"output":5,"cache_read":0.125}}}}}"#,
+        )?;
+
+        let connection = Connection::open(temporary.path().join(DATABASE_FILE))?;
+        connection.execute(
+            "UPDATE message SET data = ?1 WHERE id = ?2",
+            params![
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0,"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#,
+                "msg_1"
+            ],
+        )?;
+        drop(connection);
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .models_file(&models_file)
+            .build()?;
+        let bill = generate_bill(&context, "ses_abcdef", &[])?;
+
+        // 10 * 1.25 + 6 * 0.125 + (4 + 2) * 5 = 43.25 per million tokens.
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "1",
+                "10",
+                "6",
+                "1",
+                "4",
+                "2",
+                "0ms",
+                "$0.000043"
+            ]
+        ));
+        assert!(bill.contains("Amount due:  $0.000043 USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn never_prices_negative_corrections() -> Result<(), Box<dyn std::error::Error>> {
+        let (temporary, _) = fixture()?;
+        let models_file = temporary.path().join("models.json");
+
+        fs::write(
+            &models_file,
+            r#"{"openrouter":{"models":{"grok-test":{"cost":{"input":1,"output":1}}}}}"#,
+        )?;
+
+        let connection = Connection::open(temporary.path().join(DATABASE_FILE))?;
+        connection.execute(
+            "UPDATE message SET data = ?1 WHERE id = ?2",
+            params![
+                r#"{"role":"assistant","providerID":"openrouter","modelID":"grok-test","cost":-0.005,"tokens":{"input":1000,"output":1884,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+                "msg_1"
+            ],
+        )?;
+        drop(connection);
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .models_file(&models_file)
+            .build()?;
+        let bill = generate_bill(&context, "ses_abcdef", &[])?;
+
+        // The clamped correction stays zero even though a rate is known.
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openrouter / grok-test",
+                "1",
+                "1.0k",
+                "0",
+                "0",
+                "1.9k",
+                "0",
+                "0ms",
+                "$0.000000"
+            ]
+        ));
+        assert!(bill.contains("Amount due:  $0.000000 USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn leaves_zero_cost_unknown_model_unpriced() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "UPDATE message SET data = ?1 WHERE id = ?2",
+            params![
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0,"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#,
+                "msg_1"
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_bill(&context, "ses_abcdef", &[])?;
+
+        // gpt-test has no rate anywhere: the row stays at zero.
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "1",
+                "10",
+                "6",
+                "1",
+                "4",
+                "2",
                 "0ms",
                 "$0.000000"
             ]

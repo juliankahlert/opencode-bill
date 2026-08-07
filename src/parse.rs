@@ -100,6 +100,12 @@ pub(crate) fn parse_assistant(
         return Err(invalid_field(location, "cost must be finite"));
     }
 
+    // A zero cost usually means the client had no price for this model (for
+    // example subscription usage) and the call can be billed at a known
+    // rate; a negative cost is a provider correction, which is clamped to
+    // zero and must never be re-priced.
+    let cost_unknown = cost == 0.0;
+
     // Providers correct over-counted usage with a negative charge; a bill
     // cannot show negative usage, so clamp the charge to zero.
     let cost = cost.max(0.0);
@@ -111,6 +117,7 @@ pub(crate) fn parse_assistant(
         model,
         tokens: usage,
         cost,
+        cost_unknown,
         api_ms: message_api_ms(created, completed, tools),
         created,
         completed,
