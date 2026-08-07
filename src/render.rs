@@ -4,7 +4,7 @@ use crate::error::BillError;
 use crate::report::BillReport;
 
 /// Renders the full bill for one session.
-pub(crate) fn render_bill(report: &BillReport) -> Result<String, BillError> {
+pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
     let mut output = String::new();
 
     output.push_str("OPENCODE SESSION BILL\n");

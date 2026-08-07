@@ -1,29 +1,32 @@
-//! TUI frontend: a loading indicator, then the scrollable ratatui report.
+//! TUI frontend: a loading indicator, then the styled report table printed
+//! into the terminal's scrollback.
+//!
+//! The UI renders inline in the terminal's main buffer instead of the
+//! alternate (exclusive) screen: a loading box right below the shell prompt
+//! refreshes in place while the report is generated, and when it is ready
+//! the loading viewport is erased and the report table is printed over it
+//! from the top, so the table replaces the spinner without any blank
+//! padding in the terminal's scrollback history. The app then exits; the
+//! terminal's own scrollbar provides scrolling.
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
-};
+use crossterm::cursor::{MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::style::Print;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use opencode_bill::{BillReport, StorageContext, load_report_with_progress};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    StatefulWidget, Table, TableState,
-};
-use ratatui::{Frame, Terminal};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, StatefulWidget, Table, TableState};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 /// Spin frames for the loading indicator.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -31,12 +34,18 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const SPINNER_TICK: Duration = Duration::from_millis(100);
 /// Maximum event-poll wait; keeps the spinner animating.
 const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Height of the inline viewport: exactly the spinner box, so no empty rows
+/// pad it above or below while the report is generated.
+const VIEWPORT_HEIGHT: u16 = 5;
 /// Unified column count shared by every report table.
 const COLUMNS: usize = 11;
-/// Lines scrolled per wheel or page input.
-const SCROLL_STEP: isize = 3;
 /// Natural width of every report table column.
-const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 6, 10, 11, 7, 10, 10, 10, 11, 11];
+///
+/// Every section (usage, agent, pricing) shares one 11-column grid, so each
+/// width must fit the longest header that lands in that column: col2 carries
+/// "CACHE READ" in the pricing table, col3 carries "CACHE WRITE" in pricing,
+/// col5 carries "CACHE WRITE" in the agent table.
+const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 10, 11, 11, 11, 10, 10, 10, 11, 11];
 /// Spaces between adjacent table columns.
 const COLUMN_SPACING: u16 = 2;
 
@@ -63,13 +72,8 @@ fn worker(context: StorageContext, reference: String, sender: mpsc::Sender<Progr
 enum View {
     /// Report generation is still running.
     Loading { task: String },
-    /// The report is ready and can be scrolled.
-    Ready {
-        report: BillReport,
-        rows: Vec<Row<'static>>,
-        offset: usize,
-        h_offset: usize,
-    },
+    /// The report is ready and will be printed as a styled table.
+    Ready { report: BillReport },
     /// Report generation failed.
     Failed(String),
 }
@@ -88,7 +92,7 @@ struct App {
 
 /// What the TUI session ended with.
 pub enum TuiOutcome {
-    /// The report was shown (or the user quit before it finished).
+    /// The bill was printed (or the user quit before it finished).
     Success,
     /// The report failed and the failure message that was shown.
     Failed(String),
@@ -99,10 +103,22 @@ pub fn run(context: StorageContext, reference: String) -> Result<TuiOutcome, Str
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || worker(context, reference, sender));
 
-    let _guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
-        .map_err(|failure| failure.to_string())?;
-    terminal.clear().map_err(|failure| failure.to_string())?;
+    let mut guard = TerminalGuard::enter()?;
+    // Start on a fresh row so the viewport does not overwrite the shell prompt line.
+    execute!(io::stdout(), Print("\n")).map_err(|failure| failure.to_string())?;
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+        },
+    )
+    .map_err(|failure| failure.to_string())?;
+    let viewport_bottom = {
+        let frame = terminal.get_frame();
+
+        frame.area().bottom().saturating_sub(1)
+    };
+    guard.park_below(viewport_bottom);
 
     let mut app = App {
         view: View::Loading {
@@ -113,12 +129,83 @@ pub fn run(context: StorageContext, reference: String) -> Result<TuiOutcome, Str
         last_tick: Instant::now(),
     };
 
-    while !app.handle_events(&receiver)? {
+    // Spin the loading box until the user quits or the report is ready.
+    loop {
+        if app.handle_events(&receiver)? {
+            break;
+        }
+        if matches!(&app.view, View::Ready { .. }) {
+            break;
+        }
         app.tick();
         terminal
             .draw(|frame| app.draw(frame))
             .map_err(|failure| failure.to_string())?;
     }
+
+    // The report is ready: erase the whole loading viewport and print the
+    // styled report table from its top, so neither the spinner nor its blank
+    // surround ever reaches the terminal history, then exit.
+    if let View::Ready { report } = &app.view {
+        // Re-capture the viewport: a mid-loading resize moves it.
+        let viewport = {
+            let frame = terminal.get_frame();
+
+            frame.area()
+        };
+        guard.park_at(viewport.y + 1);
+        drop(terminal);
+
+        // The table starts right below the shell prompt, so blank every
+        // viewport row first; the table then writes over the cleared area.
+        // Still in raw mode here (the guard parks the cursor when it drops).
+        {
+            let mut stdout = io::stdout().lock();
+
+            for row in viewport.y + 1..=viewport.y + viewport.height {
+                write!(stdout, "\x1b[{row};1H\x1b[K").map_err(|failure| failure.to_string())?;
+            }
+            stdout.flush().map_err(|failure| failure.to_string())?;
+        }
+        // The guard parks the cursor on the viewport's top row and restores the
+        // terminal; the table then starts exactly where the spinner was.
+        drop(guard);
+        let mut stdout = io::stdout().lock();
+
+        // Render the whole report into one table at its natural width, then
+        // print each row with its style; the terminal's own scrollbar provides
+        // vertical navigation.
+        let rows = build_rows(report);
+        let natural_width = table_natural_width();
+        let row_count = u16::try_from(rows.len()).map_err(|_| "report has too many rows")?;
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, natural_width, row_count));
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+
+        table.render(
+            Rect::new(0, 0, natural_width, row_count),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        // Print the table; the visible width is the natural width (the table
+        // is wider than most terminals, so the terminal wraps it).
+        for y in 0..row_count {
+            stdout
+                .write_all(render_row(&table_buffer, y, natural_width).as_bytes())
+                .map_err(|failure| failure.to_string())?;
+        }
+        stdout.flush().map_err(|failure| failure.to_string())?;
+        return Ok(TuiOutcome::Success);
+    }
+
+    // Re-capture after the loop: a mid-session resize moves the inline viewport.
+    let viewport_bottom = {
+        let frame = terminal.get_frame();
+
+        frame.area().bottom().saturating_sub(1)
+    };
+    guard.park_below(viewport_bottom);
 
     Ok(match app.view {
         View::Failed(failure) => TuiOutcome::Failed(failure),
@@ -126,26 +213,56 @@ pub fn run(context: StorageContext, reference: String) -> Result<TuiOutcome, Str
     })
 }
 
-/// Enters raw mode and the alternate screen, restoring them on drop.
-struct TerminalGuard;
+/// Where the cursor parks when the TUI exits.
+enum Park {
+    /// The row below the inline viewport (the shell prompt lands under it).
+    Below(u16),
+    /// The top row of the loading viewport; the report table starts there.
+    At(u16),
+    /// Leave the cursor where it is.
+    None,
+}
+
+/// Enters raw mode without the alternate screen, restoring the terminal on
+/// drop.
+struct TerminalGuard {
+    /// Where the cursor parks when this guard drops.
+    park: Park,
+}
 
 impl TerminalGuard {
     fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|failure| failure.to_string())?;
-        let guard = TerminalGuard;
-        let mut stdout = io::stdout();
 
-        execute!(stdout, EnterAlternateScreen).map_err(|failure| failure.to_string())?;
-        execute!(stdout, EnableMouseCapture).map_err(|failure| failure.to_string())?;
-        Ok(guard)
+        Ok(TerminalGuard { park: Park::None })
+    }
+
+    fn park_below(&mut self, viewport_bottom: u16) {
+        self.park = Park::Below(viewport_bottom);
+    }
+
+    fn park_at(&mut self, row: u16) {
+        self.park = Park::At(row);
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture);
-        let _ = execute!(stdout, LeaveAlternateScreen);
+
+        // MoveTo must come first: raw mode disables OPOST, so "\n" is a bare
+        // LF that preserves the column. With the cursor at column 0 the LF
+        // parks the shell prompt on the row below the viewport.
+        match self.park {
+            Park::Below(bottom) => {
+                let _ = execute!(stdout, MoveTo(0, bottom), Print("\n"));
+            }
+            Park::At(row) => {
+                let _ = execute!(stdout, MoveTo(0, row.saturating_sub(1)));
+            }
+            Park::None => {}
+        }
+        let _ = execute!(stdout, Show);
         let _ = disable_raw_mode();
     }
 }
@@ -166,7 +283,7 @@ impl App {
             {
                 self.handle_key(key)
             }
-            Event::Mouse(mouse) => self.handle_mouse(mouse.kind),
+            Event::Mouse(_) => Ok(false),
             _ => Ok(false),
         }
     }
@@ -179,12 +296,7 @@ impl App {
                     self.view = View::Loading { task };
                 }
                 Ok(Progress::Done(Ok(report))) => {
-                    self.view = View::Ready {
-                        rows: build_rows(&report),
-                        report,
-                        offset: 0,
-                        h_offset: 0,
-                    };
+                    self.view = View::Ready { report };
                 }
                 Ok(Progress::Done(Err(failure))) => {
                     self.view = View::Failed(failure);
@@ -207,80 +319,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Ok(true),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Ok(true),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.scroll(-1);
-                Ok(false)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.scroll(1);
-                Ok(false)
-            }
-            KeyCode::PageUp => {
-                self.scroll(-SCROLL_STEP * 4);
-                Ok(false)
-            }
-            KeyCode::PageDown => {
-                self.scroll(SCROLL_STEP * 4);
-                Ok(false)
-            }
-            KeyCode::Home => {
-                self.scroll_to(0);
-                Ok(false)
-            }
-            KeyCode::End => {
-                self.scroll_to(usize::MAX);
-                Ok(false)
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.scroll_horizontal(-SCROLL_STEP);
-                Ok(false)
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.scroll_horizontal(SCROLL_STEP);
-                Ok(false)
-            }
             _ => Ok(false),
-        }
-    }
-
-    /// Handles one mouse event; returns `true` when the user quits.
-    fn handle_mouse(&mut self, kind: MouseEventKind) -> Result<bool, String> {
-        match kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll(-SCROLL_STEP);
-                Ok(false)
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll(SCROLL_STEP);
-                Ok(false)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    /// Moves the report scroll offset by a signed step.
-    fn scroll(&mut self, delta: isize) {
-        if let View::Ready { offset, rows, .. } = &mut self.view {
-            let max = rows.len().saturating_sub(1);
-            let next = (*offset as isize + delta).clamp(0, max as isize);
-
-            *offset = next as usize;
-        }
-    }
-
-    /// Jumps the report scroll offset to a content row.
-    fn scroll_to(&mut self, target: usize) {
-        if let View::Ready { offset, rows, .. } = &mut self.view {
-            let max = rows.len().saturating_sub(1);
-
-            *offset = target.min(max);
-        }
-    }
-
-    /// Moves the report horizontal offset by a signed step.
-    fn scroll_horizontal(&mut self, delta: isize) {
-        if let View::Ready { h_offset, .. } = &mut self.view {
-            *h_offset = (*h_offset as isize + delta * SCROLL_STEP).max(0) as usize;
         }
     }
 
@@ -296,12 +335,9 @@ impl App {
     fn draw(&self, frame: &mut Frame) {
         match &self.view {
             View::Loading { task } => draw_loading(frame, self, task),
-            View::Ready {
-                report,
-                rows,
-                offset,
-                h_offset,
-            } => draw_report(frame, report, rows, *offset, *h_offset),
+            // Never reached: run() prints the table and exits the moment the
+            // report is ready, before the next frame is drawn.
+            View::Ready { .. } => {}
             View::Failed(failure) => draw_failure(frame, failure),
         }
     }
@@ -331,100 +367,18 @@ fn draw_loading(frame: &mut Frame, app: &App, task: &str) {
         .block(Block::bordered().title("Generating bill"));
 
     frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, centered_rect(60, 5, area));
+    frame.render_widget(
+        paragraph,
+        Rect::new(
+            area.x,
+            area.y,
+            60.min(area.width),
+            VIEWPORT_HEIGHT.min(area.height),
+        ),
+    );
 }
 
-/// Draws the finished report as one scrollable table.
-fn draw_report(
-    frame: &mut Frame,
-    report: &BillReport,
-    rows: &[Row<'static>],
-    offset: usize,
-    h_offset: usize,
-) {
-    let area = frame.area();
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Fill(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    let table_area = chunks[1];
-    // The rightmost column is reserved for the vertical scrollbar.
-    let content_area = Rect::new(
-        table_area.x,
-        table_area.y,
-        table_area.width.saturating_sub(1),
-        table_area.height,
-    );
-    let header = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "OPENCODE SESSION BILL",
-            Style::new().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!(
-            "Session: {}   Title: {}   Sessions: {} (root + descendants)",
-            report.session_id, report.session_title, report.session_count
-        )),
-    ]);
-    let footer = Paragraph::new(Line::from(Span::styled(
-        "↑/↓ or j/k scroll · ←/→ or h/l horizontal · q quit",
-        Style::new().fg(Color::DarkGray),
-    )));
-
-    frame.render_widget(Clear, chunks[0]);
-    frame.render_widget(header, chunks[0]);
-
-    let row_count = rows.len();
-    let natural_width = table_natural_width();
-    let max_h = natural_width.saturating_sub(content_area.width);
-    let h = h_offset.min(max_h as usize) as u16;
-    // Never scroll past the last full screenful of rows.
-    let offset = offset.min(row_count.saturating_sub(content_area.height as usize));
-    let table = Table::new(rows.to_vec(), column_widths()).column_spacing(COLUMN_SPACING);
-    let mut table_state = TableState::new().with_offset(offset);
-    let mut table_buffer = Buffer::empty(Rect::new(0, 0, natural_width, content_area.height));
-
-    table.render(
-        Rect::new(0, 0, natural_width, content_area.height),
-        &mut table_buffer,
-        &mut table_state,
-    );
-
-    // Blit the visible horizontal window of the table into the frame.
-    {
-        let frame_buffer = frame.buffer_mut();
-
-        for y in 0..content_area.height {
-            for x in 0..content_area.width {
-                let source_x = h + x;
-
-                if source_x < natural_width {
-                    let cell = table_buffer[(source_x, y)].clone();
-                    frame_buffer[(content_area.x + x, content_area.y + y)] = cell;
-                } else {
-                    frame_buffer[(content_area.x + x, content_area.y + y)].reset();
-                }
-            }
-        }
-    }
-
-    if row_count > content_area.height as usize {
-        let mut scrollbar_state = ScrollbarState::new(row_count)
-            .position(offset)
-            .viewport_content_length(content_area.height as usize);
-        frame.render_stateful_widget(
-            Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
-            table_area,
-            &mut scrollbar_state,
-        );
-    }
-
-    frame.render_widget(Clear, chunks[2]);
-    frame.render_widget(footer, chunks[2]);
-}
-
-/// Draws a centered failure message.
+/// Draws the failure message in the viewport.
 fn draw_failure(frame: &mut Frame, failure: &str) {
     let area = frame.area();
     let lines = vec![
@@ -443,7 +397,15 @@ fn draw_failure(frame: &mut Frame, failure: &str) {
         .block(Block::bordered().title("Error"));
 
     frame.render_widget(Clear, area);
-    frame.render_widget(paragraph, centered_rect(80, 5, area));
+    frame.render_widget(
+        paragraph,
+        Rect::new(
+            area.x,
+            area.y,
+            80.min(area.width),
+            VIEWPORT_HEIGHT.min(area.height),
+        ),
+    );
 }
 
 /// Builds every report row as one 11-column table, padded to a shared grid.
@@ -463,6 +425,7 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "COST (USD)",
     ]));
     rows.extend(data_rows(&report.usage_rows));
+    rows.push(blank_row());
 
     rows.push(title_row("USAGE BY AGENT CLASS"));
     rows.push(header_row(&[
@@ -479,6 +442,7 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "COST (USD)",
     ]));
     rows.extend(data_rows(&report.agent_rows));
+    rows.push(blank_row());
 
     if !report.pricing_rows.is_empty() {
         rows.push(title_row("MODEL PRICING (USD / 1M TOKENS)"));
@@ -490,6 +454,7 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
             "OUTPUT",
         ]));
         rows.extend(data_rows(&report.pricing_rows));
+        rows.push(blank_row());
     }
 
     rows.push(title_row("TOTAL"));
@@ -508,6 +473,11 @@ fn column_widths() -> [Constraint; COLUMNS] {
 /// Full width of the unified report table in columns.
 fn table_natural_width() -> u16 {
     COLUMN_WIDTHS.iter().sum::<u16>() + COLUMN_SPACING * (COLUMNS as u16 - 1)
+}
+
+/// An empty row that separates the report tables.
+fn blank_row() -> Row<'static> {
+    Row::new(vec![Cell::new("")])
 }
 
 /// A section title row that spans the first column.
@@ -591,12 +561,96 @@ fn padded_cells(mut cells: Vec<Cell<'static>>) -> Vec<Cell<'static>> {
     cells
 }
 
-/// A rect centered on `area`, clamped to its size.
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
+/// Renders one table row as styled terminal output.
+///
+/// The table is rendered into a full-width buffer; the terminal wraps long
+/// lines itself, so every column keeps its natural width and alignment.
+fn render_row(buffer: &Buffer, y: u16, width: u16) -> String {
+    let mut output = String::new();
+    let mut active_style = Style::default();
 
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
+    for x in 0..width {
+        let cell = &buffer[(x, y)];
+
+        if cell.style() != active_style {
+            // Reset first: a style change to plain text must not leak the
+            // previous attributes to the end of the line.
+            output.push('\x1b');
+            output.push_str("[0m");
+            output.push_str(&ansi_style(cell.style()));
+            active_style = cell.style();
+        }
+        output.push_str(cell.symbol());
+    }
+    output.push_str("\x1b[0m\n");
+    output
+}
+
+/// Converts a ratatui style into ANSI SGR escape codes.
+fn ansi_style(style: Style) -> String {
+    let mut codes: Vec<String> = Vec::new();
+
+    match style.fg {
+        Some(Color::Black) => codes.push("30".to_owned()),
+        Some(Color::Red) => codes.push("31".to_owned()),
+        Some(Color::Green) => codes.push("32".to_owned()),
+        Some(Color::Yellow) => codes.push("33".to_owned()),
+        Some(Color::Blue) => codes.push("34".to_owned()),
+        Some(Color::Magenta) => codes.push("35".to_owned()),
+        Some(Color::Cyan) => codes.push("36".to_owned()),
+        Some(Color::Gray) => codes.push("37".to_owned()),
+        Some(Color::DarkGray) => codes.push("90".to_owned()),
+        Some(Color::LightRed) => codes.push("91".to_owned()),
+        Some(Color::LightGreen) => codes.push("92".to_owned()),
+        Some(Color::LightYellow) => codes.push("93".to_owned()),
+        Some(Color::LightBlue) => codes.push("94".to_owned()),
+        Some(Color::LightMagenta) => codes.push("95".to_owned()),
+        Some(Color::LightCyan) => codes.push("96".to_owned()),
+        Some(Color::White) => codes.push("97".to_owned()),
+        Some(Color::Rgb(red, green, blue)) => {
+            codes.push(format!("38;2;{red};{green};{blue}"));
+        }
+        Some(Color::Indexed(index)) => {
+            codes.push(format!("38;5;{index}"));
+        }
+        Some(Color::Reset) | None => {}
+    }
+
+    let modifiers = style.add_modifier;
+
+    if modifiers.contains(Modifier::BOLD) {
+        codes.push("1".to_owned());
+    }
+    if modifiers.contains(Modifier::DIM) {
+        codes.push("2".to_owned());
+    }
+    if modifiers.contains(Modifier::ITALIC) {
+        codes.push("3".to_owned());
+    }
+    if modifiers.contains(Modifier::UNDERLINED) {
+        codes.push("4".to_owned());
+    }
+    if modifiers.contains(Modifier::SLOW_BLINK) {
+        codes.push("5".to_owned());
+    }
+    if modifiers.contains(Modifier::RAPID_BLINK) {
+        codes.push("6".to_owned());
+    }
+    if modifiers.contains(Modifier::REVERSED) {
+        codes.push("7".to_owned());
+    }
+    if modifiers.contains(Modifier::HIDDEN) {
+        codes.push("8".to_owned());
+    }
+    if modifiers.contains(Modifier::CROSSED_OUT) {
+        codes.push("9".to_owned());
+    }
+
+    if codes.is_empty() {
+        return String::new();
+    }
+
+    format!("\x1b[{}m", codes.join(";"))
 }
 
 #[cfg(test)]
@@ -645,8 +699,9 @@ mod tests {
     fn builds_unified_report_table() {
         let rows = build_rows(&fixture_report());
 
-        // usage header + row, agent title + header + row, total title + 2 rows.
-        assert_eq!(rows.len(), 8);
+        // usage header + row + blank, agent title + header + row + blank,
+        // total title + 2 rows.
+        assert_eq!(rows.len(), 10);
     }
 
     #[test]
@@ -657,48 +712,8 @@ mod tests {
     }
 
     #[test]
-    fn scrolls_only_within_the_report() {
-        let mut app = App {
-            view: View::Ready {
-                rows: build_rows(&fixture_report()),
-                report: fixture_report(),
-                offset: 0,
-                h_offset: 0,
-            },
-            started: Instant::now(),
-            frame: 0,
-            last_tick: Instant::now(),
-        };
-
-        app.scroll(-5);
-        assert!(matches!(&app.view, View::Ready { offset: 0, .. }));
-
-        app.scroll(1000);
-        assert!(matches!(&app.view, View::Ready { offset: 7, .. }));
-
-        app.scroll_to(usize::MAX);
-        assert!(matches!(&app.view, View::Ready { offset: 7, .. }));
-    }
-
-    #[test]
-    fn scrolls_horizontally_without_going_negative() {
-        let mut app = App {
-            view: View::Ready {
-                rows: build_rows(&fixture_report()),
-                report: fixture_report(),
-                offset: 0,
-                h_offset: 0,
-            },
-            started: Instant::now(),
-            frame: 0,
-            last_tick: Instant::now(),
-        };
-
-        app.scroll_horizontal(-10);
-        assert!(matches!(&app.view, View::Ready { h_offset: 0, .. }));
-
-        app.scroll_horizontal(5);
-        assert!(matches!(&app.view, View::Ready { h_offset: 15, .. }));
+    fn computes_natural_table_width() {
+        assert_eq!(table_natural_width(), 169);
     }
 
     #[test]
@@ -725,7 +740,89 @@ mod tests {
     }
 
     #[test]
-    fn computes_natural_table_width() {
-        assert_eq!(table_natural_width(), 160);
+    fn renders_styled_header_row() {
+        let rows = build_rows(&fixture_report());
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 10),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let line = render_row(&table_buffer, 0, table_natural_width());
+
+        assert!(line.starts_with("\x1b[0m\x1b[1;4m"), "line: {line}");
+        assert!(line.contains("PROVIDER / MODEL"), "line: {line}");
+        assert!(line.ends_with("\x1b[0m\n"), "line: {line}");
+    }
+
+    #[test]
+    fn renders_agent_header_without_truncation() {
+        let rows = build_rows(&fixture_report());
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 10),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        // Row 4 is the agent header; REQUESTS and CACHE WRITE once fit only
+        // truncated (QUESTS / E WRITE) because they landed in narrow columns.
+        let line = render_row(&table_buffer, 4, table_natural_width());
+
+        assert!(line.contains("AGENT"), "line: {line}");
+        assert!(line.contains("SESSIONS"), "line: {line}");
+        assert!(line.contains("REQUESTS"), "line: {line}");
+        assert!(line.contains("CACHE READ"), "line: {line}");
+        assert!(line.contains("CACHE WRITE"), "line: {line}");
+        assert!(line.contains("COST (USD)"), "line: {line}");
+    }
+
+    #[test]
+    fn renders_dimmed_total_row() {
+        let rows = build_rows(&fixture_report());
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 10),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        // Row 9 is the last TOTAL row ("Amount due: ...").
+        let line = render_row(&table_buffer, 9, table_natural_width());
+
+        assert!(line.contains("\x1b[0m\x1b[90m"), "line: {line}");
+        assert!(line.contains("Amount due"), "line: {line}");
+    }
+
+    #[test]
+    fn quits_on_q_esc_or_ctrl_c() {
+        let mut app = App {
+            view: View::Loading {
+                task: "Starting".to_owned(),
+            },
+            started: Instant::now(),
+            frame: 0,
+            last_tick: Instant::now(),
+        };
+        let mut quits = |code: KeyCode, modifiers: KeyModifiers| {
+            app.handle_key(KeyEvent::new(code, modifiers)).unwrap()
+        };
+
+        assert!(quits(KeyCode::Char('q'), KeyModifiers::empty()));
+        assert!(quits(KeyCode::Char('Q'), KeyModifiers::empty()));
+        assert!(quits(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(quits(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!quits(KeyCode::Char('h'), KeyModifiers::empty()));
+        assert!(!quits(KeyCode::Char('x'), KeyModifiers::empty()));
     }
 }

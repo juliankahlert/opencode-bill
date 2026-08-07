@@ -26,4 +26,5 @@ mod timing;
 pub use bill::{generate_bill, load_report_with_progress};
 pub use context::{DataDirectorySet, MissingDataDirectory, StorageContext, StorageContextBuilder};
 pub use error::BillError;
+pub use render::render_bill;
 pub use report::BillReport;
