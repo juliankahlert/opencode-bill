@@ -5,6 +5,7 @@
 //! * `data`: plain records (`UsageRecord`, `Totals`, `ModelRates`, ...)
 //! * `store`: the `SessionStore` trait, session and month models
 //! * `pricing`: the `PricingSource` trait and its catalog / GitHub impls
+//! * `models_dev`: generic models.dev-style fallback pricing catalog
 //! * `database` / `legacy`: the two concrete session stores
 //! * `parse` / `timing` / `aggregate` / `report` / `render`: pipelines
 //! * `bill`: report loading, the public entry points
@@ -16,6 +17,7 @@ mod data;
 mod database;
 mod error;
 mod legacy;
+mod models_dev;
 mod parse;
 mod pricing;
 mod render;
