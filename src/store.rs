@@ -1,32 +1,14 @@
 //! Session model and the store abstraction behind it.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
 
-use crate::data::UsageRecord;
 use crate::error::BillError;
 use crate::report::BillHeader;
 
 /// A session reference must contain at least this many characters.
 const MINIMUM_REFERENCE_LENGTH: usize = 6;
-
-/// Everything one bill needs: the period header, usage records, and bounds.
-pub(crate) struct BillInput {
-    /// Identifies the billed period (session tree or calendar month).
-    pub(crate) header: BillHeader,
-    /// Number of sessions that produced the billed usage.
-    pub(crate) session_count: usize,
-    /// Agent class declared by each billed session.
-    pub(crate) session_agents: BTreeMap<String, String>,
-    /// Every assistant call in the billed period.
-    pub(crate) messages: Vec<UsageRecord>,
-    /// Earliest message timestamp (Unix millis).
-    pub(crate) wall_start: Option<u64>,
-    /// Latest message timestamp (Unix millis).
-    pub(crate) wall_end: Option<u64>,
-}
 
 /// One calendar month of one year, as a billing window.
 pub(crate) struct CalendarMonth {
@@ -73,18 +55,50 @@ fn month_midnight(date: NaiveDate, year: u32, month: u32) -> Result<u64, BillErr
 }
 
 /// Wherever session data lives (SQLite or legacy JSON), it loads the same way.
+///
+/// Stores are stateless readers: they return raw storage rows and never
+/// intern, parse, or build worlds.  `parse_system` turns raw rows into a
+/// `World`.
 pub(crate) trait SessionStore {
-    /// Resolves a session reference and loads the whole session tree.
-    fn load(&self, reference: &str) -> Result<BillInput, BillError>;
-    /// Loads every message recorded in one calendar month.
-    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError>;
+    /// Resolves a session reference and loads its raw storage rows.
+    fn load(&self, reference: &str) -> Result<RawLoad, BillError>;
+    /// Loads every raw storage row recorded in one calendar month.
+    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError>;
 }
 
-/// Assistant messages plus the wall-clock bounds of every message read.
-pub(crate) struct MessageLoad {
-    pub(crate) messages: Vec<UsageRecord>,
-    pub(crate) wall_start: Option<u64>,
-    pub(crate) wall_end: Option<u64>,
+/// Raw storage rows of one load: unparsed messages plus session components.
+///
+/// Rows keep the exact order the store produced them in, so the interning
+/// order of `parse_system` — and with it the byte-identical bill output — is
+/// preserved.
+pub(crate) struct RawLoad {
+    pub(crate) header: BillHeader,
+    pub(crate) session_count: usize,
+    pub(crate) sessions: Vec<RawSession>,
+    pub(crate) messages: Vec<RawMessage>,
+    pub(crate) parts: Vec<RawPart>,
+}
+
+/// One session row: identity plus the agent and parent-session components.
+pub(crate) struct RawSession {
+    pub(crate) id: String,
+    pub(crate) agent: Option<String>,
+    pub(crate) parent: Option<String>,
+}
+
+/// One message row: raw JSON payload plus its storage location.
+pub(crate) struct RawMessage {
+    pub(crate) id: String,
+    pub(crate) session_id: String,
+    pub(crate) location: String,
+    pub(crate) json: String,
+}
+
+/// One tool part row: raw JSON payload plus its storage location.
+pub(crate) struct RawPart {
+    pub(crate) message_id: String,
+    pub(crate) location: String,
+    pub(crate) json: String,
 }
 
 /// A candidate session match that can display itself in ambiguity errors.

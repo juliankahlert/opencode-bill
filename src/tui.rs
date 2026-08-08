@@ -10,8 +10,6 @@
 //! terminal's own scrollbar provides scrolling.
 
 use std::io::{self, Write};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{MoveTo, Show};
@@ -30,6 +28,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, StatefulWidget, Table, TableState};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 /// Spin frames for the loading indicator.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -52,7 +52,7 @@ const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 10, 11, 11, 11, 10, 10, 10, 11, 1
 /// Spaces between adjacent table columns.
 const COLUMN_SPACING: u16 = 2;
 
-/// One message from the background worker to the UI thread.
+/// One message from the background worker to the UI task.
 enum Progress {
     /// A work phase is about to start.
     Task(String),
@@ -61,11 +61,14 @@ enum Progress {
 }
 
 /// Runs the worker that loads the report in the background.
-fn worker(
+///
+/// The worker is a tokio task on the runtime; the unbounded channel lets the
+/// sync `on_task` callback send progress without awaiting.
+async fn worker(
     context: StorageContext,
     request: crate::Request,
     providers: Vec<String>,
-    sender: mpsc::Sender<Progress>,
+    sender: mpsc::UnboundedSender<Progress>,
 ) {
     let result = match request {
         crate::Request::Session(reference) => {
@@ -116,14 +119,16 @@ pub enum TuiOutcome {
 }
 
 /// Runs the TUI and returns an error message when something fails.
-pub fn run(
+///
+/// Must be called from a tokio runtime: the worker runs as a spawned task.
+pub async fn run(
     context: StorageContext,
     request: crate::Request,
     providers: Vec<String>,
 ) -> Result<TuiOutcome, String> {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
 
-    thread::spawn(move || worker(context, request, providers, sender));
+    let worker_task = tokio::spawn(worker(context, request, providers, sender));
 
     let mut guard = TerminalGuard::enter()?;
     // Start on a fresh row so the viewport does not overwrite the shell prompt line.
@@ -153,7 +158,7 @@ pub fn run(
 
     // Spin the loading box until the user quits or the report is ready.
     loop {
-        if app.handle_events(&receiver)? {
+        if app.handle_events(&mut receiver)? {
             break;
         }
         if matches!(&app.view, View::Ready { .. }) {
@@ -220,6 +225,12 @@ pub fn run(
         stdout.flush().map_err(|failure| failure.to_string())?;
         return Ok(TuiOutcome::Success);
     }
+
+    // The user quit before the report was ready: cancel the worker.  The
+    // pipeline runs as blocking code inside the task, so it finishes its
+    // current phase before the cancellation lands; runtime shutdown then
+    // waits only for that bounded work instead of the full pipeline.
+    worker_task.abort();
 
     // Re-capture after the loop: a mid-session resize moves the inline viewport.
     let viewport_bottom = {
@@ -291,7 +302,10 @@ impl Drop for TerminalGuard {
 
 impl App {
     /// Polls input and worker messages; returns `true` when the user quits.
-    fn handle_events(&mut self, receiver: &mpsc::Receiver<Progress>) -> Result<bool, String> {
+    fn handle_events(
+        &mut self,
+        receiver: &mut mpsc::UnboundedReceiver<Progress>,
+    ) -> Result<bool, String> {
         self.drain_progress(receiver);
 
         if !event::poll(EVENT_TIMEOUT).map_err(|failure| failure.to_string())? {
@@ -311,27 +325,18 @@ impl App {
     }
 
     /// Applies every pending worker message to the current view.
-    fn drain_progress(&mut self, receiver: &mpsc::Receiver<Progress>) {
+    fn drain_progress(&mut self, receiver: &mut mpsc::UnboundedReceiver<Progress>) {
         loop {
             match receiver.try_recv() {
-                Ok(Progress::Task(task)) => {
-                    self.view = View::Loading { task };
-                }
-                Ok(Progress::Done(Ok(report))) => {
-                    self.view = View::Ready { report };
-                }
-                Ok(Progress::Done(Err(failure))) => {
-                    self.view = View::Failed(failure);
-                }
-                Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if matches!(self.view, View::Loading { .. }) {
-                        self.view =
-                            View::Failed("report generation stopped unexpectedly".to_owned());
-                    }
-
+                Ok(Progress::Task(task)) => self.view = View::Loading { task },
+                Ok(Progress::Done(Ok(report))) => self.view = View::Ready { report },
+                Ok(Progress::Done(Err(failure))) => self.view = View::Failed(failure),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) if matches!(self.view, View::Loading { .. }) => {
+                    self.view = View::Failed("report generation stopped unexpectedly".to_owned());
                     return;
                 }
+                Err(TryRecvError::Disconnected) => return,
             }
         }
     }

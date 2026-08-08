@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use log::warn;
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
-use crate::data::{ModelKey, ModelRates, Tokens};
+use crate::data::{Interner, ModelKey, ModelRates, Tokens};
 use crate::error::BillError;
 use crate::models_dev::{EFFORT_SUFFIXES, ModelsDevFallback};
 use crate::parse::read_json;
@@ -27,9 +28,12 @@ const USER_AGENT: &str = concat!("opencode-bill/", env!("CARGO_PKG_VERSION"));
 const NETWORK_FETCH_ALLOWED: bool = cfg!(not(test));
 
 /// Looks up pricing for a provider/model pair.
+///
+/// Implementations are read-only: `rates` never mutates the source, so the
+/// trait stays a pure behavior contract.
 pub(crate) trait PricingSource {
     /// Returns the per-million-token rates, or `None` when unknown.
-    fn rates(&mut self, provider: &str, model: &str) -> Option<ModelRates>;
+    fn rates(&self, provider: &str, model: &str) -> Option<ModelRates>;
 }
 
 /// Pricing read from a local models.json catalog.
@@ -49,7 +53,7 @@ impl CatalogSource {
 }
 
 impl PricingSource for CatalogSource {
-    fn rates(&mut self, provider: &str, model: &str) -> Option<ModelRates> {
+    fn rates(&self, provider: &str, model: &str) -> Option<ModelRates> {
         let catalog = self.catalog.as_ref()?;
 
         catalog
@@ -62,42 +66,58 @@ impl PricingSource for CatalogSource {
 }
 
 /// Pricing fetched from GitHub's Copilot pricing page.
+///
+/// Fetch-once state lives in the struct as a `tokio::sync::OnceCell`; the
+/// `PricingSource` impl itself stays behavior-only.  The pipeline fetches
+/// only when the bill uses `github-copilot`, and awaits
+/// [`GithubSource::ensure_fetched`] before the pricing phase.  A failed
+/// attempt is remembered (`Err(())` is stored), so the network is never hit
+/// twice in one process.
 #[derive(Default)]
 pub(crate) struct GithubSource {
-    fetched: bool,
-    markdown: Option<String>,
+    markdown: OnceCell<Result<String, ()>>,
 }
 
 impl PricingSource for GithubSource {
-    fn rates(&mut self, provider: &str, model: &str) -> Option<ModelRates> {
+    fn rates(&self, provider: &str, model: &str) -> Option<ModelRates> {
         if provider != "github-copilot" {
             return None;
         }
 
-        let markdown = self.markdown()?;
+        let markdown = self.markdown_now()?;
 
         github_model_pricing(markdown, model)
     }
 }
 
 impl GithubSource {
-    /// Fetches the pricing page at most once, warning on failure.
-    fn markdown(&mut self) -> Option<&str> {
-        if !self.fetched {
-            self.fetched = true;
+    /// Fetches the pricing page at most once, waiting for an in-flight fetch.
+    ///
+    /// Returns the page markdown when the fetch succeeded.  A failed attempt
+    /// is stored, so later calls return `None` without touching the network.
+    pub(crate) async fn ensure_fetched(&self) -> Option<&str> {
+        self.markdown
+            .get_or_init(|| async {
+                if !NETWORK_FETCH_ALLOWED {
+                    return Err(());
+                }
 
-            if NETWORK_FETCH_ALLOWED {
-                self.markdown = match fetch_github_pricing() {
-                    Ok(markdown) => Some(markdown),
-                    Err(failure) => {
-                        warn!("could not fetch GitHub Copilot pricing: {failure}");
-                        None
-                    }
-                };
-            }
-        }
+                fetch_github_pricing().await.map_err(|failure| {
+                    warn!("could not fetch GitHub Copilot pricing: {failure}");
+                })
+            })
+            .await
+            .as_ref()
+            .ok()
+            .map(String::as_str)
+    }
 
-        self.markdown.as_deref()
+    /// The fetched page markdown, without waiting for a fetch in flight.
+    fn markdown_now(&self) -> Option<&str> {
+        self.markdown
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .map(String::as_str)
     }
 
     /// Rates for a model from the pricing page, regardless of provider.
@@ -105,8 +125,8 @@ impl GithubSource {
     /// Last resort of the pricing chain: the page lists current list prices
     /// for well-known models, so a model used under any provider can reuse
     /// them when nothing more specific is known.
-    pub(crate) fn rates_for_model(&mut self, model: &str) -> Option<ModelRates> {
-        let markdown = self.markdown()?;
+    pub(crate) fn rates_for_model(&self, model: &str) -> Option<ModelRates> {
+        let markdown = self.markdown_now()?;
 
         github_model_pricing(markdown, model)
     }
@@ -114,47 +134,58 @@ impl GithubSource {
     /// A source pre-seeded with page markdown, for tests.
     #[cfg(test)]
     fn with_markdown(markdown: &str) -> Self {
-        Self {
-            fetched: true,
-            markdown: Some(markdown.to_owned()),
-        }
+        let source = Self::default();
+
+        let _ = source.markdown.set(Ok(markdown.to_owned()));
+        source
     }
 }
 
 /// Collects rates for the requested models: catalog, GitHub, then generic.
+///
+/// `github` is the shared fetch-once source; the pipeline already awaited
+/// `ensure_fetched` when the bill needs it, so `rates` reads the page
+/// without touching the network.
 pub(crate) fn load_pricing<'a>(
     models_file: Option<&Path>,
     keys: impl Iterator<Item = &'a ModelKey>,
+    interner: &Interner,
+    github: &GithubSource,
 ) -> Result<BTreeMap<ModelKey, ModelRates>, BillError> {
-    let mut catalog = CatalogSource::new(models_file)?;
-    let mut github = GithubSource::default();
-    let mut fallback = ModelsDevFallback;
+    let catalog = CatalogSource::new(models_file)?;
+    let fallback = ModelsDevFallback;
     let pricing = keys
         .filter_map(|key| {
+            let provider = interner.resolve_provider(key.0);
+            let model = interner.resolve_model(key.1);
+
             catalog
-                .rates(&key.0, &key.1)
-                .or_else(|| github.rates(&key.0, &key.1))
-                .or_else(|| fallback.rates(&key.0, &key.1))
-                .or_else(|| github.rates_for_model(&key.1))
-                .map(|rates| (key.clone(), rates))
+                .rates(provider, model)
+                .or_else(|| github.rates(provider, model))
+                .or_else(|| fallback.rates(provider, model))
+                .or_else(|| github.rates_for_model(model))
+                .map(|rates| (*key, rates))
         })
         .collect();
 
     Ok(pricing)
 }
 
-/// Estimated USD cost of one call from token usage and per-M token rates.
+/// Estimated micro-dollar cost of one call from token usage and rates.
 ///
 /// Reasoning tokens bill at the output rate; missing rates contribute
 /// nothing.  Used to price calls whose recorded cost is unknown (zero).
-pub(crate) fn estimated_cost(tokens: &Tokens, rates: &ModelRates) -> f64 {
+/// Rounds to even micro-dollars so the printed bill matches the old `f64`
+/// path byte-for-byte.
+pub(crate) fn estimated_cost_micros(tokens: &Tokens, rates: &ModelRates) -> i64 {
     let per_million = 1_000_000.0;
-
-    tokens.input as f64 * rates.input.unwrap_or(0.0) / per_million
+    let usd = tokens.input as f64 * rates.input.unwrap_or(0.0) / per_million
         + tokens.cache_read as f64 * rates.cache_read.unwrap_or(0.0) / per_million
         + tokens.cache_write as f64 * rates.cache_write.unwrap_or(0.0) / per_million
         + (tokens.output as f64 + tokens.reasoning as f64) * rates.output.unwrap_or(0.0)
-            / per_million
+            / per_million;
+
+    crate::data::usd_to_micros(usd)
 }
 
 /// Reads the four rates out of a catalog `cost` object.
@@ -184,15 +215,19 @@ fn valid_rate(value: &Value) -> Option<f64> {
 }
 
 /// Downloads the GitHub Copilot pricing page as markdown.
-fn fetch_github_pricing() -> Result<String, reqwest::Error> {
-    reqwest::blocking::Client::builder()
+async fn fetch_github_pricing() -> Result<String, reqwest::Error> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECONDS))
         .user_agent(USER_AGENT)
-        .build()?
+        .build()?;
+
+    client
         .get(GITHUB_COPILOT_PRICING_URL)
-        .send()?
+        .send()
+        .await?
         .error_for_status()?
         .text()
+        .await
 }
 
 /// Rates for one model from the pricing page's markdown table.
@@ -326,7 +361,7 @@ mod tests {
 
     #[test]
     fn rates_for_model_ignores_provider() {
-        let mut github = GithubSource::with_markdown(PAGE_MARKDOWN);
+        let github = GithubSource::with_markdown(PAGE_MARKDOWN);
 
         assert_eq!(
             github.rates_for_model("gpt-5.6-sol-medium"),
@@ -341,7 +376,7 @@ mod tests {
 
     #[test]
     fn rates_for_model_misses_unknown_model() {
-        let mut github = GithubSource::with_markdown(PAGE_MARKDOWN);
+        let github = GithubSource::with_markdown(PAGE_MARKDOWN);
 
         assert_eq!(github.rates_for_model("nonexistent-model-9000"), None);
     }
@@ -362,7 +397,7 @@ mod tests {
             output: Some(3.0),
         };
 
-        assert_eq!(estimated_cost(&tokens, &rates), 7.5);
+        assert_eq!(estimated_cost_micros(&tokens, &rates), 7_500_000);
     }
 
     #[test]
@@ -381,21 +416,31 @@ mod tests {
             output: None,
         };
 
-        assert_eq!(estimated_cost(&tokens, &rates), 2.0);
+        assert_eq!(estimated_cost_micros(&tokens, &rates), 2_000_000);
     }
 
     #[test]
     fn load_pricing_falls_back_to_generic_catalog() {
+        let mut interner = Interner::default();
         let keys = [
-            ("openai".to_owned(), "gpt-4o".to_owned()),
-            ("openai".to_owned(), "unknown-model-9000".to_owned()),
+            (
+                interner.intern_provider("openai"),
+                interner.intern_model("gpt-4o"),
+            ),
+            (
+                interner.intern_provider("openai"),
+                interner.intern_model("unknown-model-9000"),
+            ),
         ];
 
-        let pricing = load_pricing(None, keys.iter()).unwrap();
+        let pricing = load_pricing(None, keys.iter(), &interner, &GithubSource::default()).unwrap();
 
         assert_eq!(pricing.len(), 1);
         assert_eq!(
-            pricing[&("openai".to_owned(), "gpt-4o".to_owned())],
+            pricing[&(
+                interner.intern_provider("openai"),
+                interner.intern_model("gpt-4o")
+            )],
             ModelRates {
                 input: Some(2.50),
                 cache_read: None,
@@ -418,18 +463,54 @@ mod tests {
         )
         .unwrap();
 
-        let keys = [("openai".to_owned(), "gpt-4o".to_owned())];
+        let mut interner = Interner::default();
+        let keys = [(
+            interner.intern_provider("openai"),
+            interner.intern_model("gpt-4o"),
+        )];
 
-        let pricing = load_pricing(Some(&models_file), keys.iter()).unwrap();
+        let pricing = load_pricing(
+            Some(&models_file),
+            keys.iter(),
+            &interner,
+            &GithubSource::default(),
+        )
+        .unwrap();
 
         assert_eq!(
-            pricing[&("openai".to_owned(), "gpt-4o".to_owned())],
+            pricing[&(
+                interner.intern_provider("openai"),
+                interner.intern_model("gpt-4o")
+            )],
             ModelRates {
                 input: Some(1.25),
                 cache_read: Some(0.125),
                 cache_write: None,
                 output: Some(5.00),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_once_remembers_failure_without_network() {
+        let github = GithubSource::default();
+
+        // Test builds never fetch: the cell stores the failure on first
+        // call and answers from memory afterwards.
+        assert_eq!(github.ensure_fetched().await, None);
+        assert_eq!(github.ensure_fetched().await, None);
+        assert!(github.markdown.get().is_some());
+        assert_eq!(github.rates("github-copilot", "gpt-5.6-sol"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "network test; run manually with --ignored"]
+    async fn fetches_live_github_pricing_page() {
+        let markdown = fetch_github_pricing().await.expect("live fetch failed");
+
+        assert!(
+            markdown.contains('|'),
+            "pricing page should be a markdown table"
         );
     }
 }

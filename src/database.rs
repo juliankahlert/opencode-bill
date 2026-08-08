@@ -1,17 +1,15 @@
 //! SQLite-backed session store.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use log::{debug, warn};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::data::ToolSpans;
 use crate::error::BillError;
-use crate::parse::{message_time, parse_assistant, parse_json, tool_span};
 use crate::report::BillHeader;
-use crate::store::{BillInput, CalendarMonth, MessageLoad, SessionStore, unique_match};
-use crate::timing::{earliest, latest};
+use crate::store::{
+    CalendarMonth, RawLoad, RawMessage, RawPart, RawSession, SessionStore, unique_match,
+};
 
 /// Sessions stored in OpenCode's SQLite database.
 pub(crate) struct SqliteStore {
@@ -25,57 +23,49 @@ impl SqliteStore {
 }
 
 impl SessionStore for SqliteStore {
-    fn load(&self, reference: &str) -> Result<BillInput, BillError> {
+    fn load(&self, reference: &str) -> Result<RawLoad, BillError> {
         let connection = open_database(&self.path)?;
         let matches = database_matches(&connection, &self.path, reference)?;
         let id = unique_match(reference, matches)?;
         let title = database_title(&connection, &self.path, &id)?;
-        let session_count = database_session_count(&connection, &self.path, &id)?;
-        let session_agents = database_session_agents(&connection, &self.path, &id)?;
-        let MessageLoad {
-            messages,
-            wall_start,
-            wall_end,
-        } = database_messages(&connection, &self.path, &id, &session_agents)?;
+        let sessions = database_session_rows(&connection, &self.path, &id)?;
+        let session_count = sessions.len();
+        let parts = database_tool_parts(&connection, &self.path, &id)?;
+        let messages = database_messages(&connection, &self.path, &id)?;
 
         debug!(
-            "loaded {} assistant messages from {session_count} SQLite sessions",
+            "loaded {} raw messages from {session_count} SQLite sessions",
             messages.len()
         );
-        Ok(BillInput {
+        Ok(RawLoad {
             header: BillHeader::Session { id, title },
             session_count,
-            session_agents,
+            sessions,
             messages,
-            wall_start,
-            wall_end,
+            parts,
         })
     }
 
-    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError> {
+    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError> {
         let connection = open_database(&self.path)?;
-        let session_agents = database_month_agents(&connection, &self.path, month)?;
-        let MessageLoad {
-            messages,
-            wall_start,
-            wall_end,
-        } = database_month_messages(&connection, &self.path, month, &session_agents)?;
+        let sessions = database_month_session_rows(&connection, &self.path, month)?;
+        let parts = database_month_tool_parts(&connection, &self.path, month)?;
+        let messages = database_month_messages(&connection, &self.path, month)?;
         let session_count = database_month_session_count(&connection, &self.path, month)?;
 
         debug!(
-            "loaded {} assistant messages from {session_count} SQLite sessions in {}",
+            "loaded {} raw messages from {session_count} SQLite sessions in {}",
             messages.len(),
             month.label
         );
-        Ok(BillInput {
+        Ok(RawLoad {
             header: BillHeader::Month {
                 label: month.label.clone(),
             },
             session_count,
-            session_agents,
+            sessions,
             messages,
-            wall_start,
-            wall_end,
+            parts,
         })
     }
 }
@@ -127,76 +117,80 @@ fn database_title(connection: &Connection, path: &Path, id: &str) -> Result<Stri
         .ok_or_else(|| BillError::SessionNotFound(id.to_owned()))
 }
 
-/// Count of the session and all its descendants.
-fn database_session_count(
+/// Raw session rows of one root: every descendant with its agent and
+/// parent-session components, ordered by session id.
+fn database_session_rows(
     connection: &Connection,
     path: &Path,
     id: &str,
-) -> Result<usize, BillError> {
-    connection
-        .query_row(
-            r#"WITH RECURSIVE descendants(id) AS (
-                   SELECT id FROM session WHERE id = ?1
-                   UNION
-                   SELECT session.id FROM session
-                   JOIN descendants ON session.parent_id = descendants.id
-               )
-               SELECT COUNT(*) FROM descendants"#,
-            params![id],
-            |row| row.get(0),
-        )
-        .map_err(|source| database_error(path, source))
-}
-
-/// Agent class of every descendant session, keyed by session ID.
-fn database_session_agents(
-    connection: &Connection,
-    path: &Path,
-    id: &str,
-) -> Result<BTreeMap<String, String>, BillError> {
-    if !database_has_column(connection, path, "session", "agent")? {
-        return Ok(BTreeMap::new());
-    }
-
+) -> Result<Vec<RawSession>, BillError> {
+    let has_agent = database_has_column(connection, path, "session", "agent")?;
+    let has_parent = database_has_column(connection, path, "session", "parent_id")?;
+    let agent_column = if has_agent { ", session.agent" } else { "" };
+    let parent_column = if has_parent {
+        ", session.parent_id"
+    } else {
+        ""
+    };
+    let agent_index = if has_agent { Some(1usize) } else { None };
+    let parent_index = if has_parent {
+        Some(1 + usize::from(has_agent))
+    } else {
+        None
+    };
     let mut statement = connection
-        .prepare(
+        .prepare(&format!(
             r#"WITH RECURSIVE descendants(id) AS (
                    SELECT id FROM session WHERE id = ?1
                    UNION
                    SELECT session.id FROM session
                    JOIN descendants ON session.parent_id = descendants.id
                )
-               SELECT session.id, session.agent FROM session
+               SELECT session.id{agent_column}{parent_column} FROM session
                JOIN descendants ON session.id = descendants.id
-               ORDER BY session.id"#,
-        )
+               ORDER BY session.id"#
+        ))
         .map_err(|source| database_error(path, source))?;
     let rows = statement
         .query_map(params![id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            let session_id = row.get::<_, String>(0)?;
+            let agent = match agent_index {
+                Some(index) => row.get::<_, Option<String>>(index)?,
+                None => None,
+            };
+            let parent = match parent_index {
+                Some(index) => row.get::<_, Option<String>>(index)?,
+                None => None,
+            };
+
+            Ok((session_id, agent, parent))
         })
         .map_err(|source| database_error(path, source))?;
-    let mut agents = BTreeMap::new();
+    let mut sessions = Vec::new();
 
     for row in rows {
-        let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
+        let (session_id, agent, parent) = row.map_err(|source| database_error(path, source))?;
 
-        if let Some(agent) = agent.filter(|agent| !agent.is_empty()) {
-            agents.insert(session_id, agent);
-        }
+        sessions.push(RawSession {
+            id: session_id,
+            agent,
+            parent,
+        });
     }
 
-    Ok(agents)
+    Ok(sessions)
 }
 
-/// Agent class of every session that has a message in the month window.
-fn database_month_agents(
+/// Raw agent-component rows of every session with a message in the month
+/// window, ordered by session id.  Sessions without an agent component are
+/// not part of the month's agent tree.
+fn database_month_session_rows(
     connection: &Connection,
     path: &Path,
     month: &CalendarMonth,
-) -> Result<BTreeMap<String, String>, BillError> {
+) -> Result<Vec<RawSession>, BillError> {
     if !database_has_column(connection, path, "session", "agent")? {
-        return Ok(BTreeMap::new());
+        return Ok(Vec::new());
     }
 
     let mut statement = connection
@@ -212,26 +206,29 @@ fn database_month_agents(
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .map_err(|source| database_error(path, source))?;
-    let mut agents = BTreeMap::new();
+    let mut sessions = Vec::new();
 
     for row in rows {
         let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
 
         if let Some(agent) = agent.filter(|agent| !agent.is_empty()) {
-            agents.insert(session_id, agent);
+            sessions.push(RawSession {
+                id: session_id,
+                agent: Some(agent),
+                parent: None,
+            });
         }
     }
 
-    Ok(agents)
+    Ok(sessions)
 }
 
-/// Every assistant message in the session tree, plus the wall-clock bounds.
+/// Every raw message row in the session tree, in wall-clock order.
 fn database_messages(
     connection: &Connection,
     path: &Path,
     id: &str,
-    session_agents: &BTreeMap<String, String>,
-) -> Result<MessageLoad, BillError> {
+) -> Result<Vec<RawMessage>, BillError> {
     let mut statement = connection
         .prepare(
             r#"WITH RECURSIVE descendants(id) AS (
@@ -255,44 +252,28 @@ fn database_messages(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let tools = database_tool_spans(connection, path, id)?;
     let mut messages = Vec::new();
-    let mut wall_start = None;
-    let mut wall_end = None;
 
     for row in rows {
         let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
-        let value = parse_json(&json, &location)?;
-        let (created, completed) = message_time(&value);
 
-        wall_start = earliest(wall_start, created);
-        wall_end = latest(wall_end, completed.or(created));
-
-        if let Some(message) = parse_assistant(
-            &value,
-            &location,
-            &session_id,
-            session_agents.get(&session_id).map(String::as_str),
-            tools.get(&message_id).map_or(&[][..], Vec::as_slice),
-        )? {
-            messages.push(message);
-        }
+        messages.push(RawMessage {
+            id: message_id,
+            session_id,
+            location: location.clone(),
+            json,
+        });
     }
 
-    Ok(MessageLoad {
-        messages,
-        wall_start,
-        wall_end,
-    })
+    Ok(messages)
 }
 
-/// Every assistant message recorded in one calendar month, plus the bounds.
+/// Every raw message row recorded in one calendar month, in wall-clock order.
 fn database_month_messages(
     connection: &Connection,
     path: &Path,
     month: &CalendarMonth,
-    session_agents: &BTreeMap<String, String>,
-) -> Result<MessageLoad, BillError> {
+) -> Result<Vec<RawMessage>, BillError> {
     let mut statement = connection
         .prepare(
             r#"SELECT message.id, message.session_id, message.data FROM message
@@ -310,35 +291,20 @@ fn database_month_messages(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let tools = database_month_tool_spans(connection, path, month)?;
     let mut messages = Vec::new();
-    let mut wall_start = None;
-    let mut wall_end = None;
 
     for row in rows {
         let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
-        let value = parse_json(&json, &location)?;
-        let (created, completed) = message_time(&value);
 
-        wall_start = earliest(wall_start, created);
-        wall_end = latest(wall_end, completed.or(created));
-
-        if let Some(message) = parse_assistant(
-            &value,
-            &location,
-            &session_id,
-            session_agents.get(&session_id).map(String::as_str),
-            tools.get(&message_id).map_or(&[][..], Vec::as_slice),
-        )? {
-            messages.push(message);
-        }
+        messages.push(RawMessage {
+            id: message_id,
+            session_id,
+            location: location.clone(),
+            json,
+        });
     }
 
-    Ok(MessageLoad {
-        messages,
-        wall_start,
-        wall_end,
-    })
+    Ok(messages)
 }
 
 /// Number of distinct sessions with at least one message in the month window.
@@ -357,15 +323,15 @@ fn database_month_session_count(
         .map_err(|source| database_error(path, source))
 }
 
-/// Collects the tool-call spans of every message in the session tree.
-fn database_tool_spans(
+/// Raw tool part rows of every message in the session tree.
+fn database_tool_parts(
     connection: &Connection,
     path: &Path,
     id: &str,
-) -> Result<ToolSpans, BillError> {
+) -> Result<Vec<RawPart>, BillError> {
     if !database_has_table(connection, path, "part")? {
         warn!("no 'part' table: API time will still include tool calls");
-        return Ok(ToolSpans::new());
+        return Ok(Vec::new());
     }
 
     let mut statement = connection
@@ -386,29 +352,30 @@ fn database_tool_spans(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let mut spans = ToolSpans::new();
+    let mut parts = Vec::new();
 
     for row in rows {
         let (message_id, json) = row.map_err(|source| database_error(path, source))?;
-        let value = parse_json(&json, &location)?;
 
-        if let Some(span) = tool_span(&value) {
-            spans.entry(message_id).or_default().push(span);
-        }
+        parts.push(RawPart {
+            message_id,
+            location: location.clone(),
+            json,
+        });
     }
 
-    Ok(spans)
+    Ok(parts)
 }
 
-/// Tool-call spans of every message recorded in one calendar month.
-fn database_month_tool_spans(
+/// Raw tool part rows of every message recorded in one calendar month.
+fn database_month_tool_parts(
     connection: &Connection,
     path: &Path,
     month: &CalendarMonth,
-) -> Result<ToolSpans, BillError> {
+) -> Result<Vec<RawPart>, BillError> {
     if !database_has_table(connection, path, "part")? {
         warn!("no 'part' table: API time will still include tool calls");
-        return Ok(ToolSpans::new());
+        return Ok(Vec::new());
     }
 
     let mut statement = connection
@@ -424,18 +391,19 @@ fn database_month_tool_spans(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let mut spans = ToolSpans::new();
+    let mut parts = Vec::new();
 
     for row in rows {
         let (message_id, json) = row.map_err(|source| database_error(path, source))?;
-        let value = parse_json(&json, &location)?;
 
-        if let Some(span) = tool_span(&value) {
-            spans.entry(message_id).or_default().push(span);
-        }
+        parts.push(RawPart {
+            message_id,
+            location: location.clone(),
+            json,
+        });
     }
 
-    Ok(spans)
+    Ok(parts)
 }
 
 /// Whether the database has a table with the given name.

@@ -51,7 +51,7 @@ enum Request {
     Month(u32, u32),
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
     let data_dir = arguments.data_dir.as_ref();
     let context = match data_dir {
@@ -62,7 +62,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let request = resolve_request(arguments.month, arguments.session, today);
 
     if io::stdout().is_terminal() {
-        return match tui::run(context, request, arguments.providers)? {
+        return match tui::run(context, request, arguments.providers).await? {
             tui::TuiOutcome::Success => Ok(()),
             tui::TuiOutcome::Failed(failure) => Err(failure.into()),
         };
@@ -92,10 +92,11 @@ fn resolve_request(month: Option<u8>, session: Option<String>, today: NaiveDate)
     }
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     env_logger::init();
 
-    if let Err(failure) = run() {
+    if let Err(failure) = run().await {
         debug!("command failed: {failure}");
         eprintln!("opencode-bill: {failure}");
         return ExitCode::FAILURE;

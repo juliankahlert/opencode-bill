@@ -1,16 +1,88 @@
 //! Orchestration: load a session or month, summarize it, build the report.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::aggregate::{aggregate, aggregate_agents};
-use crate::context::StorageContext;
-use crate::data::{AgentUsage, ModelKey, ModelRates, Totals, UsageRecord};
+use crate::context::{StorageContext, Store};
+use crate::data::{AgentId, AgentUsage, ModelKey, ModelRates, Totals, UsageStore, World};
 use crate::error::BillError;
+use crate::parse::parse_system;
 use crate::pricing;
 use crate::render::render_bill;
 use crate::report::{BillReport, build_report};
-use crate::store::{BillInput, CalendarMonth, SessionStore, validate_reference};
+use crate::store::{CalendarMonth, RawLoad, SessionStore, validate_reference};
 use crate::timing::{earliest, latest};
+
+/// Lockless progress counters of one bill pipeline run.
+///
+/// Every counter is an atomic updated from the parallel workers, so no lock
+/// guards them.  The phase counter marks the pipeline stage; the message and
+/// row counters feed the TUI progress path (Phase 8) and are asserted by
+/// tests.  Systems stay pure: progress is external observation, not state
+/// the systems read to decide anything.
+#[derive(Default)]
+pub(crate) struct PipelineProgress {
+    /// Pipeline phase: 0 load, 1 parse, 2 price, 3 aggregate, 4 render.
+    phase: AtomicUsize,
+    /// Messages parsed so far, counted by the parallel parse workers.
+    parsed_messages: AtomicU64,
+    /// Rows folded during aggregation, counted in both aggregate folds.
+    folded_rows: AtomicU64,
+}
+
+impl PipelineProgress {
+    /// Marks the pipeline phase that is about to run.
+    pub(crate) fn note_phase(&self, phase: usize) {
+        self.phase.store(phase, Ordering::Relaxed);
+    }
+
+    /// Counts one parsed message from a parallel worker.
+    pub(crate) fn parsed_message(&self) {
+        self.parsed_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one folded row from an aggregate worker.
+    pub(crate) fn folded_row(&self) {
+        self.folded_rows.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Runs a future on the current tokio runtime, creating one when absent.
+///
+/// The public entry points stay synchronous; the pipeline internals run on
+/// tokio so the store read can run on the blocking pool.  The GitHub pricing
+/// fetch runs inline in the pricing phase, gated on the bill using
+/// `github-copilot`.  Inside a runtime the calling thread parks with
+/// `block_in_place`, so even a single-core multi-thread runtime cannot
+/// deadlock waiting for a spawned task.  A `current_thread` runtime polls
+/// spawned tasks from the same `block_on`, so it needs no parking.
+///
+/// Contract: when a runtime exists it must be entered on its own thread — a
+/// `current_thread` handle entered from a foreign thread panics inside
+/// tokio.  All in-crate callers (CLI and TUI tasks on the `#[tokio::main]`
+/// runtime) satisfy this; external users should call the public functions
+/// from plain synchronous code.  Blind spot: a foreign runtime configured
+/// with `max_blocking_threads(1)` can deadlock with `block_in_place` +
+/// `spawn_blocking` on a single task; crate-created runtimes use tokio
+/// defaults.
+fn block_on<F: Future>(future: F) -> Result<F::Output, BillError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::CurrentThread => Ok(handle.block_on(future)),
+            _ => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        },
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(BillError::Runtime)?;
+
+            Ok(runtime.block_on(future))
+        }
+    }
+}
 
 /// Generates a deterministic plain-text bill for one OpenCode session.
 ///
@@ -46,18 +118,24 @@ pub fn generate_monthly_bill(
 /// `on_task` runs before every phase (loading, aggregation, pricing, report
 /// building) so a UI can show which step is currently in progress. When
 /// `providers` is non-empty, only usage from those providers is included.
+///
+/// The pipeline runs on tokio internally (store read on the blocking pool,
+/// gated GitHub pricing fetch in the pricing phase); the function itself
+/// stays synchronous.
 pub fn load_report_with_progress(
     context: &StorageContext,
     reference: &str,
     providers: &[String],
-    mut on_task: impl FnMut(&str),
+    on_task: impl FnMut(&str),
 ) -> Result<BillReport, BillError> {
-    validate_reference(reference)?;
+    let mut on_task = on_task;
 
-    on_task("Loading session data");
-    let input = context.store().load(reference)?;
-
-    summarize(context, input, providers, &mut on_task)
+    block_on(load_report_async(
+        context,
+        reference,
+        providers,
+        &mut on_task,
+    ))?
 }
 
 /// Loads one calendar month and builds the report data, reporting each step.
@@ -65,51 +143,213 @@ pub fn load_report_with_progress(
 /// `on_task` runs before every phase (loading, aggregation, pricing, report
 /// building) so a UI can show which step is currently in progress. When
 /// `providers` is non-empty, only usage from those providers is included.
+///
+/// The pipeline runs on tokio internally (store read on the blocking pool,
+/// gated GitHub pricing fetch in the pricing phase); the function itself
+/// stays synchronous.
 pub fn load_month_report_with_progress(
     context: &StorageContext,
     year: u32,
     month: u32,
     providers: &[String],
-    mut on_task: impl FnMut(&str),
+    on_task: impl FnMut(&str),
 ) -> Result<BillReport, BillError> {
-    let month = CalendarMonth::new(year, month)?;
+    let mut on_task = on_task;
 
-    on_task("Loading month data");
-    let input = context.store().load_month(&month)?;
-
-    summarize(context, input, providers, &mut on_task)
+    block_on(load_month_report_async(
+        context,
+        year,
+        month,
+        providers,
+        &mut on_task,
+    ))?
 }
 
-/// Runs the aggregation, pricing, and report-building phases.
-fn summarize(
+/// The async session pipeline: loads the store on the blocking pool, then
+/// parses, prices, aggregates, and renders on the calling thread.  The
+/// GitHub pricing page is fetched only when the bill uses `github-copilot`.
+async fn load_report_async(
     context: &StorageContext,
-    input: BillInput,
+    reference: &str,
     providers: &[String],
     on_task: &mut impl FnMut(&str),
 ) -> Result<BillReport, BillError> {
-    let input = filter_providers(input, providers);
+    let progress = PipelineProgress::default();
 
+    on_task("Loading session data");
+    progress.note_phase(0);
+    let world = load_system(context, reference, &progress).await?;
+
+    summarize_async(context, world, providers, on_task, &progress).await
+}
+
+/// The async month pipeline: loads the store on the blocking pool, then
+/// parses, prices, aggregates, and renders on the calling thread.  The
+/// GitHub pricing page is fetched only when the bill uses `github-copilot`.
+async fn load_month_report_async(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    providers: &[String],
+    on_task: &mut impl FnMut(&str),
+) -> Result<BillReport, BillError> {
+    let progress = PipelineProgress::default();
+
+    on_task("Loading month data");
+    progress.note_phase(0);
+    let world = load_month_system(context, year, month, &progress).await?;
+
+    summarize_async(context, world, providers, on_task, &progress).await
+}
+
+/// Loads a session tree from the store and parses it into a world.
+///
+/// The store read is I/O bound, so it runs on the tokio blocking pool and
+/// keeps the runtime worker threads free for other async I/O; the parse
+/// (compute) runs on the calling thread after the join.
+async fn load_system(
+    context: &StorageContext,
+    reference: &str,
+    progress: &PipelineProgress,
+) -> Result<World, BillError> {
+    validate_reference(reference)?;
+
+    let data_dir = context.data_dir.clone();
+    let reference = reference.to_owned();
+    let raw = blocking_load(move || Store::select(&data_dir).load(&reference)).await?;
+
+    parse_system(raw, progress)
+}
+
+/// Loads one calendar month from the store and parses it into a world.
+///
+/// The store read is I/O bound, so it runs on the tokio blocking pool; the
+/// month window is built inside the task because the store owns it only
+/// during the read.
+async fn load_month_system(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    progress: &PipelineProgress,
+) -> Result<World, BillError> {
+    let data_dir = context.data_dir.clone();
+    let raw = blocking_load(move || {
+        Store::select(&data_dir).load_month(&CalendarMonth::new(year, month)?)
+    })
+    .await?;
+
+    parse_system(raw, progress)
+}
+
+/// Runs an I/O-bound store read on the tokio blocking pool.
+///
+/// A failed join means the blocking task itself failed (only possible when
+/// it panicked — the crate has no panic paths), mapped to `BillError::Runtime`
+/// so every failure stays a `Result`.
+async fn blocking_load<F>(load: F) -> Result<RawLoad, BillError>
+where
+    F: FnOnce() -> Result<RawLoad, BillError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(load)
+        .await
+        .map_err(|failure| BillError::Runtime(std::io::Error::other(failure.to_string())))?
+}
+
+/// Runs the pricing, aggregation, and report-building systems.
+///
+/// The GitHub pricing fetch (spawned only for bills that use `github-copilot`)
+/// is awaited before the pricing phase; the compute phases stay synchronous.
+async fn summarize_async(
+    context: &StorageContext,
+    world: World,
+    providers: &[String],
+    on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
+) -> Result<BillReport, BillError> {
+    let mut world = filter_providers(world, providers);
+
+    progress.note_phase(2);
+    let pricing = price_system_async(context, &mut world, on_task).await?;
+
+    progress.note_phase(3);
+    let (by_model, by_agent, total) = aggregate_system(&world, providers, progress);
+
+    progress.note_phase(4);
+    on_task("Building report");
+    Ok(render_system(
+        &world, &by_model, &by_agent, &total, &pricing,
+    ))
+}
+
+/// Resolves model rates and fills the estimated cost component lane.
+///
+/// Fetches the GitHub pricing page only when the bill actually uses
+/// `github-copilot`, so catalog-only and offline bills never touch the
+/// network (matching the pre-migration lazy fetch).
+async fn price_system_async(
+    context: &StorageContext,
+    world: &mut World,
+    on_task: &mut impl FnMut(&str),
+) -> Result<BTreeMap<ModelKey, ModelRates>, BillError> {
     on_task("Loading model pricing");
-    let keys = input
-        .messages
-        .iter()
-        .map(|record| (record.provider.clone(), record.model.clone()))
+    let keys = world
+        .entities
+        .rows()
+        .map(|row| (row.provider, row.model))
         .collect::<BTreeSet<_>>();
-    let pricing = pricing::load_pricing(context.models_file.as_deref(), keys.iter())?;
+    let needs_github = keys
+        .iter()
+        .any(|key| world.interner.resolve_provider(key.0) == "github-copilot");
+
+    // The never-fetched default source answers every lookup with `None`, so
+    // the pricing chain is unchanged for bills without github-copilot rows.
+    let github = pricing::GithubSource::default();
+
+    if needs_github {
+        let _ = github.ensure_fetched().await;
+    }
+    let pricing = pricing::load_pricing(
+        context.models_file.as_deref(),
+        keys.iter(),
+        &world.interner,
+        &github,
+    )?;
 
     on_task("Aggregating usage");
-    let messages = estimate_zero_costs(input.messages, &pricing);
-    let input = BillInput { messages, ..input };
-    let by_model = aggregate(&input.messages);
-    let by_agent = aggregate_agents(&input.messages, &input.session_agents);
-    let by_agent = keep_agents_with_usage(by_agent, providers, &input.messages);
+    estimate_zero_costs(&mut world.entities, &pricing);
+    Ok(pricing)
+}
+
+/// Folds the entity components into per-model and per-agent totals.
+fn aggregate_system(
+    world: &World,
+    providers: &[String],
+    progress: &PipelineProgress,
+) -> (
+    BTreeMap<ModelKey, Totals>,
+    BTreeMap<AgentId, AgentUsage>,
+    Totals,
+) {
+    let by_model = aggregate(&world.entities, progress);
+    let by_agent = aggregate_agents(&world.entities, &world.sessions, progress);
+    let by_agent = keep_agents_with_usage(by_agent, providers, &world.entities);
     let total = by_model.values().fold(Totals::default(), |mut sum, row| {
         sum.merge(row);
         sum
     });
 
-    on_task("Building report");
-    Ok(build_report(&input, &by_model, &by_agent, &total, &pricing))
+    (by_model, by_agent, total)
+}
+
+/// Produces the report data from the world and its aggregated components.
+fn render_system(
+    world: &World,
+    by_model: &BTreeMap<ModelKey, Totals>,
+    by_agent: &BTreeMap<AgentId, AgentUsage>,
+    total: &Totals,
+    pricing: &BTreeMap<ModelKey, ModelRates>,
+) -> BillReport {
+    build_report(world, by_model, by_agent, total, pricing, &world.interner)
 }
 
 /// Fills in an estimated cost for calls whose recorded cost is unknown.
@@ -117,23 +357,19 @@ fn summarize(
 /// Subscription usage often has no per-call price recorded; when a rate is
 /// known for the provider/model pair, the call is billed at that rate
 /// instead of leaving a zero row.  Provider corrections are never re-priced.
-fn estimate_zero_costs(
-    messages: Vec<UsageRecord>,
-    pricing: &BTreeMap<ModelKey, ModelRates>,
-) -> Vec<UsageRecord> {
-    messages
-        .into_iter()
-        .map(|mut record| {
-            if record.cost_unknown {
-                let key = (record.provider.clone(), record.model.clone());
+fn estimate_zero_costs(store: &mut UsageStore, pricing: &BTreeMap<ModelKey, ModelRates>) {
+    let entities = store.entities().collect::<Vec<_>>();
 
-                if let Some(rates) = pricing.get(&key) {
-                    record.cost = pricing::estimated_cost(&record.tokens, rates);
-                }
-            }
-            record
-        })
-        .collect()
+    for (entity, row) in entities {
+        if row.cost_unknown
+            && let Some(rates) = pricing.get(&(row.provider, row.model))
+        {
+            // The entity came from this store's own lanes, so the checked
+            // write cannot miss; ignore the defensive `false`.
+            let _ =
+                store.set_cost_micros(entity, pricing::estimated_cost_micros(&row.tokens, rates));
+        }
+    }
 }
 
 /// Restricts the bill to the given providers, keeping the full period when
@@ -141,30 +377,43 @@ fn estimate_zero_costs(
 ///
 /// Wall bounds are recomputed from the kept assistant calls, so the reported
 /// times cover only the requested providers.
-fn filter_providers(input: BillInput, providers: &[String]) -> BillInput {
+fn filter_providers(world: World, providers: &[String]) -> World {
     if providers.is_empty() {
-        return input;
+        return world;
     }
 
-    let messages = input
-        .messages
-        .into_iter()
-        .filter(|record| {
-            providers
-                .iter()
-                .any(|provider| provider == &record.provider)
-        })
-        .collect::<Vec<_>>();
+    let World {
+        header,
+        session_count,
+        sessions,
+        entities,
+        wall_start: _,
+        wall_end: _,
+        mut interner,
+    } = world;
+    let wanted = providers
+        .iter()
+        .map(|provider| interner.intern_provider(provider))
+        .collect::<BTreeSet<_>>();
+    let entities = entities
+        .rows()
+        .filter(|row| wanted.contains(&row.provider))
+        .collect::<UsageStore>();
+    let wall_start = entities
+        .rows()
+        .fold(None, |bound, row| earliest(bound, row.created));
+    let wall_end = entities.rows().fold(None, |bound, row| {
+        latest(bound, row.completed.or(row.created))
+    });
 
-    BillInput {
-        wall_start: messages
-            .iter()
-            .fold(None, |bound, record| earliest(bound, record.created)),
-        wall_end: messages.iter().fold(None, |bound, record| {
-            latest(bound, record.completed.or(record.created))
-        }),
-        messages,
-        ..input
+    World {
+        header,
+        session_count,
+        sessions,
+        entities,
+        wall_start,
+        wall_end,
+        interner,
     }
 }
 
@@ -177,17 +426,17 @@ fn filter_providers(input: BillInput, providers: &[String]) -> BillInput {
 /// produced the kept usage, so a filtered row's SESSIONS column does not
 /// overcount sessions whose usage was filtered out.
 fn keep_agents_with_usage(
-    by_agent: BTreeMap<String, AgentUsage>,
+    by_agent: BTreeMap<AgentId, AgentUsage>,
     providers: &[String],
-    messages: &[UsageRecord],
-) -> BTreeMap<String, AgentUsage> {
+    entities: &UsageStore,
+) -> BTreeMap<AgentId, AgentUsage> {
     if providers.is_empty() {
         return by_agent;
     }
 
-    let kept_sessions = messages
-        .iter()
-        .map(|record| record.session_id.as_str())
+    let kept_sessions = entities
+        .rows()
+        .map(|row| row.session_id)
         .collect::<BTreeSet<_>>();
 
     by_agent
@@ -196,7 +445,7 @@ fn keep_agents_with_usage(
         .map(|(agent, mut usage)| {
             usage
                 .sessions
-                .retain(|session| kept_sessions.contains(session.as_str()));
+                .retain(|session| kept_sessions.contains(session));
 
             (agent, usage)
         })
@@ -1496,6 +1745,212 @@ Amount due:  $0.125000 USD
                 "$0.750000"
             ]
         ));
+        Ok(())
+    }
+
+    /// Number of synthetic providers in the profile fixture.
+    const PROFILE_PROVIDERS: u32 = 5;
+    /// Number of synthetic models per provider in the profile fixture.
+    const PROFILE_MODELS: u32 = 10;
+
+    /// Builds a SQLite fixture with `message_count` assistant messages (one
+    /// tool part each) plus a catalog that prices every synthetic
+    /// provider/model pair, so pricing never touches the network.
+    fn profile_fixture(
+        message_count: u32,
+    ) -> Result<(TempDir, StorageContext), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let database = temporary.path().join(DATABASE_FILE);
+        let connection = Connection::open(&database)?;
+
+        connection.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT, agent TEXT);\
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,\
+             time_created INTEGER NOT NULL, data TEXT NOT NULL);\
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,\
+             session_id TEXT NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title, agent) VALUES (?1, ?2, ?3)",
+            params!["ses_profile_000000", "Profile session", "build"],
+        )?;
+
+        let mut insert_message = connection.prepare(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let mut insert_part = connection.prepare(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+
+        for index in 0..message_count {
+            let provider = index % PROFILE_PROVIDERS;
+            let model = index % PROFILE_MODELS;
+            let created = 1_000 + u64::from(index) * 10;
+            let completed = created + 5_000;
+
+            insert_message.execute(params![
+                format!("msg_{index:06}"),
+                "ses_profile_000000",
+                created as i64,
+                format!(
+                    r#"{{"role":"assistant","providerID":"prov{provider}","modelID":"model{model}","cost":0.125,"time":{{"created":{created},"completed":{completed}}},"tokens":{{"input":10,"output":4,"reasoning":2,"cache":{{"read":6,"write":1}}}}}}"#
+                ),
+            ])?;
+            insert_part.execute(params![
+                format!("prt_{index:06}"),
+                format!("msg_{index:06}"),
+                "ses_profile_000000",
+                format!(
+                    r#"{{"type":"tool","state":{{"status":"completed","time":{{"start":{created},"end":{completed}}}}}}}"#
+                ),
+            ])?;
+        }
+        drop(insert_message);
+        drop(insert_part);
+        drop(connection);
+
+        let models_file = temporary.path().join("models.json");
+
+        fs::write(&models_file, profile_catalog())?;
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .models_file(&models_file)
+            .build()?;
+        Ok((temporary, context))
+    }
+
+    /// Catalog JSON pricing every synthetic provider/model pair.
+    fn profile_catalog() -> String {
+        let mut catalog = String::from("{");
+
+        for provider in 0..PROFILE_PROVIDERS {
+            catalog.push_str(&format!(r#""prov{provider}":{{"models":{{"#));
+
+            for model in 0..PROFILE_MODELS {
+                catalog.push_str(&format!(
+                    r#""model{model}":{{"cost":{{"input":1.25,"output":5,"cache_read":0.125,"cache_write":1}}}}"#
+                ));
+
+                if model + 1 < PROFILE_MODELS {
+                    catalog.push(',');
+                }
+            }
+
+            catalog.push_str("}}");
+
+            if provider + 1 < PROFILE_PROVIDERS {
+                catalog.push(',');
+            }
+        }
+
+        catalog.push('}');
+        catalog
+    }
+
+    /// Measures the time share of every pipeline phase on a synthetic load.
+    ///
+    /// Prints the per-phase durations and shares; the output is captured by
+    /// the test runner unless `--nocapture` is passed.  Run with
+    /// `cargo test --release profiles_pipeline_time_share -- --nocapture`
+    /// for meaningful numbers.
+    #[tokio::test]
+    async fn profiles_pipeline_time_share() -> Result<(), Box<dyn std::error::Error>> {
+        const MESSAGES: u32 = 10_000;
+
+        let (_temporary, context) = profile_fixture(MESSAGES)?;
+        let progress = PipelineProgress::default();
+
+        progress.note_phase(0);
+        let (raw, load) = {
+            let now = std::time::Instant::now();
+            let raw = Store::select(&context.data_dir).load("ses_profile")?;
+
+            (raw, now.elapsed())
+        };
+        let (mut world, parse) = {
+            let now = std::time::Instant::now();
+            let world = parse_system(raw, &progress)?;
+
+            (world, now.elapsed())
+        };
+        let mut noop = |_: &str| {};
+        progress.note_phase(2);
+        let (pricing, price) = {
+            let now = std::time::Instant::now();
+            let pricing = price_system_async(&context, &mut world, &mut noop).await?;
+
+            (pricing, now.elapsed())
+        };
+        progress.note_phase(3);
+        let (aggregates, aggregate) = {
+            let now = std::time::Instant::now();
+            let aggregates = aggregate_system(&world, &[], &progress);
+
+            (aggregates, now.elapsed())
+        };
+        progress.note_phase(4);
+        let (bill, render) = {
+            let now = std::time::Instant::now();
+            let report = render_system(
+                &world,
+                &aggregates.0,
+                &aggregates.1,
+                &aggregates.2,
+                &pricing,
+            );
+            let bill = render_bill(&report)?;
+
+            (bill, now.elapsed())
+        };
+
+        let shares = [
+            ("load", load),
+            ("parse", parse),
+            ("price", price),
+            ("aggregate", aggregate),
+            ("render", render),
+        ];
+        let total = shares
+            .iter()
+            .map(|(_, duration)| duration.as_secs_f64())
+            .sum::<f64>();
+
+        println!("profile: {MESSAGES} messages");
+        for (name, duration) in shares {
+            let share = duration.as_secs_f64() / total * 100.0;
+
+            println!("  {name:<9} {duration:>8?}  {share:5.1}%");
+        }
+        println!("  total     {total:>8.1?}");
+
+        // The lockless counters counted every message once and every row in
+        // both aggregate folds.
+        assert_eq!(
+            progress.parsed_messages.load(Ordering::Relaxed),
+            u64::from(MESSAGES)
+        );
+        assert_eq!(
+            progress.folded_rows.load(Ordering::Relaxed),
+            2 * u64::from(MESSAGES)
+        );
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 4);
+        assert!(!bill.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pipeline_progress_tracks_phases_and_counts() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temporary, context) = fixture()?;
+        let progress = PipelineProgress::default();
+
+        let world = load_system(&context, "ses_abcdef", &progress).await?;
+
+        summarize_async(&context, world, &[], &mut |_| {}, &progress).await?;
+
+        assert_eq!(progress.phase.load(Ordering::Relaxed), 4);
+        assert_eq!(progress.parsed_messages.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.folded_rows.load(Ordering::Relaxed), 2);
         Ok(())
     }
 }

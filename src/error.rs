@@ -60,4 +60,8 @@ pub enum BillError {
         /// Validation detail.
         detail: String,
     },
+
+    /// The tokio runtime could not be started, or a runtime task failed.
+    #[error("async runtime failure: {0}")]
+    Runtime(#[source] std::io::Error),
 }

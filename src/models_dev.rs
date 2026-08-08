@@ -157,7 +157,7 @@ pub(crate) const GENERIC_CATALOG: ModelCatalog = ModelCatalog::new(
 pub(crate) struct ModelsDevFallback;
 
 impl PricingSource for ModelsDevFallback {
-    fn rates(&mut self, _provider: &str, model: &str) -> Option<ModelRates> {
+    fn rates(&self, _provider: &str, model: &str) -> Option<ModelRates> {
         GENERIC_CATALOG.pricing(model).map(|info| ModelRates {
             input: Some(info.input_per_mtok),
             cache_read: None,
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn fallback_serves_generic_catalog() {
-        let mut fallback = ModelsDevFallback;
+        let fallback = ModelsDevFallback;
 
         assert_eq!(
             fallback.rates("openai", "gpt-4o"),
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn fallback_ignores_provider() {
-        let mut fallback = ModelsDevFallback;
+        let fallback = ModelsDevFallback;
 
         let via_unknown_provider = fallback.rates("some-other-provider", "gpt-4o");
         let via_openai = fallback.rates("openai", "gpt-4o");
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn fallback_misses_unknown_model() {
-        let mut fallback = ModelsDevFallback;
+        let fallback = ModelsDevFallback;
 
         assert_eq!(fallback.rates("openai", "unknown-model-9000"), None);
     }

@@ -2,7 +2,7 @@
 //!
 //! The crate is split into data-oriented modules:
 //!
-//! * `data`: plain records (`UsageRecord`, `Totals`, `ModelRates`, ...)
+//! * `data`: component storage (`UsageStore` SoA rows, `Totals`, `ModelRates`, ...)
 //! * `store`: the `SessionStore` trait, session and month models
 //! * `pricing`: the `PricingSource` trait and its catalog / GitHub impls
 //! * `models_dev`: generic models.dev-style fallback pricing catalog

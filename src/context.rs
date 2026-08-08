@@ -8,7 +8,7 @@ use directories::BaseDirs;
 use crate::database::SqliteStore;
 use crate::error::BillError;
 use crate::legacy::LegacyStore;
-use crate::store::{BillInput, CalendarMonth, SessionStore};
+use crate::store::{CalendarMonth, RawLoad, SessionStore};
 
 /// Name of OpenCode's SQLite session database.
 pub(crate) const DATABASE_FILE: &str = "opencode.db";
@@ -31,17 +31,6 @@ impl StorageContext {
             state: PhantomData,
         }
     }
-
-    /// Selects the store matching this data directory's layout.
-    pub(crate) fn store(&self) -> Store {
-        let database = self.data_dir.join(DATABASE_FILE);
-
-        if database.is_file() {
-            return Store::Database(SqliteStore::new(database));
-        }
-
-        Store::Legacy(LegacyStore::new(self.data_dir.join("storage")))
-    }
 }
 
 /// Concrete store selected from the data directory layout.
@@ -52,15 +41,32 @@ pub(crate) enum Store {
     Legacy(LegacyStore),
 }
 
+impl Store {
+    /// Selects the store matching a data directory's layout.
+    ///
+    /// The store is a cheap value (`SqliteStore` keeps only the database
+    /// path; the connection opens per load), so the pipeline can build it
+    /// inside a blocking task and hand it straight to `SessionStore::load`.
+    pub(crate) fn select(data_dir: &Path) -> Store {
+        let database = data_dir.join(DATABASE_FILE);
+
+        if database.is_file() {
+            return Store::Database(SqliteStore::new(database));
+        }
+
+        Store::Legacy(LegacyStore::new(data_dir.join("storage")))
+    }
+}
+
 impl SessionStore for Store {
-    fn load(&self, reference: &str) -> Result<BillInput, BillError> {
+    fn load(&self, reference: &str) -> Result<RawLoad, BillError> {
         match self {
             Store::Database(store) => store.load(reference),
             Store::Legacy(store) => store.load(reference),
         }
     }
 
-    fn load_month(&self, month: &CalendarMonth) -> Result<BillInput, BillError> {
+    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError> {
         match self {
             Store::Database(store) => store.load_month(month),
             Store::Legacy(store) => store.load_month(month),

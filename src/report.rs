@@ -2,8 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::data::{AgentUsage, ModelKey, ModelRates, Totals};
-use crate::store::BillInput;
+use crate::data::{
+    AgentId, AgentUsage, Interner, MICRO_PER_DOLLAR, ModelKey, ModelRates, Totals, World,
+};
 use crate::timing::{format_duration, format_timestamp, span_ms};
 
 const MILLION: u64 = 1_000_000;
@@ -44,28 +45,83 @@ pub struct BillReport {
 
 /// Builds the report data from aggregated usage.
 pub(crate) fn build_report(
-    input: &BillInput,
+    world: &World,
     by_model: &BTreeMap<ModelKey, Totals>,
-    by_agent: &BTreeMap<String, AgentUsage>,
+    by_agent: &BTreeMap<AgentId, AgentUsage>,
     total: &Totals,
     pricing: &BTreeMap<ModelKey, ModelRates>,
+    interner: &Interner,
 ) -> BillReport {
     BillReport {
-        header: input.header.clone(),
-        session_count: input.session_count,
-        usage_rows: by_model.iter().map(usage_row).collect(),
-        agent_rows: by_agent.iter().map(agent_row).collect(),
-        pricing_rows: pricing.iter().map(pricing_row).collect(),
-        totals: total_rows(input, total),
+        header: world.header.clone(),
+        session_count: world.session_count,
+        usage_rows: sorted_usage(by_model, interner)
+            .into_iter()
+            .map(|entry| usage_row(entry, interner))
+            .collect(),
+        agent_rows: sorted_agents(by_agent, interner)
+            .into_iter()
+            .map(|entry| agent_row(entry, interner))
+            .collect(),
+        pricing_rows: sorted_usage(pricing, interner)
+            .into_iter()
+            .map(|entry| pricing_row(entry, interner))
+            .collect(),
+        totals: total_rows(world, total),
     }
 }
 
+/// Model entries in lexicographic (provider, model) string order.
+///
+/// The aggregate folds key rows by compact handle pairs; the pre-migration
+/// bill iterated `BTreeMap<(String, String), _>` in lexicographic order, so
+/// the report re-sorts by resolved strings to stay byte-identical.
+fn sorted_usage<'a, V>(
+    map: &'a BTreeMap<ModelKey, V>,
+    interner: &Interner,
+) -> Vec<(&'a ModelKey, &'a V)> {
+    let mut entries = map.iter().collect::<Vec<_>>();
+
+    entries.sort_by(|(left, _), (right, _)| {
+        (
+            interner.resolve_provider(left.0),
+            interner.resolve_model(left.1),
+        )
+            .cmp(&(
+                interner.resolve_provider(right.0),
+                interner.resolve_model(right.1),
+            ))
+    });
+
+    entries
+}
+
+/// Agent entries in lexicographic agent-name order (pre-migration order).
+fn sorted_agents<'a>(
+    map: &'a BTreeMap<AgentId, AgentUsage>,
+    interner: &Interner,
+) -> Vec<(&'a AgentId, &'a AgentUsage)> {
+    let mut entries = map.iter().collect::<Vec<_>>();
+
+    entries.sort_by(|(left, _), (right, _)| {
+        interner
+            .resolve_agent(**left)
+            .cmp(interner.resolve_agent(**right))
+    });
+
+    entries
+}
+
 /// One provider/model usage row.
-fn usage_row(entry: (&ModelKey, &Totals)) -> Vec<String> {
+fn usage_row(entry: (&ModelKey, &Totals), interner: &Interner) -> Vec<String> {
     let ((provider, model), totals) = entry;
 
     vec![
-        format!("{provider} / {model}"),
+        format!(
+            "{} / {}",
+            interner.resolve_provider(*provider),
+            interner.resolve_model(*model)
+        ),
         compact_count(totals.requests),
         compact_count(totals.tokens.input),
         compact_count(totals.tokens.cache_read),
@@ -73,17 +129,17 @@ fn usage_row(entry: (&ModelKey, &Totals)) -> Vec<String> {
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format!("${:.6}", totals.cost),
+        format_cost(totals.cost_micros),
     ]
 }
 
 /// One agent-class usage row.
-fn agent_row(entry: (&String, &AgentUsage)) -> Vec<String> {
+fn agent_row(entry: (&AgentId, &AgentUsage), interner: &Interner) -> Vec<String> {
     let (agent, usage) = entry;
     let totals = &usage.totals;
 
     vec![
-        agent.clone(),
+        interner.resolve_agent(*agent).to_owned(),
         compact_count(usage.sessions.len() as u64),
         compact_count(totals.requests),
         compact_count(totals.tokens.input),
@@ -92,16 +148,20 @@ fn agent_row(entry: (&String, &AgentUsage)) -> Vec<String> {
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format!("${:.6}", totals.cost),
+        format_cost(totals.cost_micros),
     ]
 }
 
 /// One model pricing row.
-fn pricing_row(entry: (&ModelKey, &ModelRates)) -> Vec<String> {
+fn pricing_row(entry: (&ModelKey, &ModelRates), interner: &Interner) -> Vec<String> {
     let ((provider, model), rates) = entry;
 
     vec![
-        format!("{provider} / {model}"),
+        format!(
+            "{} / {}",
+            interner.resolve_provider(*provider),
+            interner.resolve_model(*model)
+        ),
         format_rate(rates.input),
         format_rate(rates.cache_read),
         format_rate(rates.cache_write),
@@ -113,8 +173,8 @@ fn pricing_row(entry: (&ModelKey, &ModelRates)) -> Vec<String> {
 ///
 /// Session bills carry the wall-clock bounds (Started, Ended, Wall time);
 /// month bills skip them because they span many unrelated sessions.
-fn total_rows(input: &BillInput, total: &Totals) -> Vec<(String, String)> {
-    let is_session = matches!(input.header, BillHeader::Session { .. });
+fn total_rows(world: &World, total: &Totals) -> Vec<(String, String)> {
+    let is_session = matches!(world.header, BillHeader::Session { .. });
 
     let mut rows = vec![
         ("Requests:".to_owned(), compact_count(total.requests)),
@@ -135,20 +195,35 @@ fn total_rows(input: &BillInput, total: &Totals) -> Vec<(String, String)> {
     ];
 
     if is_session {
-        rows.push(("Started:".to_owned(), format_timestamp(input.wall_start)));
-        rows.push(("Ended:".to_owned(), format_timestamp(input.wall_end)));
+        rows.push(("Started:".to_owned(), format_timestamp(world.wall_start)));
+        rows.push(("Ended:".to_owned(), format_timestamp(world.wall_end)));
     }
     rows.push(("API time:".to_owned(), format_duration(total.api_ms)));
 
     if is_session {
         rows.push((
             "Wall time:".to_owned(),
-            format_duration(span_ms(input.wall_start, input.wall_end)),
+            format_duration(span_ms(world.wall_start, world.wall_end)),
         ));
     }
-    rows.push(("Amount due:".to_owned(), format!("${:.6} USD", total.cost)));
+    rows.push((
+        "Amount due:".to_owned(),
+        format!("{} USD", format_cost(total.cost_micros)),
+    ));
 
     rows
+}
+
+/// Renders a micro-dollar cost as dollars with exactly six decimals.
+fn format_cost(cost_micros: i64) -> String {
+    let sign = if cost_micros < 0 { "-" } else { "" };
+    let absolute = cost_micros.unsigned_abs();
+
+    format!(
+        "{sign}${}.{:06}",
+        absolute / MICRO_PER_DOLLAR as u64,
+        absolute % MICRO_PER_DOLLAR as u64
+    )
 }
 
 /// Renders a rate as dollars, or `-` when unknown.
@@ -172,6 +247,7 @@ fn compact_count(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::{SessionTree, UsageStore};
 
     #[test]
     fn compacts_large_usage_counts() {
@@ -184,18 +260,19 @@ mod tests {
 
     #[test]
     fn builds_total_rows() {
-        let input = BillInput {
+        let world = World {
             header: BillHeader::Session {
                 id: "ses".to_owned(),
                 title: "Test".to_owned(),
             },
             session_count: 1,
-            session_agents: BTreeMap::new(),
-            messages: Vec::new(),
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
             wall_start: None,
             wall_end: None,
+            interner: Interner::default(),
         };
-        let rows = total_rows(&input, &Totals::default());
+        let rows = total_rows(&world, &Totals::default());
 
         assert_eq!(rows.len(), 11);
         assert_eq!(rows[0], ("Requests:".to_owned(), "0".to_owned()));
@@ -208,17 +285,18 @@ mod tests {
 
     #[test]
     fn omits_wall_bounds_from_month_total() {
-        let input = BillInput {
+        let world = World {
             header: BillHeader::Month {
                 label: "February 2026".to_owned(),
             },
             session_count: 1,
-            session_agents: BTreeMap::new(),
-            messages: Vec::new(),
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
             wall_start: None,
             wall_end: None,
+            interner: Interner::default(),
         };
-        let rows = total_rows(&input, &Totals::default());
+        let rows = total_rows(&world, &Totals::default());
 
         assert_eq!(rows.len(), 8);
         assert!(
@@ -231,5 +309,100 @@ mod tests {
             rows[7],
             ("Amount due:".to_owned(), "$0.000000 USD".to_owned())
         );
+    }
+
+    #[test]
+    fn report_rows_follow_lexicographic_string_order() {
+        use crate::data::{AgentUsage, ModelRates};
+
+        let mut interner = Interner::default();
+        // Interning order is the reverse of lexicographic: zzz handles are
+        // assigned before aaa, so handle-sorted maps would print zzz first.
+        let zzz_provider = interner.intern_provider("zzz-provider");
+        let zzz_model = interner.intern_model("zzz-model");
+        let aaa_provider = interner.intern_provider("aaa-provider");
+        let aaa_model = interner.intern_model("aaa-model");
+        let zzz_agent = interner.intern_agent("zzz-agent");
+        let aaa_agent = interner.intern_agent("aaa-agent");
+
+        let mut by_model = BTreeMap::new();
+        by_model.insert(
+            (zzz_provider, zzz_model),
+            Totals {
+                requests: 1,
+                ..Totals::default()
+            },
+        );
+        by_model.insert(
+            (aaa_provider, aaa_model),
+            Totals {
+                requests: 2,
+                ..Totals::default()
+            },
+        );
+
+        let mut by_agent = BTreeMap::new();
+        by_agent.insert(
+            zzz_agent,
+            AgentUsage {
+                sessions: Default::default(),
+                totals: Totals::default(),
+            },
+        );
+        by_agent.insert(
+            aaa_agent,
+            AgentUsage {
+                sessions: Default::default(),
+                totals: Totals::default(),
+            },
+        );
+
+        let mut pricing = BTreeMap::new();
+        pricing.insert(
+            (zzz_provider, zzz_model),
+            ModelRates {
+                input: None,
+                cache_read: None,
+                cache_write: None,
+                output: Some(1.0),
+            },
+        );
+        pricing.insert(
+            (aaa_provider, aaa_model),
+            ModelRates {
+                input: None,
+                cache_read: None,
+                cache_write: None,
+                output: Some(1.0),
+            },
+        );
+
+        let world = World {
+            header: BillHeader::Session {
+                id: "ses".to_owned(),
+                title: "Test".to_owned(),
+            },
+            session_count: 0,
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner: Interner::default(),
+        };
+        let report = build_report(
+            &world,
+            &by_model,
+            &by_agent,
+            &Totals::default(),
+            &pricing,
+            &interner,
+        );
+
+        assert_eq!(report.usage_rows[0][0], "aaa-provider / aaa-model");
+        assert_eq!(report.usage_rows[1][0], "zzz-provider / zzz-model");
+        assert_eq!(report.agent_rows[0][0], "aaa-agent");
+        assert_eq!(report.agent_rows[1][0], "zzz-agent");
+        assert_eq!(report.pricing_rows[0][0], "aaa-provider / aaa-model");
+        assert_eq!(report.pricing_rows[1][0], "zzz-provider / zzz-model");
     }
 }
