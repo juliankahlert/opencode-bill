@@ -26,6 +26,43 @@ pub enum BillHeader {
         /// Label like "February 2026".
         label: String,
     },
+    /// One calendar day, identified by its label.
+    Day {
+        /// Label like "August 8 2026".
+        label: String,
+    },
+    /// One calendar year, identified by its label.
+    Year {
+        /// Label like "2026".
+        label: String,
+    },
+}
+
+/// How a [`BarGraph`] total is formatted: counts, durations, or money.
+#[derive(Clone, Copy)]
+pub enum MetricKind {
+    /// Plain count (requests, tokens).
+    Count,
+    /// A millisecond duration (API time).
+    Duration,
+    /// Micro-dollars (amount due).
+    Cost,
+}
+
+/// One metric of the year bill: a vertical bar per month, plus the year total.
+///
+/// The 12 bars hold the metric's value per calendar month, January first;
+/// `total` is the whole-year value and is shown as text, never as a bar.
+#[derive(Clone)]
+pub struct BarGraph {
+    /// Uppercase metric label, e.g. "REQUESTS" or "AMOUNT DUE".
+    pub label: &'static str,
+    /// One value per month, January first; the bars of the graph.
+    pub bars: [u64; 12],
+    /// The whole-year total of the metric, displayed as a value.
+    pub total: u64,
+    /// How the total is formatted for display.
+    pub kind: MetricKind,
 }
 
 /// Everything a renderer needs to show one bill.
@@ -42,6 +79,10 @@ pub struct BillReport {
     pub pricing_rows: Vec<Vec<String>>,
     /// Label/value pairs of the TOTAL section.
     pub totals: Vec<(String, String)>,
+    /// One bar graph per total metric; the year bill's TOTAL replacement.
+    ///
+    /// Session, month, and day bills leave this empty.
+    pub graphs: Vec<BarGraph>,
 }
 
 /// Builds the report data from aggregated usage.
@@ -51,6 +92,7 @@ pub(crate) fn build_report(
     by_agent: &BTreeMap<AgentId, AgentUsage>,
     total: &Totals,
     pricing: &BTreeMap<ModelKey, ModelRates>,
+    graphs: &[BarGraph],
     interner: &Interner,
 ) -> BillReport {
     BillReport {
@@ -69,6 +111,7 @@ pub(crate) fn build_report(
             .map(|entry| pricing_row(entry, interner))
             .collect(),
         totals: total_rows(world, total),
+        graphs: graphs.to_vec(),
     }
 }
 
@@ -173,7 +216,7 @@ fn pricing_row(entry: (&ModelKey, &ModelRates), interner: &Interner) -> Vec<Stri
 /// Label/value pairs of the TOTAL section.
 ///
 /// Session bills carry the wall-clock bounds (Started, Ended, Wall time);
-/// month bills skip them because they span many unrelated sessions.
+/// month and day bills skip them because they span many unrelated sessions.
 fn total_rows(world: &World, total: &Totals) -> Vec<(String, String)> {
     let is_session = matches!(world.header, BillHeader::Session { .. });
 
@@ -216,7 +259,7 @@ fn total_rows(world: &World, total: &Totals) -> Vec<(String, String)> {
 }
 
 /// Renders a micro-dollar cost as dollars with exactly six decimals.
-fn format_cost(cost_micros: i64) -> String {
+pub(crate) fn format_cost(cost_micros: i64) -> String {
     let sign = if cost_micros < 0 { "-" } else { "" };
     let absolute = cost_micros.unsigned_abs();
 
@@ -233,7 +276,7 @@ fn format_rate(rate: Option<f64>) -> String {
 }
 
 /// Compacts a large token or request count to a short human string.
-fn compact_count(value: u64) -> String {
+pub(crate) fn compact_count(value: u64) -> String {
     if value >= MILLION {
         return format!("{:.1}M", value as f64 / MILLION as f64);
     }
@@ -289,6 +332,34 @@ mod tests {
         let world = World {
             header: BillHeader::Month {
                 label: "February 2026".to_owned(),
+            },
+            session_count: 1,
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner: Interner::default(),
+        };
+        let rows = total_rows(&world, &Totals::default());
+
+        assert_eq!(rows.len(), 8);
+        assert!(
+            rows.iter().all(|(label, _)| {
+                !matches!(label.as_str(), "Started:" | "Ended:" | "Wall time:")
+            })
+        );
+        assert_eq!(rows[6], ("API time:".to_owned(), "0ms".to_owned()));
+        assert_eq!(
+            rows[7],
+            ("Amount due:".to_owned(), "$0.000000 USD".to_owned())
+        );
+    }
+
+    #[test]
+    fn omits_wall_bounds_from_day_total() {
+        let world = World {
+            header: BillHeader::Day {
+                label: "August 8 2026".to_owned(),
             },
             session_count: 1,
             sessions: SessionTree::new(),
@@ -396,6 +467,7 @@ mod tests {
             &by_agent,
             &Totals::default(),
             &pricing,
+            &[],
             &interner,
         );
 

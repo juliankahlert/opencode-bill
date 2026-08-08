@@ -18,8 +18,8 @@ use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use opencode_bill::{
-    BillHeader, BillProgress, BillReport, StorageContext, load_month_report_with_progress_counted,
-    load_report_with_progress_counted,
+    BillHeader, BillProgress, BillReport, StorageContext, graph_lines,
+    load_month_report_with_progress_counted, load_report_with_progress_counted,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -237,6 +237,25 @@ pub async fn run(
             stdout
                 .write_all(render_row(&table_buffer, y, natural_width).as_bytes())
                 .map_err(|failure| failure.to_string())?;
+        }
+
+        // The year bill's bar graphs are full-width lines, so they print
+        // after the table instead of inside its 11-column grid.
+        if let BillHeader::Year { .. } = &report.header {
+            for graph in &report.graphs {
+                stdout
+                    .write_all(b"\n")
+                    .map_err(|failure| failure.to_string())?;
+
+                for line in graph_lines(graph) {
+                    stdout
+                        .write_all(line.as_bytes())
+                        .map_err(|failure| failure.to_string())?;
+                    stdout
+                        .write_all(b"\n")
+                        .map_err(|failure| failure.to_string())?;
+                }
+            }
         }
         stdout.flush().map_err(|failure| failure.to_string())?;
         return Ok(TuiOutcome::Success);
@@ -498,8 +517,11 @@ fn draw_failure(frame: &mut Frame, failure: &str) {
 fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
     let mut rows = Vec::new();
 
-    // Month bills carry their label; session bills have no header row here.
-    if let BillHeader::Month { label } = &report.header {
+    // Month, day, and year bills carry their label; session bills have no
+    // header row here.
+    if let BillHeader::Month { label } | BillHeader::Day { label } | BillHeader::Year { label } =
+        &report.header
+    {
         rows.push(title_row(label));
     }
 
@@ -546,9 +568,13 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         rows.push(blank_row());
     }
 
-    rows.push(title_row("TOTAL"));
-    for (label, value) in &report.totals {
-        rows.push(totals_row(label, value));
+    // The year bill replaces the TOTAL table with full-width bar graphs,
+    // printed after the table rows.
+    if report.graphs.is_empty() {
+        rows.push(title_row("TOTAL"));
+        for (label, value) in &report.totals {
+            rows.push(totals_row(label, value));
+        }
     }
 
     rows
@@ -781,6 +807,7 @@ mod tests {
                 ("Requests:".to_owned(), "1".to_owned()),
                 ("Amount due:".to_owned(), "$0.125000 USD".to_owned()),
             ],
+            graphs: Vec::new(),
         }
     }
 
@@ -814,6 +841,70 @@ mod tests {
         let label = render_row(&table_buffer, 0, table_natural_width());
 
         assert!(label.contains("February 2026"), "label: {label}");
+    }
+
+    #[test]
+    fn prepends_day_label_row() {
+        let mut report = fixture_report();
+
+        report.header = BillHeader::Day {
+            label: "August 8 2026".to_owned(),
+        };
+        let rows = build_rows(&report);
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 11));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 11),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let label = render_row(&table_buffer, 0, table_natural_width());
+
+        assert!(label.contains("August 8 2026"), "label: {label}");
+    }
+
+    #[test]
+    fn year_report_skips_the_total_table_for_graphs() {
+        let mut report = fixture_report();
+
+        report.header = BillHeader::Year {
+            label: "2026".to_owned(),
+        };
+        report.graphs.push(opencode_bill::BarGraph {
+            label: "REQUESTS",
+            bars: [1; 12],
+            total: 12,
+            kind: opencode_bill::MetricKind::Count,
+        });
+
+        let rows = build_rows(&report);
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 12),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let mut text = String::new();
+
+        for y in 0..12 {
+            for x in 0..table_natural_width() {
+                text.push_str(table_buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(text.contains("2026"), "text: {text}");
+        assert!(
+            !text.contains("TOTAL"),
+            "year report must skip TOTAL: {text}"
+        );
     }
 
     #[test]

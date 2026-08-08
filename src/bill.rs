@@ -13,7 +13,7 @@ use crate::error::BillError;
 use crate::parse::parse_system;
 use crate::pricing;
 use crate::render::render_bill;
-use crate::report::{BillReport, build_report};
+use crate::report::{BarGraph, BillReport, build_report};
 use crate::store::{CalendarMonth, RawLoad, SessionStore, validate_reference};
 use crate::timing::{earliest, latest};
 
@@ -337,7 +337,12 @@ async fn summarize_async(
     progress.note_phase(4);
     on_task("Building report");
     Ok(render_system(
-        &world, &by_model, &by_agent, &total, &pricing,
+        &world,
+        &by_model,
+        &by_agent,
+        &total,
+        &pricing,
+        &[],
     ))
 }
 
@@ -406,14 +411,26 @@ fn aggregate_system(
 }
 
 /// Produces the report data from the world and its aggregated components.
+///
+/// `graphs` carries the year bill's per-month bar graphs; other bills pass
+/// an empty slice and render the plain TOTAL section instead.
 fn render_system(
     world: &World,
     by_model: &BTreeMap<ModelKey, Totals>,
     by_agent: &BTreeMap<AgentId, AgentUsage>,
     total: &Totals,
     pricing: &BTreeMap<ModelKey, ModelRates>,
+    graphs: &[BarGraph],
 ) -> BillReport {
-    build_report(world, by_model, by_agent, total, pricing, &world.interner)
+    build_report(
+        world,
+        by_model,
+        by_agent,
+        total,
+        pricing,
+        graphs,
+        &world.interner,
+    )
 }
 
 /// Fills in an estimated cost for calls whose recorded cost is unknown.
@@ -624,7 +641,9 @@ mod tests {
                 assert_eq!(id, "ses_abcdef123456");
                 assert_eq!(title, "Test session");
             }
-            crate::report::BillHeader::Month { .. } => {
+            crate::report::BillHeader::Month { .. }
+            | crate::report::BillHeader::Day { .. }
+            | crate::report::BillHeader::Year { .. } => {
                 panic!("expected a session header");
             }
         }
@@ -1990,6 +2009,7 @@ Amount due:  $0.125000 USD
                 &aggregates.1,
                 &aggregates.2,
                 &pricing,
+                &[],
             );
             let bill = render_bill(&report)?;
 
