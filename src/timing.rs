@@ -37,27 +37,37 @@ pub(crate) fn message_api_ms(
 
     spans.sort_unstable();
 
-    let mut busy: u64 = 0;
-    let mut current: Option<(u64, u64)> = None;
+    let (busy, current) = spans
+        .into_iter()
+        .fold((0u64, None), |(busy, current), (open, close)| {
+            let (busy_added, next) = merge_tool_span(current, open, close);
 
-    for (open, close) in spans {
-        match current {
-            Some((_, ref mut merged_close)) if open <= *merged_close => {
-                *merged_close = (*merged_close).max(close);
-            }
-            Some((merged_open, merged_close)) => {
-                busy += merged_close - merged_open;
-                current = Some((open, close));
-            }
-            None => current = Some((open, close)),
-        }
-    }
-
-    if let Some((merged_open, merged_close)) = current {
-        busy += merged_close - merged_open;
-    }
+            (busy + busy_added, next)
+        });
+    let busy = busy + current.map_or(0, |(open, close)| close - open);
 
     (end - start).saturating_sub(busy)
+}
+
+/// Merges one sorted tool span into the running merged span.
+///
+/// Returns the busy time the span adds plus the next running span. An
+/// overlapping span extends the running one; a later span closes the run and
+/// starts a new one.
+fn merge_tool_span(
+    current: Option<(u64, u64)>,
+    open: u64,
+    close: u64,
+) -> (u64, Option<(u64, u64)>) {
+    let Some((merged_open, merged_close)) = current else {
+        return (0, Some((open, close)));
+    };
+
+    if open <= merged_close {
+        (0, Some((merged_open, merged_close.max(close))))
+    } else {
+        (merged_close - merged_open, Some((open, close)))
+    }
 }
 
 /// Millisecond span between two timestamps, zero when either is missing.
