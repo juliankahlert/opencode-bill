@@ -277,15 +277,17 @@ pub(crate) fn cost_add(left: Cost, right: Cost) -> Cost {
 /// Totals may legally exceed `i64::MAX` in the decimal domain; the report
 /// clamps here, mirroring the previous saturating sums.
 pub(crate) fn cost_to_micros(cost: Cost) -> i64 {
-    let scaled = match cost.amount().checked_mul(Decimal::from(MICRO_PER_DOLLAR)) {
-        Some(scaled) => scaled.trunc(),
-        None => {
-            return if cost.is_negative() {
-                i64::MIN
-            } else {
-                i64::MAX
-            };
-        }
+    let saturated = if cost.is_negative() {
+        i64::MIN
+    } else {
+        i64::MAX
+    };
+    let Some(scaled) = cost
+        .amount()
+        .checked_mul(Decimal::from(MICRO_PER_DOLLAR))
+        .map(|scaled| scaled.trunc())
+    else {
+        return saturated;
     };
 
     if scaled >= Decimal::from(i64::MAX) {
