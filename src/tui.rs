@@ -19,7 +19,8 @@ use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use opencode_bill::{
     BillHeader, BillProgress, BillReport, StorageContext, graph_lines,
-    load_month_report_with_progress_counted, load_report_with_progress_counted,
+    load_day_report_with_progress_counted, load_month_report_with_progress_counted,
+    load_report_with_progress_counted, load_year_report_with_progress_counted,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -86,6 +87,26 @@ async fn worker(
             &context,
             year,
             month,
+            &providers,
+            |task| {
+                let _ = sender.send(Progress::Task(task.to_owned()));
+            },
+            &counters,
+        ),
+        crate::Request::Day(year, month, day) => load_day_report_with_progress_counted(
+            &context,
+            year,
+            month,
+            day,
+            &providers,
+            |task| {
+                let _ = sender.send(Progress::Task(task.to_owned()));
+            },
+            &counters,
+        ),
+        crate::Request::Year(year) => load_year_report_with_progress_counted(
+            &context,
+            year,
             &providers,
             |task| {
                 let _ = sender.send(Progress::Task(task.to_owned()));

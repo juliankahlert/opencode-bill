@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use chrono::{Datelike, NaiveDate};
 use clap::Parser;
 use log::debug;
-use opencode_bill::{StorageContext, generate_bill, generate_monthly_bill};
+use opencode_bill::{
+    StorageContext, generate_bill, generate_daily_bill, generate_monthly_bill, generate_yearly_bill,
+};
 
 mod tui;
 
@@ -14,11 +16,11 @@ mod tui;
 #[command(
     name = "opencode-bill",
     version,
-    about = "Generate a bill for an OpenCode session or calendar month"
+    about = "Generate a bill for an OpenCode session, calendar month, calendar year, or calendar day"
 )]
 struct Arguments {
-    /// Full OpenCode session ID or a unique ID prefix; with no session and
-    /// no --month the current month is billed
+    /// Full OpenCode session ID or a unique prefix; with no session, no
+    /// --month, no --year, and no --today the current month is billed
     #[arg(conflicts_with = "month")]
     session: Option<String>,
 
@@ -37,6 +39,22 @@ struct Arguments {
     )]
     month: Option<u8>,
 
+    /// Bill the calendar year; no value means the current year
+    #[arg(
+        long,
+        value_name = "YEAR",
+        num_args = 0..=1,
+        default_missing_value = "0",
+        value_parser = clap::value_parser!(u32).range(0..=i64::from(i32::MAX)),
+        conflicts_with_all = ["month", "today", "session"]
+    )]
+    year: Option<u32>,
+
+    /// Bill the current calendar day instead of one session and its
+    /// sub-agents
+    #[arg(long, conflicts_with_all = ["month", "session"])]
+    today: bool,
+
     /// Only include usage from this provider; repeatable
     #[arg(long = "provider", value_name = "PROVIDER")]
     providers: Vec<String>,
@@ -49,6 +67,10 @@ enum Request {
     Session(String),
     /// One calendar month of the current year.
     Month(u32, u32),
+    /// One calendar year.
+    Year(u32),
+    /// One calendar day of the current year.
+    Day(u32, u32, u32),
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,7 +81,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => StorageContext::builder().platform_data_dir()?.build()?,
     };
     let today = chrono::Local::now().date_naive();
-    let request = resolve_request(arguments.month, arguments.session, today);
+    let request = resolve_request(
+        arguments.month,
+        arguments.year,
+        arguments.today,
+        arguments.session,
+        today,
+    );
 
     if io::stdout().is_terminal() {
         return match tui::run(context, request, arguments.providers).await? {
@@ -72,6 +100,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let bill = match &request {
         Request::Session(reference) => generate_bill(&context, reference, providers)?,
         Request::Month(year, month) => generate_monthly_bill(&context, *year, *month, providers)?,
+        Request::Year(year) => generate_yearly_bill(&context, *year, providers)?,
+        Request::Day(year, month, day) => {
+            generate_daily_bill(&context, *year, *month, *day, providers)?
+        }
     };
     let mut stdout = io::stdout().lock();
 
@@ -83,12 +115,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Map the CLI arguments to one bill request.
 ///
 /// `--month` without a value (clap delivers `Some(0)`) and no arguments at
-/// all both mean the current calendar month.
-fn resolve_request(month: Option<u8>, session: Option<String>, today: NaiveDate) -> Request {
-    match (month, session) {
-        (Some(0), _) | (None, None) => Request::Month(today.year() as u32, today.month()),
-        (Some(month), _) => Request::Month(today.year() as u32, month as u32),
-        (None, Some(session)) => Request::Session(session),
+/// all both mean the current calendar month; `--year` without a value means
+/// the current calendar year; `--today` means the current calendar day.
+/// clap rejects `--today` combined with `--month`, `--year`, or a session,
+/// and `--year` combined with `--month` or a session, so those arms are
+/// unreachable; the month value wins, then the year value, then the today
+/// flag, then the session.
+fn resolve_request(
+    month: Option<u8>,
+    year: Option<u32>,
+    today: bool,
+    session: Option<String>,
+    today_date: NaiveDate,
+) -> Request {
+    match (month, year, today, session) {
+        (Some(0), _, _, _) | (None, None, false, None) => {
+            Request::Month(today_date.year() as u32, today_date.month())
+        }
+        (Some(month), _, _, _) => Request::Month(today_date.year() as u32, month as u32),
+        (None, Some(0), _, _) => Request::Year(today_date.year() as u32),
+        (None, Some(year), _, _) => Request::Year(year),
+        (None, None, true, _) => Request::Day(
+            today_date.year() as u32,
+            today_date.month(),
+            today_date.day(),
+        ),
+        (None, None, false, Some(session)) => Request::Session(session),
     }
 }
 
@@ -113,7 +165,10 @@ mod tests {
     fn no_arguments_bills_current_month() {
         let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
 
-        assert_eq!(resolve_request(None, None, today), Request::Month(2026, 8));
+        assert_eq!(
+            resolve_request(None, None, false, None, today),
+            Request::Month(2026, 8)
+        );
     }
 
     #[test]
@@ -121,7 +176,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
 
         assert_eq!(
-            resolve_request(Some(0), None, today),
+            resolve_request(Some(0), None, false, None, today),
             Request::Month(2026, 8)
         );
     }
@@ -131,8 +186,38 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
 
         assert_eq!(
-            resolve_request(Some(2), None, today),
+            resolve_request(Some(2), None, false, None, today),
             Request::Month(2026, 2)
+        );
+    }
+
+    #[test]
+    fn year_without_value_bills_current_year() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            resolve_request(None, Some(0), false, None, today),
+            Request::Year(2026)
+        );
+    }
+
+    #[test]
+    fn year_with_value_bills_that_year() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            resolve_request(None, Some(2025), false, None, today),
+            Request::Year(2025)
+        );
+    }
+
+    #[test]
+    fn today_flag_bills_current_day() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            resolve_request(None, None, true, None, today),
+            Request::Day(2026, 8, 7)
         );
     }
 
@@ -141,8 +226,24 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
 
         assert_eq!(
-            resolve_request(None, Some("abc123".to_string()), today),
+            resolve_request(None, None, false, Some("abc123".to_string()), today),
             Request::Session("abc123".to_string())
         );
+    }
+
+    #[test]
+    fn today_conflicts_with_month_year_and_session() {
+        assert!(Arguments::try_parse_from(["opencode-bill", "--today", "--month"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--today", "--year"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--today", "abc123"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--today"]).is_ok());
+    }
+
+    #[test]
+    fn year_conflicts_with_month_and_session() {
+        assert!(Arguments::try_parse_from(["opencode-bill", "--year", "--month"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--year", "abc123"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--year"]).is_ok());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--year", "2025"]).is_ok());
     }
 }
