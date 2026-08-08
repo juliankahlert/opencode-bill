@@ -198,19 +198,24 @@ fn database_month_session_rows(
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .map_err(|source| database_error(path, source))?;
-    let mut sessions = Vec::new();
+    let sessions = rows
+        .map(|row| {
+            let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
 
-    for row in rows {
-        let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
+            Ok((session_id, agent))
+        })
+        .collect::<Result<Vec<_>, BillError>>()?
+        .into_iter()
+        .filter_map(|(session_id, agent)| {
+            let agent = agent.filter(|agent| !agent.is_empty())?;
 
-        if let Some(agent) = agent.filter(|agent| !agent.is_empty()) {
             progress.loaded_row();
-            sessions.push(RawSession {
+            Some(RawSession {
                 id: session_id,
                 agent: Some(agent),
-            });
-        }
-    }
+            })
+        })
+        .collect::<Vec<_>>();
 
     Ok(sessions)
 }
