@@ -8,6 +8,17 @@ use crate::data::BillProgress;
 use crate::error::BillError;
 use crate::report::BillHeader;
 
+/// Raw window rows without the message payloads.
+///
+/// The message and part rows are streamed separately, per day; the header,
+/// the session count, and the session tree are small enough to stay in
+/// memory for the whole window.
+pub(crate) struct RawWindowMeta {
+    pub(crate) header: BillHeader,
+    pub(crate) session_count: usize,
+    pub(crate) sessions: Vec<RawSession>,
+}
+
 /// A session reference must contain at least this many characters.
 const MINIMUM_REFERENCE_LENGTH: usize = 6;
 

@@ -13,7 +13,7 @@ use crate::data::{
     usd_to_micros,
 };
 use crate::error::BillError;
-use crate::store::{RawLoad, RawMessage, RawPart};
+use crate::store::{RawLoad, RawMessage, RawPart, RawWindowMeta};
 use crate::timing::{earliest, latest, message_api_ms};
 
 /// Parses a JSON string, tagging failures with its location.
@@ -419,21 +419,79 @@ fn invalid_field(location: &str, field: &str) -> BillError {
 /// Parses raw storage rows into a world: entities, components, interner.
 ///
 /// The system preserves the row order the store produced, so the interning
-/// order of session/agent/provider/model handles — and with it the
-/// byte-identical bill output — stays exactly as before.
+/// order of agent/provider/model handles — and with it the byte-identical
+/// bill output — stays exactly as before.  Session handles intern in session
+/// row order; no component renders session handle order.
 ///
-/// Message parsing is the parallel work unit: a rayon `par_iter` decodes
-/// every message JSON in parallel and extracts raw strings, while the merge
-/// pass below interns in message order.  Interning stays single-threaded and
-/// ordered, so handle assignment is deterministic regardless of thread
-/// scheduling.  The first failing message in store order stops the pipeline.
+/// The pipeline shares its machinery with the streaming year load: the
+/// window metadata parses first ([`parse_metadata`]), then the messages
+/// parse in batches ([`parse_message_batch`]).  Message parsing is the
+/// parallel work unit: a rayon `par_iter` decodes every message JSON in
+/// parallel and extracts raw strings, while the merge pass interns in
+/// message order.  Interning stays single-threaded and ordered, so handle
+/// assignment is deterministic regardless of thread scheduling.  The first
+/// failing message in store order stops the pipeline.
 pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<World, BillError> {
+    let RawLoad {
+        header,
+        session_count,
+        sessions,
+        messages,
+        parts,
+    } = raw;
+    let meta = RawWindowMeta {
+        header,
+        session_count,
+        sessions,
+    };
+    let (mut world, parse) = parse_metadata(meta, progress)?;
+    let mut messages = messages;
+    let mut parts = parts;
+    let mut results = Vec::new();
+    let mut rows = Vec::new();
+
+    parse_message_batch(
+        &mut world,
+        &parse,
+        &mut parts,
+        &mut messages,
+        &mut results,
+        &mut rows,
+        progress,
+    )?;
+
+    for row in rows.drain(..) {
+        world.entities.push(row);
+    }
+
+    Ok(world)
+}
+
+/// Window-wide parse state shared by every message batch of one window.
+///
+/// Session agents are window metadata, built once by [`parse_metadata`];
+/// tool spans stay batch-local: a day's parts parse with its messages, and
+/// the spans map never grows with the window.
+pub(crate) struct ParseContext {
+    /// Declared agent of every session, for message rows that need it.
+    session_agents: BTreeMap<String, Option<AgentId>>,
+}
+
+/// Parses one window's metadata (sessions) into a world with an empty entity
+/// store, plus the shared batch parse context.
+///
+/// Session handles intern here, in session row order; message handles intern
+/// later, batch by batch, in message order.
+pub(crate) fn parse_metadata(
+    meta: RawWindowMeta,
+    progress: &PipelineProgress,
+) -> Result<(World, ParseContext), BillError> {
     progress.note_phase(1);
     let mut interner = Interner::default();
     let mut sessions = SessionTree::new();
     let mut session_agents = BTreeMap::new();
 
-    for session in raw.sessions {
+    for session in meta.sessions {
         progress.parsed_row();
         let id = interner.intern_session(&session.id);
         let agent = session
@@ -445,42 +503,80 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
         session_agents.entry(session.id).or_insert(agent);
     }
 
-    let tools = parse_tool_spans(raw.parts, progress)?;
+    Ok((
+        World {
+            header: meta.header,
+            session_count: meta.session_count,
+            sessions,
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner,
+        },
+        ParseContext { session_agents },
+    ))
+}
 
-    let results = raw
-        .messages
+/// Parses one batch of raw tool parts and messages into usage rows, in
+/// batch order.
+///
+/// The day's tool parts parse first into a batch-local span map — every
+/// message only ever looks up its own parts, so the map never outlives the
+/// batch and the window's span memory stays flat.  The rayon `par_iter`
+/// decodes the batch's JSON in parallel while the merge pass interns in
+/// message order; batches arrive in window order, so handle assignment stays
+/// deterministic across the whole window.  The part, message, decode-result,
+/// and row buffers belong to the caller and are reused for every batch of
+/// the stream — the message, decode-result, and row containers are reused
+/// (the parts container is consumed by the span parse).  The rows are
+/// drained by the caller (the session pipeline pushes them into the entity
+/// store, the streaming pipeline folds them into the aggregates and drops
+/// them).  Wall bounds cover every message, so a timestamp-less user
+/// message still sets the earliest bound.
+pub(crate) fn parse_message_batch(
+    world: &mut World,
+    context: &ParseContext,
+    parts: &mut Vec<RawPart>,
+    messages: &mut Vec<RawMessage>,
+    results: &mut Vec<Result<ParsedMessage, BillError>>,
+    rows: &mut Vec<UsageRow>,
+    progress: &PipelineProgress,
+) -> Result<(), BillError> {
+    let tools = parse_tool_spans(std::mem::take(parts), progress)?;
+
+    results.clear();
+    messages
         .par_iter()
         .map(|message| {
             progress.parsed_row();
 
-            parse_message(message, &session_agents, &tools)
+            parse_message(message, &context.session_agents, &tools)
         })
-        .collect::<Vec<_>>();
+        .collect_into_vec(results);
 
-    let mut entities = UsageStore::default();
-    let mut wall_start = None;
-    let mut wall_end = None;
-
-    for result in results {
+    rows.clear();
+    for result in results.drain(..) {
         let message = result?;
-        let session_handle = interner.intern_session(&message.session_id);
+        let session_handle = world.interner.intern_session(&message.session_id);
 
-        wall_start = earliest(wall_start, message.created);
-        wall_end = latest(wall_end, message.completed.or(message.created));
+        world.wall_start = earliest(world.wall_start, message.created);
+        world.wall_end = latest(world.wall_end, message.completed.or(message.created));
 
         let Some(row) = message.row else {
             continue;
         };
         let agent = match row.session_agent {
             Some(agent) => agent,
-            None => interner.intern_agent(row.message_agent.as_deref().unwrap_or("unknown")),
+            None => world
+                .interner
+                .intern_agent(row.message_agent.as_deref().unwrap_or("unknown")),
         };
 
-        entities.push(UsageRow {
+        rows.push(UsageRow {
             session_id: session_handle,
             agent,
-            provider: interner.intern_provider(&row.provider),
-            model: interner.intern_model(&row.model),
+            provider: world.interner.intern_provider(&row.provider),
+            model: world.interner.intern_model(&row.model),
             tokens: row.tokens,
             cost_micros: row.cost_micros,
             cost_unknown: row.cost_unknown,
@@ -490,15 +586,7 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
         });
     }
 
-    Ok(World {
-        header: raw.header,
-        session_count: raw.session_count,
-        sessions,
-        entities,
-        wall_start,
-        wall_end,
-        interner,
-    })
+    Ok(())
 }
 
 /// Groups the raw tool part rows into per-message busy spans.
@@ -536,7 +624,133 @@ fn part_span(fields: &PartFields) -> Option<(u64, u64)> {
 mod tests {
     use super::*;
     use crate::report::BillHeader;
-    use crate::store::{RawLoad, RawMessage, RawPart, RawSession};
+    use crate::store::{RawLoad, RawMessage, RawPart, RawSession, RawWindowMeta};
+
+    /// Raw rows of one session: two assistant calls plus a user message.
+    fn raw_fixture() -> RawLoad {
+        RawLoad {
+            header: BillHeader::Session {
+                id: "ses_abc123456".to_owned(),
+                title: "Test session".to_owned(),
+            },
+            session_count: 1,
+            sessions: vec![RawSession {
+                id: "ses_abc123456".to_owned(),
+                agent: Some("build".to_owned()),
+            }],
+            messages: vec![
+                RawMessage {
+                    id: "msg_1".to_owned(),
+                    session_id: "ses_abc123456".to_owned(),
+                    location: "fixture".to_owned(),
+                    json: r#"["assistant","openai","gpt-test",0.125,1000,3000,10,4,2,6,1,"build","primary"]"#
+                        .to_owned(),
+                },
+                RawMessage {
+                    id: "msg_2".to_owned(),
+                    session_id: "ses_abc123456".to_owned(),
+                    location: "fixture".to_owned(),
+                    json: r#"["assistant","anthropic","claude-test",0.5,2000,2500,30,8,1,2,0,null,null]"#
+                        .to_owned(),
+                },
+                RawMessage {
+                    id: "msg_user".to_owned(),
+                    session_id: "ses_abc123456".to_owned(),
+                    location: "fixture".to_owned(),
+                    json: r#"["user",null,null,null,500,null,null,null,null,null,null,null,null]"#.to_owned(),
+                },
+            ],
+            parts: vec![RawPart {
+                message_id: "msg_1".to_owned(),
+                location: "fixture".to_owned(),
+                json: r#"["tool",1000,2500]"#
+                    .to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn batched_parsing_matches_single_pass() -> Result<(), Box<dyn std::error::Error>> {
+        let single = parse_system(raw_fixture(), &PipelineProgress::default())?;
+        let raw = raw_fixture();
+        let RawLoad {
+            header,
+            session_count,
+            sessions,
+            messages,
+            parts,
+        } = raw;
+        let meta = RawWindowMeta {
+            header,
+            session_count,
+            sessions,
+        };
+        let (mut world, parse) = parse_metadata(meta, &PipelineProgress::default())?;
+
+        // Stream the parts and messages in two batches: the first two rows,
+        // then the rest — the interning order must match the single pass
+        // exactly.  The part, decode, and row buffers are reused across both
+        // batches, as the streaming pipeline does.
+        let mut messages = messages.into_iter();
+        let mut first_parts = parts;
+        let mut first = messages.by_ref().take(2).collect::<Vec<_>>();
+        let mut results = Vec::new();
+        let mut rows = Vec::new();
+
+        parse_message_batch(
+            &mut world,
+            &parse,
+            &mut first_parts,
+            &mut first,
+            &mut results,
+            &mut rows,
+            &PipelineProgress::default(),
+        )?;
+        for row in rows.drain(..) {
+            world.entities.push(row);
+        }
+
+        let mut second_parts = Vec::new();
+        let mut second = messages.collect::<Vec<_>>();
+        parse_message_batch(
+            &mut world,
+            &parse,
+            &mut second_parts,
+            &mut second,
+            &mut results,
+            &mut rows,
+            &PipelineProgress::default(),
+        )?;
+        for row in rows.drain(..) {
+            world.entities.push(row);
+        }
+
+        assert_eq!(world.session_count, single.session_count);
+        assert_eq!(world.entities.len(), single.entities.len());
+        assert_eq!(world.wall_start, single.wall_start);
+        assert_eq!(world.wall_end, single.wall_end);
+
+        for (batched, whole) in world.entities.rows().zip(single.entities.rows()) {
+            // Handles are equal only when interning happened in the same
+            // order: the batch stream must assign identical ids.
+            assert_eq!(batched.session_id, whole.session_id);
+            assert_eq!(batched.agent, whole.agent);
+            assert_eq!(batched.provider, whole.provider);
+            assert_eq!(batched.model, whole.model);
+            assert_eq!(batched.tokens.input, whole.tokens.input);
+            assert_eq!(batched.tokens.output, whole.tokens.output);
+            assert_eq!(batched.tokens.reasoning, whole.tokens.reasoning);
+            assert_eq!(batched.tokens.cache_read, whole.tokens.cache_read);
+            assert_eq!(batched.tokens.cache_write, whole.tokens.cache_write);
+            assert_eq!(batched.cost_micros, whole.cost_micros);
+            assert_eq!(batched.cost_unknown, whole.cost_unknown);
+            assert_eq!(batched.api_ms, whole.api_ms);
+            assert_eq!(batched.created, whole.created);
+            assert_eq!(batched.completed, whole.completed);
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn parse_system_builds_world_from_raw_rows() -> Result<(), Box<dyn std::error::Error>> {
