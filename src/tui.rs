@@ -16,9 +16,9 @@ use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::style::Print;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use opencode_bill::{
-    BillHeader, BillProgress, BillReport, StorageContext, graph_lines,
+    BarGraph, BillHeader, BillProgress, BillReport, StorageContext, graph_lines,
     load_day_report_with_progress_counted, load_month_report_with_progress_counted,
     load_report_with_progress_counted, load_year_report_with_progress_counted,
 };
@@ -52,6 +52,8 @@ const COLUMNS: usize = 11;
 const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 10, 11, 11, 11, 10, 10, 10, 11, 11];
 /// Spaces between adjacent table columns.
 const COLUMN_SPACING: u16 = 2;
+/// Horizontal gap between adjacent graph blocks in the year grid.
+const GRAPH_SPACING: u16 = 2;
 
 /// One message from the background worker to the UI task.
 enum Progress {
@@ -260,22 +262,19 @@ pub async fn run(
                 .map_err(|failure| failure.to_string())?;
         }
 
-        // The year bill's bar graphs are full-width lines, so they print
-        // after the table instead of inside its 11-column grid.
+        // The year bill's bar graphs render as bordered blocks in a grid
+        // that fits the terminal width; they print after the table, outside
+        // its 11-column grid.
         if let BillHeader::Year { .. } = &report.header {
-            for graph in &report.graphs {
-                stdout
-                    .write_all(b"\n")
-                    .map_err(|failure| failure.to_string())?;
+            let (terminal_width, _) = size().map_err(|failure| failure.to_string())?;
+            stdout
+                .write_all(b"\n")
+                .map_err(|failure| failure.to_string())?;
 
-                for line in graph_lines(graph) {
-                    stdout
-                        .write_all(line.as_bytes())
-                        .map_err(|failure| failure.to_string())?;
-                    stdout
-                        .write_all(b"\n")
-                        .map_err(|failure| failure.to_string())?;
-                }
+            for line in render_graph_grid(&report.graphs, terminal_width) {
+                stdout
+                    .write_all(line.as_bytes())
+                    .map_err(|failure| failure.to_string())?;
             }
         }
         stdout.flush().map_err(|failure| failure.to_string())?;
@@ -611,6 +610,89 @@ fn table_natural_width() -> u16 {
     COLUMN_WIDTHS.iter().sum::<u16>() + COLUMN_SPACING * (COLUMNS as u16 - 1)
 }
 
+/// Renders the year bill's bar graphs as bordered blocks in a grid.
+///
+/// The terminal width decides how many blocks sit next to each other: every
+/// block shares the widest graph's content width plus borders, and columns
+/// is the largest count whose blocks plus gaps still fit.  Blocks in one
+/// row share the row's tallest height; shorter graphs pad with blank lines.
+/// Each returned line is one styled terminal row of the finished grid.
+fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
+    let blocks = graphs.iter().map(graph_lines).collect::<Vec<_>>();
+
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let content_width = blocks
+        .iter()
+        .flat_map(|lines| lines.iter().map(|line| line.chars().count()))
+        .max()
+        .unwrap_or(1)
+        .max(1)
+        .min(usize::from(u16::MAX) - 4);
+    let block_width = content_width + 2;
+    let columns = (usize::from(terminal_width) + usize::from(GRAPH_SPACING))
+        / (block_width + usize::from(GRAPH_SPACING));
+    let columns = columns.max(1);
+    let row_heights = blocks
+        .chunks(columns)
+        .map(|chunk| chunk.iter().map(Vec::len).max().unwrap_or(1))
+        .collect::<Vec<_>>();
+    let buffer_width = columns * block_width + (columns - 1) * usize::from(GRAPH_SPACING);
+    let buffer_height = row_heights.iter().map(|height| *height + 2).sum::<usize>();
+    let mut buffer = Buffer::empty(Rect::new(
+        0,
+        0,
+        u16::try_from(buffer_width).unwrap_or(u16::MAX),
+        u16::try_from(buffer_height).unwrap_or(u16::MAX),
+    ));
+    let mut y_offset = 0u16;
+
+    for (row_index, chunk) in blocks.chunks(columns).enumerate() {
+        let row_height = row_heights[row_index] as u16;
+
+        for (column, lines) in chunk.iter().enumerate() {
+            let x = column as u16 * (block_width as u16 + GRAPH_SPACING);
+            let block_area = Rect::new(x, y_offset, block_width as u16, row_height + 2);
+            let content_area = Rect::new(x + 1, y_offset + 1, block_width as u16 - 2, row_height);
+
+            ratatui::widgets::Widget::render(Block::bordered(), block_area, &mut buffer);
+            ratatui::widgets::Widget::render(
+                Paragraph::new(styled_graph_lines(lines, row_height)),
+                content_area,
+                &mut buffer,
+            );
+        }
+        y_offset = y_offset.saturating_add(row_height + 2);
+    }
+
+    (0..buffer_height)
+        .map(|y| render_row(&buffer, y as u16, buffer_width as u16))
+        .collect()
+}
+
+/// Pads a graph's lines to a row height and styles them: the title line
+/// bold, the month labels dim.
+fn styled_graph_lines(lines: &[String], row_height: u16) -> Vec<Line<'static>> {
+    let padded_len = usize::from(row_height);
+
+    (0..padded_len)
+        .map(|index| {
+            let text = lines.get(index).cloned().unwrap_or_default();
+            let modifier = if index == 0 {
+                Modifier::BOLD
+            } else if index + 1 == padded_len {
+                Modifier::DIM
+            } else {
+                Modifier::empty()
+            };
+
+            Line::from(Span::styled(text, Style::new().add_modifier(modifier)))
+        })
+        .collect()
+}
+
 /// An empty row that separates the report tables.
 fn blank_row() -> Row<'static> {
     Row::new(vec![Cell::new("")])
@@ -926,6 +1008,75 @@ mod tests {
             !text.contains("TOTAL"),
             "year report must skip TOTAL: {text}"
         );
+    }
+
+    /// The eight year graphs mirroring the month TOTAL rows.
+    fn year_graphs() -> Vec<BarGraph> {
+        [
+            "REQUESTS",
+            "INPUT",
+            "CACHE READ",
+            "CACHE WRITE",
+            "OUTPUT",
+            "REASONING",
+            "API TIME",
+            "AMOUNT DUE",
+        ]
+        .into_iter()
+        .map(|label| BarGraph {
+            label,
+            bars: [1; 12],
+            total: 12,
+            kind: opencode_bill::MetricKind::Count,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn grids_year_graphs_into_blocks_that_fit_the_terminal_width() {
+        let grid = render_graph_grid(&year_graphs(), 200);
+        let first = &grid[0];
+
+        // 50-column blocks plus 2-column gaps: three fit in 200 columns, so
+        // eight graphs need three rows of 12 lines.
+        assert_eq!(grid.len(), 36);
+        assert_eq!(first.matches('┌').count(), 3);
+        assert!(grid[1].contains("REQUESTS BY MONTH"), "row: {}", grid[1]);
+    }
+
+    #[test]
+    fn stacks_year_graphs_into_one_column_on_narrow_terminals() {
+        let grid = render_graph_grid(&year_graphs(), 80);
+
+        assert_eq!(grid.len(), 96);
+        assert_eq!(grid[0].matches('┌').count(), 1);
+    }
+
+    #[test]
+    fn fits_every_year_graph_on_one_row_when_the_terminal_is_wide() {
+        let grid = render_graph_grid(&year_graphs(), 1000);
+
+        assert_eq!(grid.len(), 12);
+        assert_eq!(grid[0].matches('┌').count(), 8);
+        assert!(grid[1].contains("AMOUNT DUE BY MONTH"), "row: {}", grid[1]);
+    }
+
+    #[test]
+    fn pads_short_year_graphs_to_their_row_height() {
+        let mut graphs = year_graphs();
+
+        graphs[7].bars = [0; 12];
+        graphs[7].total = 0;
+        let grid = render_graph_grid(&graphs, 1000);
+
+        assert_eq!(grid.len(), 12);
+        // The zero-usage graph keeps its bordered block across the full row.
+        assert!(grid[11].contains("└"), "row: {}", grid[11]);
+    }
+
+    #[test]
+    fn renders_an_empty_graph_grid() {
+        assert!(render_graph_grid(&[], 200).is_empty());
     }
 
     #[test]
