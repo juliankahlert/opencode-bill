@@ -76,12 +76,13 @@ Usage
     opencode-bill [<session-id-or-prefix>] [--data-dir PATH]
     opencode-bill [--month [MONTH]] [--data-dir PATH]
     opencode-bill [--year [YEAR]] [--data-dir PATH]
+    opencode-bill [--week [WEEK]] [--data-dir PATH]
     opencode-bill [--today] [--data-dir PATH]
 
   session-id-or-prefix   Full OpenCode session ID or a unique prefix
                          (minimum 6 characters). With no session argument,
-                         no --month, and no --year, the current month is
-                         billed.
+                         no --month, no --year, no --week, and no --today,
+                         the current month is billed.
 
   --month [MONTH]        Bill the calendar month (1-12) of the current
                          year instead of one session and its sub-agents.
@@ -105,6 +106,16 @@ Usage
                          one bar graph per total metric: each graph has a
                          vertical bar for every month of the year plus the
                          year total as a value (the total is not a bar).
+
+  --week [WEEK]          Bill the ISO calendar week (1-53) of the current
+                         year instead of one session and its sub-agents.
+                         With no value the current week is billed, so
+                         every session with messages in that window is
+                         included; no session argument is required. The
+                         report replaces the TOTAL table with one bar
+                         graph per total metric: each graph has a vertical
+                         bar for every weekday (Monday to Sunday) plus the
+                         week total as a value (the total is not a bar).
 
   --today                Bill the current calendar day instead of one
                          session and its sub-agents. Every session with
@@ -130,13 +141,16 @@ The month window is the calendar month in UTC (start of the first day to
 start of the next month, in the timestamps OpenCode stores); the day window
 is one calendar day in UTC (start of the day to start of the next day); the
 year window is one calendar year in UTC (start of January 1 to start of
-January 1 of the next year). The labeled day is the local calendar date; the
-window is that date in UTC. Year-graph bars bucket each call by the calendar
-month of its creation time; month-graph bars bucket each call by the ISO
-calendar week of its creation time. Calls without a creation time count in
-the totals but belong to no bar. Provider corrections with negative token or
-cost values are clamped to zero, so a monthly total can exceed what a
-provider's own invoice shows when such corrections occurred.
+January 1 of the next year); the week window is one ISO calendar week in UTC
+(start of Monday to start of the next Monday), so week 1 of a year can start
+in the previous calendar year. The labeled day is the local calendar date;
+the window is that date in UTC. Year-graph bars bucket each call by the
+calendar month of its creation time, month-graph bars by the ISO calendar
+week of its creation time, and week-graph bars by the weekday of its
+creation time. Calls without a creation time count in the totals but belong
+to no bar. Provider corrections with negative token or cost values are
+clamped to zero, so a monthly total can exceed what a provider's own invoice
+shows when such corrections occurred.
 
 Examples:
 
@@ -147,10 +161,13 @@ Examples:
     opencode-bill --month 2
     opencode-bill --year
     opencode-bill --year 2025
+    opencode-bill --week
+    opencode-bill --week 32
     opencode-bill --today
     opencode-bill abc123 --provider openai
     opencode-bill --month --provider openai --provider anthropic
     opencode-bill --year --provider openai
+    opencode-bill --week --provider openai
     opencode-bill --today --provider openai
 
 When stdout is a terminal the report is shown with a loading indicator
