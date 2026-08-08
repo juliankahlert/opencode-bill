@@ -233,7 +233,7 @@ mod tests {
                 parallel_totals.tokens.cache_write,
                 totals.tokens.cache_write
             );
-            assert_eq!(parallel_totals.cost_micros, totals.cost_micros);
+            assert_eq!(parallel_totals.cost, totals.cost);
             assert_eq!(parallel_totals.api_ms, totals.api_ms);
             assert_eq!(parallel_totals.wall_start, totals.wall_start);
             assert_eq!(parallel_totals.wall_end, totals.wall_end);
@@ -287,7 +287,7 @@ mod tests {
                 actual.totals.tokens.cache_write,
                 expected.totals.tokens.cache_write
             );
-            assert_eq!(actual.totals.cost_micros, expected.totals.cost_micros);
+            assert_eq!(actual.totals.cost, expected.totals.cost);
             assert_eq!(actual.totals.api_ms, expected.totals.api_ms);
             assert_eq!(actual.totals.wall_start, expected.totals.wall_start);
             assert_eq!(actual.totals.wall_end, expected.totals.wall_end);

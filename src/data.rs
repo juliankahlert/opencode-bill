@@ -5,6 +5,10 @@ use std::ops::AddAssign;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use rusty_money::{FormattableCurrency, Locale, Money};
+
 use crate::report::BillHeader;
 use crate::timing::{earliest, latest};
 
@@ -206,6 +210,92 @@ fn intern(ids: &mut HashMap<String, u32>, table: &mut Vec<String>, text: &str) -
 
 /// One micro-dollar (`1/1_000_000` of one USD), the deterministic cost unit.
 pub(crate) const MICRO_PER_DOLLAR: i64 = 1_000_000;
+
+/// Currency whose minor unit is one micro-dollar.
+///
+/// The ISO `USD` currency counts cents (exponent 2); the storage lanes and
+/// the report both count micro-dollars (exponent 6), so every cost
+/// calculation uses this currency and `rusty_money`'s checked arithmetic
+/// instead of raw `i64` adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MicroUsd;
+
+impl FormattableCurrency for MicroUsd {
+    fn to_string(&self) -> String {
+        "USDM".to_owned()
+    }
+
+    fn exponent(&self) -> u32 {
+        6
+    }
+
+    fn code(&self) -> &'static str {
+        "USDM"
+    }
+
+    fn locale(&self) -> Locale {
+        Locale::EnUs
+    }
+
+    fn symbol(&self) -> &'static str {
+        ""
+    }
+
+    fn symbol_first(&self) -> bool {
+        true
+    }
+}
+
+/// The single micro-dollar currency instance.
+pub(crate) const MICRO_USD: MicroUsd = MicroUsd;
+
+/// A cost amount in micro-dollars, with checked `rusty_money` arithmetic.
+pub(crate) type Cost = Money<'static, MicroUsd>;
+
+/// Wraps a micro-dollar integer as a [`Cost`].
+pub(crate) fn cost_from_micros(micros: i64) -> Cost {
+    Money::from_minor(micros, &MICRO_USD)
+}
+
+/// Adds two costs, saturating at the `i64` micro-dollar range.
+///
+/// `rusty_money`'s `Money::add` falls through to `rust_decimal`'s `Add`,
+/// which panics on decimal overflow instead of returning an error, so the
+/// addition runs on `Decimal::checked_add` and clamps on overflow —
+/// keeping the saturating-sum contract that every fold path relies on.
+pub(crate) fn cost_add(left: Cost, right: Cost) -> Cost {
+    match left.amount().checked_add(*right.amount()) {
+        Some(amount) => Money::from_decimal(amount, &MICRO_USD),
+        None if left.is_negative() || right.is_negative() => cost_from_micros(i64::MIN),
+        None => cost_from_micros(i64::MAX),
+    }
+}
+
+/// Micro-dollar integer of a [`Cost`], truncated toward zero and clamped to
+/// the `i64` range.
+///
+/// Totals may legally exceed `i64::MAX` in the decimal domain; the report
+/// clamps here, mirroring the previous saturating sums.
+pub(crate) fn cost_to_micros(cost: Cost) -> i64 {
+    let scaled = match cost.amount().checked_mul(Decimal::from(MICRO_PER_DOLLAR)) {
+        Some(scaled) => scaled.trunc(),
+        None => {
+            return if cost.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            };
+        }
+    };
+
+    if scaled >= Decimal::from(i64::MAX) {
+        i64::MAX
+    } else if scaled <= Decimal::from(i64::MIN) {
+        i64::MIN
+    } else {
+        scaled.to_i64().unwrap_or(0)
+    }
+}
 
 /// Converts a USD amount to micro-dollars with display-equivalent rounding.
 ///
@@ -447,14 +537,14 @@ fn present_bit(present: bool) -> u64 {
 /// Token and API-time sums saturate at `u64::MAX`; cost sums saturate in
 /// micro-dollars; wall bounds widen in the message-order-independent way used
 /// across every fold in the crate.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct Totals {
     /// Number of assistant calls.
     pub(crate) requests: u64,
     /// Summed token usage.
     pub(crate) tokens: Tokens,
     /// Summed cost in micro-dollars.
-    pub(crate) cost_micros: i64,
+    pub(crate) cost: Cost,
     /// Summed endpoint-busy time in milliseconds.
     pub(crate) api_ms: u64,
     /// Earliest wall-clock start (Unix millis).
@@ -463,12 +553,25 @@ pub(crate) struct Totals {
     pub(crate) wall_end: Option<u64>,
 }
 
+impl Default for Totals {
+    fn default() -> Self {
+        Totals {
+            requests: 0,
+            tokens: Tokens::default(),
+            cost: cost_from_micros(0),
+            api_ms: 0,
+            wall_start: None,
+            wall_end: None,
+        }
+    }
+}
+
 impl Totals {
     /// Folds one assistant call into this running total.
     pub(crate) fn accumulate(&mut self, row: &UsageRow) {
         self.requests += 1;
         self.tokens += &row.tokens;
-        self.cost_micros = self.cost_micros.saturating_add(row.cost_micros);
+        self.cost = cost_add(self.cost, cost_from_micros(row.cost_micros));
         self.api_ms = self.api_ms.saturating_add(row.api_ms);
         self.wall_start = earliest(self.wall_start, row.created);
         self.wall_end = latest(self.wall_end, row.completed.or(row.created));
@@ -478,7 +581,7 @@ impl Totals {
     pub(crate) fn merge(&mut self, other: &Totals) {
         self.requests += other.requests;
         self.tokens += &other.tokens;
-        self.cost_micros = self.cost_micros.saturating_add(other.cost_micros);
+        self.cost = cost_add(self.cost, other.cost);
         self.api_ms = self.api_ms.saturating_add(other.api_ms);
         self.wall_start = earliest(self.wall_start, other.wall_start);
         self.wall_end = latest(self.wall_end, other.wall_end);
@@ -675,7 +778,7 @@ mod tests {
     #[test]
     fn totals_saturate_cost_in_micro_dollars() {
         let mut total = Totals {
-            cost_micros: i64::MAX,
+            cost: cost_from_micros(i64::MAX),
             ..Totals::default()
         };
         let row = UsageRow {
@@ -687,7 +790,15 @@ mod tests {
 
         total.accumulate(&row);
 
-        assert_eq!(total.cost_micros, i64::MAX);
+        assert_eq!(cost_to_micros(total.cost), i64::MAX);
+    }
+
+    #[test]
+    fn cost_add_saturates_on_decimal_overflow() {
+        let huge = Money::from_decimal(Decimal::MAX, &MICRO_USD);
+
+        assert_eq!(cost_to_micros(cost_add(huge, huge)), i64::MAX);
+        assert_eq!(cost_to_micros(cost_add(-huge, -huge)), i64::MIN);
     }
 
     fn usage_row_default() -> UsageRow {

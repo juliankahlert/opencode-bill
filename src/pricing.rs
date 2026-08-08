@@ -6,10 +6,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use log::warn;
+use rust_decimal::Decimal;
+use rusty_money::{Money, Round};
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use crate::data::{Interner, ModelKey, ModelRates, Tokens};
+use crate::data::{
+    Cost, Interner, MICRO_PER_DOLLAR, MICRO_USD, ModelKey, ModelRates, Tokens, cost_add,
+    cost_from_micros, cost_to_micros,
+};
 use crate::error::BillError;
 use crate::models_dev::{EFFORT_SUFFIXES, ModelsDevFallback};
 use crate::parse::read_json;
@@ -175,17 +180,49 @@ pub(crate) fn load_pricing<'a>(
 ///
 /// Reasoning tokens bill at the output rate; missing rates contribute
 /// nothing.  Used to price calls whose recorded cost is unknown (zero).
-/// Rounds to even micro-dollars so the printed bill matches the old `f64`
-/// path byte-for-byte.
+/// The per-term products and the sum run through [`rusty_money`] decimal
+/// arithmetic, rounded ties-to-even at the micro-dollar.  The old `f64`
+/// path was noise-dependent at half-micro ties; the exact decimal path
+/// rounds the true sum, which can differ from the old binary result by
+/// one micro on ties.
 pub(crate) fn estimated_cost_micros(tokens: &Tokens, rates: &ModelRates) -> i64 {
-    let per_million = 1_000_000.0;
-    let usd = tokens.input as f64 * rates.input.unwrap_or(0.0) / per_million
-        + tokens.cache_read as f64 * rates.cache_read.unwrap_or(0.0) / per_million
-        + tokens.cache_write as f64 * rates.cache_write.unwrap_or(0.0) / per_million
-        + (tokens.output as f64 + tokens.reasoning as f64) * rates.output.unwrap_or(0.0)
-            / per_million;
+    let output_tokens = tokens.output.saturating_add(tokens.reasoning);
+    let cost = [
+        term(tokens.input, rates.input),
+        term(tokens.cache_read, rates.cache_read),
+        term(tokens.cache_write, rates.cache_write),
+        term(output_tokens, rates.output),
+    ]
+    .into_iter()
+    .fold(cost_from_micros(0), cost_add);
 
-    crate::data::usd_to_micros(usd)
+    cost_to_micros(cost.round(6, Round::HalfEven))
+}
+
+/// Cost of `tokens` at a USD-per-million rate, or zero when the rate is
+/// absent.  Extreme token counts clamp to the `i64` dollar range so the
+/// exact decimal arithmetic stays inside the 96-bit mantissa.
+fn term(tokens: u64, rate: Option<f64>) -> Cost {
+    let Some(rate) = rate else {
+        return cost_from_micros(0);
+    };
+    let rate = match Decimal::try_from(rate) {
+        Ok(rate) => rate,
+        Err(_) => {
+            warn!("non-decimal model rate {rate}; billing the call at the cap");
+            return cost_from_micros(i64::MAX);
+        }
+    };
+    let tokens = tokens.min(i64::MAX as u64) as i64;
+    let dollars = Money::from_major(tokens, &MICRO_USD).mul(rate);
+
+    // Every rate source filters non-negative values, so only a decimal
+    // overflow can reach the error arm; the negative guard is defensive.
+    match dollars.and_then(|dollars| dollars.div(MICRO_PER_DOLLAR)) {
+        Ok(cost) => cost,
+        Err(_) if rate.is_sign_negative() => cost_from_micros(i64::MIN),
+        Err(_) => cost_from_micros(i64::MAX),
+    }
 }
 
 /// Reads the four rates out of a catalog `cost` object.
@@ -417,6 +454,30 @@ mod tests {
         };
 
         assert_eq!(estimated_cost_micros(&tokens, &rates), 2_000_000);
+    }
+
+    #[test]
+    fn estimated_cost_rounds_half_micro_ties_to_even() {
+        let rates = ModelRates {
+            input: Some(0.5),
+            cache_read: None,
+            cache_write: None,
+            output: None,
+        };
+
+        // 3 * 0.5 / 1e6 = 1.5 micros, an exact tie -> rounds to even (2).
+        let tokens = Tokens {
+            input: 3,
+            ..Tokens::default()
+        };
+        assert_eq!(estimated_cost_micros(&tokens, &rates), 2);
+
+        // 1 * 0.5 / 1e6 = 0.5 micros, an exact tie -> rounds to even (0).
+        let tokens = Tokens {
+            input: 1,
+            ..Tokens::default()
+        };
+        assert_eq!(estimated_cost_micros(&tokens, &rates), 0);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::data::{
     AgentId, AgentUsage, Interner, MICRO_PER_DOLLAR, ModelKey, ModelRates, Totals, World,
+    cost_to_micros,
 };
 use crate::timing::{format_duration, format_timestamp, span_ms};
 
@@ -129,7 +130,7 @@ fn usage_row(entry: (&ModelKey, &Totals), interner: &Interner) -> Vec<String> {
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format_cost(totals.cost_micros),
+        format_cost(cost_to_micros(totals.cost)),
     ]
 }
 
@@ -148,7 +149,7 @@ fn agent_row(entry: (&AgentId, &AgentUsage), interner: &Interner) -> Vec<String>
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format_cost(totals.cost_micros),
+        format_cost(cost_to_micros(totals.cost)),
     ]
 }
 
@@ -208,7 +209,7 @@ fn total_rows(world: &World, total: &Totals) -> Vec<(String, String)> {
     }
     rows.push((
         "Amount due:".to_owned(),
-        format!("{} USD", format_cost(total.cost_micros)),
+        format!("{} USD", format_cost(cost_to_micros(total.cost))),
     ));
 
     rows
