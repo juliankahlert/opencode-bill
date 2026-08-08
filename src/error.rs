@@ -19,6 +19,14 @@ pub enum BillError {
     #[error("invalid month: {0}")]
     InvalidMonth(String),
 
+    /// The day window does not exist in the calendar.
+    #[error("invalid day: {0}")]
+    InvalidDay(String),
+
+    /// The year window does not exist in the calendar.
+    #[error("invalid year: {0}")]
+    InvalidYear(String),
+
     /// No session matched the supplied reference.
     #[error("session '{0}' was not found")]
     SessionNotFound(String),

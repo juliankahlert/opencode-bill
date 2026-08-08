@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 use crate::data::BillProgress;
 use crate::error::BillError;
@@ -47,8 +47,49 @@ impl CalendarWindow {
             header: BillHeader::Month { label },
         })
     }
+
+    /// Builds one calendar day with its exact millisecond window.
+    pub(crate) fn day(year: u32, month: u32, day: u32) -> Result<Self, BillError> {
+        let detail = format!("{year}-{month}-{day}");
+        if !(1970..=i32::MAX as u32).contains(&year) {
+            return Err(BillError::InvalidDay(detail.clone()));
+        }
+        let date = NaiveDate::from_ymd_opt(year as i32, month, day)
+            .ok_or_else(|| BillError::InvalidDay(detail.clone()))?;
+        let next = date
+            .succ_opt()
+            .ok_or_else(|| BillError::InvalidDay(detail.clone()))?;
+        let label = format!("{} {} {}", date.format("%B"), date.day(), date.format("%Y"));
+
+        Ok(Self {
+            label: label.clone(),
+            start_ms: midnight_ms(date).ok_or_else(|| BillError::InvalidDay(detail.clone()))?,
+            end_ms: midnight_ms(next).ok_or_else(|| BillError::InvalidDay(detail))?,
+            header: BillHeader::Day { label },
+        })
+    }
+
+    /// Builds one calendar year with its exact millisecond window.
+    pub(crate) fn year(year: u32) -> Result<Self, BillError> {
+        let detail = format!("{year}");
+        if !(1970..=i32::MAX as u32).contains(&year) {
+            return Err(BillError::InvalidYear(detail.clone()));
+        }
+        let first = first_day(year, 1).map_err(|_| BillError::InvalidYear(detail.clone()))?;
+        let next_year =
+            first_day(year + 1, 1).map_err(|_| BillError::InvalidYear(detail.clone()))?;
+        let label = first.format("%Y").to_string();
+
+        Ok(Self {
+            label: label.clone(),
+            start_ms: midnight_ms(first).ok_or_else(|| BillError::InvalidYear(detail.clone()))?,
+            end_ms: midnight_ms(next_year).ok_or_else(|| BillError::InvalidYear(detail))?,
+            header: BillHeader::Year { label },
+        })
+    }
 }
 
+/// First day of a month, or an error when the month does not exist.
 fn first_day(year: u32, month: u32) -> Result<NaiveDate, BillError> {
     NaiveDate::from_ymd_opt(year as i32, month, 1)
         .ok_or_else(|| BillError::InvalidMonth(format!("{year}-{month}")))

@@ -1,9 +1,10 @@
-//! OpenCode session and calendar-month bill generation.
+//! OpenCode session, calendar-month, calendar-year, and calendar-day bill
+//! generation.
 //!
 //! The crate is split into data-oriented modules:
 //!
 //! * `data`: component storage (`UsageStore` SoA rows, `Totals`, `ModelRates`, ...)
-//! * `store`: the `SessionStore` trait, session and month models
+//! * `store`: the `SessionStore` trait, session and calendar-window models
 //! * `pricing`: the `PricingSource` trait and its catalog / GitHub impls
 //! * `models_dev`: generic models.dev-style fallback pricing catalog
 //! * `database` / `legacy`: the two concrete session stores
@@ -26,9 +27,11 @@ mod store;
 mod timing;
 
 pub use bill::{
-    generate_bill, generate_monthly_bill, load_month_report_with_progress,
-    load_month_report_with_progress_counted, load_report_with_progress,
-    load_report_with_progress_counted,
+    generate_bill, generate_daily_bill, generate_monthly_bill, generate_yearly_bill,
+    load_day_report_with_progress, load_day_report_with_progress_counted,
+    load_month_report_with_progress, load_month_report_with_progress_counted,
+    load_report_with_progress, load_report_with_progress_counted, load_year_report_with_progress,
+    load_year_report_with_progress_counted,
 };
 pub use context::{DataDirectorySet, MissingDataDirectory, StorageContext, StorageContextBuilder};
 pub use data::BillProgress;

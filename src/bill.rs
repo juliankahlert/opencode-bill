@@ -131,6 +131,40 @@ pub fn generate_monthly_bill(
     render_bill(&report)
 }
 
+/// Generates a deterministic plain-text bill for one calendar day.
+///
+/// The day is a day number of the given year and month; every session whose
+/// messages were recorded in that window is included. When `providers` is
+/// non-empty, only usage from those providers is included.
+pub fn generate_daily_bill(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    day: u32,
+    providers: &[String],
+) -> Result<String, BillError> {
+    let report = load_day_report_with_progress(context, year, month, day, providers, |_| {})?;
+
+    render_bill(&report)
+}
+
+/// Generates a deterministic plain-text bill for one calendar year.
+///
+/// The year is a year number; every session whose messages were recorded in
+/// that window is included.  The report carries the full usage tables plus
+/// one bar graph per TOTAL metric of a month bill, with a vertical bar per
+/// month and the year total shown as a value. When `providers` is non-empty,
+/// only usage from those providers is included.
+pub fn generate_yearly_bill(
+    context: &StorageContext,
+    year: u32,
+    providers: &[String],
+) -> Result<String, BillError> {
+    let report = load_year_report_with_progress(context, year, providers, |_| {})?;
+
+    render_bill(&report)
+}
+
 /// Loads a session and builds the report data, reporting each work step.
 ///
 /// `on_task` runs before every phase (loading, parsing, pricing, aggregation,
@@ -224,6 +258,102 @@ pub fn load_month_report_with_progress_counted(
     ))?
 }
 
+/// Loads one calendar day and builds the report data, reporting each step.
+///
+/// `on_task` runs before every phase (loading, parsing, pricing, aggregation,
+/// report building) so a UI can show which step is currently in progress.
+/// When `providers` is non-empty, only usage from those providers is included.
+///
+/// The pipeline runs on tokio internally (store read on the blocking pool,
+/// gated GitHub pricing fetch in the pricing phase); the function itself
+/// stays synchronous.
+pub fn load_day_report_with_progress(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    day: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+) -> Result<BillReport, BillError> {
+    let counters = BillProgress::default();
+
+    load_day_report_with_progress_counted(context, year, month, day, providers, on_task, &counters)
+}
+
+/// Loads one calendar day and builds the report data, reporting each work
+/// step and counting live progress.
+///
+/// Like [`load_day_report_with_progress`], but the pipeline also writes the
+/// loaded, parsed, and folded row counts into the shared `counters` handle
+/// while it runs, so a UI on another task can show live numbers.
+pub fn load_day_report_with_progress_counted(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    day: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+    counters: &BillProgress,
+) -> Result<BillReport, BillError> {
+    let mut on_task = on_task;
+    let progress = PipelineProgress::with_counters(counters.clone());
+
+    block_on(load_day_report_async(
+        context,
+        year,
+        month,
+        day,
+        providers,
+        &mut on_task,
+        &progress,
+    ))?
+}
+
+/// Loads one calendar year and builds the report data, reporting each step.
+///
+/// `on_task` runs before every phase (loading, parsing, pricing, aggregation,
+/// report building) so a UI can show which step is currently in progress.
+/// When `providers` is non-empty, only usage from those providers is included.
+///
+/// The pipeline runs on tokio internally (store read on the blocking pool,
+/// gated GitHub pricing fetch in the pricing phase); the function itself
+/// stays synchronous.
+pub fn load_year_report_with_progress(
+    context: &StorageContext,
+    year: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+) -> Result<BillReport, BillError> {
+    let counters = BillProgress::default();
+
+    load_year_report_with_progress_counted(context, year, providers, on_task, &counters)
+}
+
+/// Loads one calendar year and builds the report data, reporting each work
+/// step and counting live progress.
+///
+/// Like [`load_year_report_with_progress`], but the pipeline also writes the
+/// loaded, parsed, and folded row counts into the shared `counters` handle
+/// while it runs, so a UI on another task can show live numbers.
+pub fn load_year_report_with_progress_counted(
+    context: &StorageContext,
+    year: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+    counters: &BillProgress,
+) -> Result<BillReport, BillError> {
+    let mut on_task = on_task;
+    let progress = PipelineProgress::with_counters(counters.clone());
+
+    block_on(load_year_report_async(
+        context,
+        year,
+        providers,
+        &mut on_task,
+        &progress,
+    ))?
+}
+
 /// The async session pipeline: loads the store on the blocking pool, then
 /// parses, prices, aggregates, and renders on the calling thread.  The
 /// GitHub pricing page is fetched only when the bill uses `github-copilot`.
@@ -259,6 +389,46 @@ async fn load_month_report_async(
     let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
 
     summarize_streamed_async(streamed, providers, false, on_task, progress)
+}
+
+/// The async day pipeline: streams the store on the blocking pool (a day
+/// window is one day chunk) while a second blocking task parses and folds
+/// each batch, then renders.  The GitHub pricing page is fetched only when
+/// the bill uses `github-copilot`.
+async fn load_day_report_async(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    day: u32,
+    providers: &[String],
+    on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
+) -> Result<BillReport, BillError> {
+    on_task("Loading day data");
+    progress.note_phase(0);
+    let window = CalendarWindow::day(year, month, day)?;
+    let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
+
+    summarize_streamed_async(streamed, providers, false, on_task, progress)
+}
+
+/// The async year pipeline: streams the store on the blocking pool one day
+/// at a time while a second blocking task parses and folds each day's batch,
+/// then renders with the month bar graphs.  The GitHub pricing page is
+/// fetched only when the bill uses `github-copilot`.
+async fn load_year_report_async(
+    context: &StorageContext,
+    year: u32,
+    providers: &[String],
+    on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
+) -> Result<BillReport, BillError> {
+    on_task("Loading year data");
+    progress.note_phase(0);
+    let window = CalendarWindow::year(year)?;
+    let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
+
+    summarize_streamed_async(streamed, providers, true, on_task, progress)
 }
 
 /// The result of one streamed window load: the parse world (without the
@@ -883,6 +1053,7 @@ mod tests {
     use super::*;
     use crate::context::DATABASE_FILE;
     use crate::database::SqliteStore;
+    use crate::store::MESSAGE_BATCH_LIMIT;
     use rusqlite::{Connection, params};
     use std::fs;
     use tempfile::TempDir;
@@ -1572,6 +1743,121 @@ Amount due:  $0.125000 USD
     }
 
     #[test]
+    fn generates_yearly_bill_with_month_bars() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+        let june = chrono::DateTime::parse_from_rfc3339("1970-06-15T12:00:00Z")?.timestamp_millis();
+        let outside = 1_000_000_000_000_i64;
+
+        // A June 1970 call (same year as the fixture's January window), and
+        // a 2001 call that must stay outside the 1970 window.
+        connection.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["ses_june123456", "June session"],
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["ses_far1234567", "Far session"],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_june",
+                "ses_june123456",
+                june,
+                format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.5,"time":{{"created":{june}}},"tokens":{{"input":30,"output":12,"reasoning":3,"cache":{{"read":7,"write":2}}}}}}"#
+                )
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_far",
+                "ses_far1234567",
+                outside,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.75,"tokens":{"input":50,"output":10,"reasoning":2,"cache":{"read":8,"write":1}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_yearly_bill(&context, 1970, &[])?;
+
+        assert!(bill.contains("OPENCODE YEARLY BILL"));
+        assert!(bill.contains("Year:    1970"));
+        assert!(bill.contains("Sessions: 2"));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "2",
+                "40",
+                "13",
+                "3",
+                "16",
+                "5",
+                "0ms",
+                "$0.625000"
+            ]
+        ));
+        // The bar graphs replace the TOTAL table.
+        assert!(bill.contains("REQUESTS BY MONTH    Year total: 2"));
+        assert!(bill.contains("AMOUNT DUE BY MONTH  Year total: $0.625000 USD"));
+        assert!(!bill.contains("Amount due:"));
+        assert!(!bill.contains("TOTAL\n"));
+        // The fixture message has no creation time, so only June gets a bar;
+        // its values still count in the year totals.
+        assert!(bill.contains("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec "));
+        Ok(())
+    }
+
+    #[test]
+    fn year_streaming_pumps_one_batch_per_day() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // A second message on the following day (one UTC day later than the
+        // fixture's day-0 message): the streamer must cut a batch boundary
+        // exactly there.
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_day2",
+                "ses_abcdef123456",
+                90_000_000_i64,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{"created":90000000},"tokens":{"input":5,"output":2,"reasoning":0,"cache":{"read":1,"write":0}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(context.data_dir.join(DATABASE_FILE));
+        let window = CalendarWindow::year(1970)?;
+        let progress = BillProgress::default();
+        let mut batches = Vec::new();
+
+        store.stream_window_messages(&window, &progress, &mut |mut batch| {
+            batches.push(
+                batch
+                    .messages
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            batch.messages.clear();
+
+            Ok(batch)
+        })?;
+
+        assert_eq!(
+            batches,
+            [vec!["msg_1".to_owned()], vec!["msg_day2".to_owned()]],
+            "one batch per calendar day, in window order"
+        );
+        assert_eq!(progress.loaded_rows(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn month_streaming_pumps_one_batch_per_day() -> Result<(), Box<dyn std::error::Error>> {
         let (_temporary, context) = fixture()?;
         let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
@@ -1612,6 +1898,220 @@ Amount due:  $0.125000 USD
             [vec!["msg_1".to_owned()], vec!["msg_day2".to_owned()]],
             "month windows stream one batch per calendar day too"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn day_batches_never_exceed_the_message_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // The fixture's day-0 message plus one batch's worth plus one more:
+        // the day must be split into a full batch and the remainder, both
+        // at or below the pipeline's message limit.
+        for index in 0..MESSAGE_BATCH_LIMIT + 1 {
+            connection.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    format!("msg_bulk_{index:05}"),
+                    "ses_abcdef123456",
+                    1000 + index as i64,
+                    r#"{"role":"user","time":{"created":1000}}"#
+                ],
+            )?;
+        }
+        drop(connection);
+
+        let store = SqliteStore::new(context.data_dir.join(DATABASE_FILE));
+        let window = CalendarWindow::year(1970)?;
+        let progress = BillProgress::default();
+        let mut sizes = Vec::new();
+
+        store.stream_window_messages(&window, &progress, &mut |mut batch| {
+            sizes.push(batch.messages.len());
+            batch.messages.clear();
+
+            Ok(batch)
+        })?;
+
+        assert_eq!(
+            sizes,
+            [MESSAGE_BATCH_LIMIT, 2],
+            "the fixture message plus the bulk rows split into at most {} rows per batch",
+            MESSAGE_BATCH_LIMIT
+        );
+        assert_eq!(progress.loaded_rows(), MESSAGE_BATCH_LIMIT as u64 + 2);
+        Ok(())
+    }
+
+    #[test]
+    fn github_copilot_bill_runs_without_network() -> Result<(), Box<dyn std::error::Error>> {
+        // The pump detects github-copilot payloads in the stream and fetches
+        // the pricing page once; in tests the fetch is disabled and fails
+        // fast, and the bill still completes with the catalog rates.
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_github",
+                "ses_abcdef123456",
+                90_000_000_i64,
+                r#"{"role":"assistant","providerID":"github-copilot","modelID":"gpt-4o","cost":0,"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let counters = BillProgress::default();
+        let mut noop = |_: &str| {};
+
+        load_year_report_with_progress_counted(&context, 1970, &[], &mut noop, &counters)?;
+
+        // Two assistant messages streamed: the fixture's and the github one.
+        assert_eq!(counters.loaded_rows(), 2);
+        assert_eq!(counters.parsed_rows(), 2);
+        assert_eq!(counters.folded_rows(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_parse_error_surfaces_as_the_root_cause() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // The second day carries an invalid assistant message: the parse
+        // side must fail, stop the pump, and its data error must surface
+        // instead of the pump's cancellation error.
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_bad",
+                "ses_abcdef123456",
+                90_000_000_i64,
+                r#"{"role":"assistant"}"#
+            ],
+        )?;
+        drop(connection);
+
+        let counters = BillProgress::default();
+        let mut noop = |_: &str| {};
+
+        let failure =
+            load_year_report_with_progress_counted(&context, 1970, &[], &mut noop, &counters)
+                .err()
+                .ok_or("expected an error")?;
+
+        assert!(
+            matches!(failure, BillError::InvalidData { .. }),
+            "the parse error is the root cause: {failure:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn year_streaming_counts_loaded_and_parsed_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_day2",
+                "ses_abcdef123456",
+                90_000_000_i64,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{"created":90000000},"tokens":{"input":5,"output":2,"reasoning":0,"cache":{"read":1,"write":0}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let counters = BillProgress::default();
+        let mut noop = |_: &str| {};
+
+        load_year_report_with_progress_counted(&context, 1970, &[], &mut noop, &counters)?;
+
+        // Two assistant messages (no session agent column, no parts), so the
+        // streaming parse counts exactly what the store streamed, and the
+        // three aggregate passes (model, agent, month bars) fold the two
+        // usage rows.
+        assert_eq!(counters.loaded_rows(), 2);
+        assert_eq!(counters.parsed_rows(), 2);
+        assert_eq!(counters.folded_rows(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn generates_yearly_bill_from_legacy_json() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let session_id = "ses_legacy123456";
+        let message_dir = temporary.path().join("storage/message").join(session_id);
+
+        fs::create_dir_all(&message_dir)?;
+        fs::write(
+            message_dir.join("msg_1.json"),
+            r#"{"role":"assistant","providerID":"anthropic","modelID":"legacy","cost":0.25,"time":{"created":1000,"completed":4000},"tokens":{"input":20,"output":8,"reasoning":1,"cache":{"read":4,"write":2}}}"#,
+        )?;
+        // A second call on the following day of the same year.
+        fs::write(
+            message_dir.join("msg_2.json"),
+            r#"{"role":"assistant","providerID":"anthropic","modelID":"legacy","cost":0.75,"time":{"created":90000000},"tokens":{"input":50,"output":10,"reasoning":2,"cache":{"read":8,"write":1}}}"#,
+        )?;
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .build()?;
+        let bill = generate_yearly_bill(&context, 1970, &[])?;
+
+        assert!(bill.contains("OPENCODE YEARLY BILL"));
+        assert!(bill.contains("Year:    1970"));
+        assert!(bill.contains("Sessions: 1"));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "anthropic / legacy",
+                "2",
+                "70",
+                "12",
+                "3",
+                "18",
+                "3",
+                "3s",
+                "$1.000000"
+            ]
+        ));
+        assert!(bill.contains("REQUESTS BY MONTH    Year total: 2"));
+
+        // Legacy counting: one kept session + two messages, no parts, in
+        // both the load and the parse universe; the three aggregate passes
+        // fold the two usage rows.
+        let counters = BillProgress::default();
+        let mut noop = |_: &str| {};
+
+        load_year_report_with_progress_counted(&context, 1970, &[], &mut noop, &counters)?;
+
+        assert_eq!(counters.loaded_rows(), 3);
+        assert_eq!(counters.parsed_rows(), 3);
+        assert_eq!(counters.folded_rows(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_year() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+
+        let before_epoch = generate_yearly_bill(&context, 1969, &[])
+            .err()
+            .ok_or("expected an error")?;
+        let beyond_range = generate_yearly_bill(&context, 2_147_483_648, &[])
+            .err()
+            .ok_or("expected an error")?;
+        let beyond_chrono = generate_yearly_bill(&context, 262_143, &[])
+            .err()
+            .ok_or("expected an error")?;
+
+        assert!(matches!(before_epoch, BillError::InvalidYear(_)));
+        assert!(matches!(beyond_range, BillError::InvalidYear(_)));
+        assert!(matches!(beyond_chrono, BillError::InvalidYear(_)));
         Ok(())
     }
 
@@ -1669,6 +2169,129 @@ Amount due:  $0.125000 USD
             .ok_or("expected an error")?;
 
         assert!(matches!(failure, BillError::InvalidMonth(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn generates_daily_bill_from_database() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+
+        // The fixture message sits at 1ms, inside January 1 1970.
+        let bill = generate_daily_bill(&context, 1970, 1, 1, &[])?;
+
+        assert!(bill.contains("OPENCODE DAILY BILL"));
+        assert!(bill.contains("Day:     January 1 1970"));
+        assert!(bill.contains("Sessions: 1"));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "1",
+                "10",
+                "6",
+                "1",
+                "4",
+                "2",
+                "0ms",
+                "$0.125000"
+            ]
+        ));
+        assert!(bill.contains("Amount due:  $0.125000 USD"));
+        // Wall-clock bounds belong to session bills only.
+        assert!(!bill.contains("Started:"));
+        assert!(!bill.contains("Ended:"));
+        assert!(!bill.contains("Wall time:"));
+        Ok(())
+    }
+
+    #[test]
+    fn daily_bill_excludes_out_of_range_messages() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["ses_other123456", "Other session"],
+        )?;
+        // 2001-09-09 01:46:40 UTC, outside January 1 1970.
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_far",
+                "ses_other123456",
+                1_000_000_000_000_i64,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.5,"tokens":{"input":30,"output":12,"reasoning":3,"cache":{"read":7,"write":2}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let first = generate_daily_bill(&context, 1970, 1, 1, &[])?;
+
+        assert!(first.contains("Sessions: 1"));
+        assert!(first.contains("Requests:    1"));
+        assert!(first.contains("Amount due:  $0.125000 USD"));
+
+        let second = generate_daily_bill(&context, 1970, 1, 2, &[])?;
+
+        assert!(second.contains("Sessions: 0"));
+        assert!(second.contains("Requests:    0"));
+        Ok(())
+    }
+
+    #[test]
+    fn generates_daily_bill_from_legacy_json() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let session_id = "ses_legacy123456";
+        let message_dir = temporary.path().join("storage/message").join(session_id);
+        let outside_dir = temporary
+            .path()
+            .join("storage/message")
+            .join("ses_outside12345");
+
+        fs::create_dir_all(&message_dir)?;
+        fs::create_dir_all(&outside_dir)?;
+        fs::write(
+            message_dir.join("msg_1.json"),
+            r#"{"role":"assistant","providerID":"anthropic","modelID":"legacy","cost":0.25,"time":{"created":1000,"completed":4000},"tokens":{"input":20,"output":8,"reasoning":1,"cache":{"read":4,"write":2}}}"#,
+        )?;
+        fs::write(
+            outside_dir.join("msg_far.json"),
+            r#"{"role":"assistant","providerID":"anthropic","modelID":"legacy","cost":0.75,"time":{"created":1000000000000},"tokens":{"input":50,"output":10,"reasoning":2,"cache":{"read":8,"write":1}}}"#,
+        )?;
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .build()?;
+        let bill = generate_daily_bill(&context, 1970, 1, 1, &[])?;
+
+        assert!(bill.contains("Sessions: 1"));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "anthropic / legacy",
+                "1",
+                "20",
+                "4",
+                "2",
+                "8",
+                "1",
+                "3s",
+                "$0.250000"
+            ]
+        ));
+        assert!(bill.contains("Amount due:  $0.250000 USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_day() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+
+        let failure = generate_daily_bill(&context, 1970, 1, 32, &[])
+            .err()
+            .ok_or("expected an error")?;
+
+        assert!(matches!(failure, BillError::InvalidDay(_)));
         Ok(())
     }
 
