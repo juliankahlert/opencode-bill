@@ -2,19 +2,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::aggregate::{aggregate, aggregate_agents};
+use crate::aggregate::{StreamedAggregates, aggregate, aggregate_agents};
 use crate::context::{StorageContext, Store};
 use crate::data::{
-    AgentId, AgentUsage, BillProgress, ModelKey, ModelRates, Totals, UsageStore, World,
+    AgentId, AgentUsage, BillProgress, ModelKey, ModelRates, SessionId, Totals, UsageRow,
+    UsageStore, World,
 };
 use crate::error::BillError;
-use crate::parse::parse_system;
+use crate::parse::{parse_message_batch, parse_metadata, parse_system};
 use crate::pricing;
 use crate::render::render_bill;
-use crate::report::{BarGraph, BillReport, build_report};
-use crate::store::{CalendarMonth, RawLoad, SessionStore, validate_reference};
+use crate::report::{BarGraph, BillReport, build_report, year_graphs};
+use crate::store::{CalendarWindow, RawWindowMeta, SessionStore, StreamBatch, validate_reference};
 use crate::timing::{earliest, latest};
 
 /// Lockless progress counters of one bill pipeline run.
@@ -80,7 +82,9 @@ impl PipelineProgress {
 /// from plain synchronous code.  Blind spot: a foreign runtime configured
 /// with `max_blocking_threads(1)` can deadlock with `block_in_place` +
 /// `spawn_blocking` on a single task; crate-created runtimes use tokio
-/// defaults.
+/// defaults.  The streaming window load parks two blocking-pool threads
+/// (pump and parse) against each other over a bounded channel, so a foreign
+/// runtime with fewer than two blocking threads can starve it the same way.
 fn block_on<F: Future>(future: F) -> Result<F::Output, BillError> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
@@ -237,9 +241,10 @@ async fn load_report_async(
     summarize_async(context, world, providers, on_task, progress).await
 }
 
-/// The async month pipeline: loads the store on the blocking pool, then
-/// parses, prices, aggregates, and renders on the calling thread.  The
-/// GitHub pricing page is fetched only when the bill uses `github-copilot`.
+/// The async month pipeline: streams the store on the blocking pool one day
+/// at a time while a second blocking task parses and folds each day's batch,
+/// then renders.  The GitHub pricing page is fetched only when the bill uses
+/// `github-copilot`.
 async fn load_month_report_async(
     context: &StorageContext,
     year: u32,
@@ -250,9 +255,360 @@ async fn load_month_report_async(
 ) -> Result<BillReport, BillError> {
     on_task("Loading month data");
     progress.note_phase(0);
-    let world = load_month_system(context, year, month, progress, on_task).await?;
+    let window = CalendarWindow::month(year, month)?;
+    let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
 
-    summarize_async(context, world, providers, on_task, progress).await
+    summarize_streamed_async(streamed, providers, false, on_task, progress)
+}
+
+/// The result of one streamed window load: the parse world (without the
+/// entity store) and the aggregates every row folded into while it streamed.
+struct StreamedBill {
+    /// Parse world: header, sessions, interner, wall bounds.
+    world: World,
+    /// The three summaries the rows folded into, row by row.
+    aggregates: StreamedAggregates,
+    /// Rates resolved lazily per model key, in key order.
+    pricing: BTreeMap<ModelKey, ModelRates>,
+}
+
+/// Streams one calendar window through the whole pipeline: the metadata
+/// first, then the messages one day at a time.  Each day's batch loads,
+/// parses, prices, and folds into the summaries in one pass, and the rows
+/// are dropped — the memory peak is the summaries plus the in-flight chunks,
+/// never the whole window.
+///
+/// Every window (month, day, or year) loads through this pipeline.  Two
+/// tasks on the tokio blocking pool run back to back over a bounded channel:
+/// the pump task reads the store and sends one day's raw rows per message,
+/// the parse task parses each received day while the pump already reads the
+/// next day — the next chunk loads concurrently with the current chunk's
+/// parse and fold.  The pump's batches and the parse buffers are reused
+/// across the whole stream (the callback returns its drained batch, the
+/// decode and row buffers live in the parse task), so dynamic allocation is
+/// the exception, not the rule.  The channel capacity bounds the in-flight
+/// raw JSON.
+///
+/// The GitHub pricing page is fetched by the pump before the first batch is
+/// sent whenever the window metadata reports a `github-copilot` message, so
+/// every row folds with the final rates.
+async fn load_streaming_system(
+    context: &StorageContext,
+    window: &CalendarWindow,
+    providers: &[String],
+    progress: &PipelineProgress,
+    on_task: &mut impl FnMut(&str),
+) -> Result<StreamedBill, BillError> {
+    let data_dir = context.data_dir.clone();
+    let models_file = context.models_file.clone();
+    let counters = progress.counters().clone();
+    let window = window.clone();
+    let providers = providers.to_vec();
+
+    on_task("Parsing messages");
+    progress.note_phase(1);
+
+    // One item per store visit: the window metadata first, then one day's
+    // bundle per message.  The pump task produces, the parse task consumes;
+    // when the parse side fails it drops the receiver and the pump's next
+    // send fails, which stops the stream.  The recycle channel hands the
+    // drained bundles back to the pump, so no row buffer is ever
+    // reallocated.
+    let (sender, receiver) = tokio::sync::mpsc::channel::<StreamItem>(2);
+    let (recycle_sender, mut recycle_receiver) = tokio::sync::mpsc::channel::<StreamBatch>(2);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    // When this future is dropped (ctrl+C or TUI quit mid-stream), the
+    // guard flags the tasks so they stop at the next batch instead of
+    // streaming the whole window on a dead runtime.
+    let _abort_guard = AbortGuard(cancelled.clone());
+    let github = Arc::new(pricing::GithubSource::default());
+    let pump_counters = counters.clone();
+    let pump_github = github.clone();
+
+    let pump = {
+        let cancelled = cancelled.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = Store::select(&data_dir);
+            let pipeline = PipelineProgress::with_counters(pump_counters);
+
+            let meta = store.load_window_meta(&window, pipeline.counters())?;
+
+            sender
+                .blocking_send(StreamItem::Meta(meta))
+                .map_err(|_| BillError::Runtime(std::io::Error::other("parse stopped early")))?;
+
+            // The GitHub pricing page is fetched at most once, when the
+            // first github-copilot batch arrives — the payloads are already
+            // in hand, so no whole-window pre-scan is needed, and the fetch
+            // completes before that batch is sent, so every github row folds
+            // with the final rates.  A failed attempt is remembered by the
+            // source and never retried.
+            let mut github_fetched = false;
+
+            store.stream_window_messages(&window, pipeline.counters(), &mut |batch| {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(BillError::Runtime(std::io::Error::other(
+                        "pipeline aborted",
+                    )));
+                }
+
+                if !github_fetched
+                    && batch
+                        .messages
+                        .iter()
+                        .any(|message| message.json.contains("github-copilot"))
+                {
+                    let _ = blocking_block_on(pump_github.ensure_fetched())?;
+                    github_fetched = true;
+                }
+
+                sender
+                    .blocking_send(StreamItem::Batch(batch))
+                    .map_err(|_| {
+                        cancelled.store(true, Ordering::Relaxed);
+
+                        BillError::Runtime(std::io::Error::other(
+                            "message stream stopped by the parse side",
+                        ))
+                    })?;
+
+                // The parse side drained the bundle; hand its buffers back
+                // (or fresh ones) so the next day reuses the same slots.
+                Ok(recycle_receiver.try_recv().unwrap_or(StreamBatch {
+                    messages: Vec::new(),
+                    parts: Vec::new(),
+                }))
+            })
+        })
+    };
+    let parse_cancelled = cancelled.clone();
+    let parse = tokio::task::spawn_blocking(move || {
+        let mut receiver = receiver;
+        let pipeline = PipelineProgress::with_counters(counters);
+
+        let StreamItem::Meta(meta) = receiver.blocking_recv().ok_or_else(|| {
+            BillError::Runtime(std::io::Error::other("stream ended before metadata"))
+        })?
+        else {
+            return Err(BillError::Runtime(std::io::Error::other(
+                "expected window metadata first",
+            )));
+        };
+        let (mut world, parse) = parse_metadata(meta, &pipeline)?;
+        let mut aggregates = StreamedAggregates::default();
+
+        aggregates.seed_agents(&world.sessions);
+
+        // Pricing sources resolve lazily per key; the catalog and the GitHub
+        // page (already fetched by the pump when needed) are shared across
+        // the whole stream.
+        let catalog = pricing::CatalogSource::new(models_file.as_deref())?;
+        let mut pricing = BTreeMap::<ModelKey, ModelRates>::new();
+        let wanted = providers
+            .iter()
+            .map(|provider| world.interner.intern_provider(provider))
+            .collect::<BTreeSet<_>>();
+
+        // One decode buffer and one row buffer for the whole stream.
+        let mut results = Vec::new();
+        let mut rows = Vec::new();
+
+        while let Some(item) = receiver.blocking_recv() {
+            if parse_cancelled.load(Ordering::Relaxed) {
+                return Err(BillError::Runtime(std::io::Error::other(
+                    "pipeline aborted",
+                )));
+            }
+
+            let StreamItem::Batch(mut batch) = item else {
+                return Err(BillError::Runtime(std::io::Error::other(
+                    "unexpected item in the message stream",
+                )));
+            };
+
+            parse_message_batch(
+                &mut world,
+                &parse,
+                &mut batch.parts,
+                &mut batch.messages,
+                &mut results,
+                &mut rows,
+                &pipeline,
+            )?;
+
+            for row in rows.drain(..) {
+                // Pre-filter: rows outside the requested providers die here,
+                // before pricing and folding.
+                if !wanted.is_empty() && !wanted.contains(&row.provider) {
+                    continue;
+                }
+
+                // Zero-cost estimation folds in the estimated cost when a
+                // rate is known; otherwise the recorded (zero) cost stays.
+                let row = estimate_streamed_cost(row, &mut pricing, &catalog, &github, &world);
+
+                aggregates.fold(&row, &pipeline);
+            }
+
+            // The bundle is drained; hand its buffers back to the pump.
+            batch.messages.clear();
+            let _ = recycle_sender.try_send(batch);
+        }
+
+        // The pricing map must cover every key of the bill, not only the
+        // rows whose cost needed estimation: resolve the remaining model
+        // keys so the MODEL PRICING table matches a whole-store bill.
+        for key in aggregates.by_model.keys() {
+            if !pricing.contains_key(key)
+                && let Some(rates) = pricing::rates_for_key(key, &world.interner, &catalog, &github)
+            {
+                pricing.insert(*key, rates);
+            }
+        }
+
+        Ok(StreamedBill {
+            world,
+            aggregates,
+            pricing,
+        })
+    });
+
+    let pump_result = pump
+        .await
+        .map_err(|failure| BillError::Runtime(std::io::Error::other(failure.to_string())))?;
+    let parse_result = parse
+        .await
+        .map_err(|failure| BillError::Runtime(std::io::Error::other(failure.to_string())))?;
+
+    if cancelled.load(Ordering::Relaxed) {
+        // The parse side failed first and stopped the stream; its error is
+        // the root cause, the pump's cancellation is not.
+        return parse_result;
+    }
+
+    match (pump_result, parse_result) {
+        (Err(pump_error), _) => Err(pump_error),
+        (Ok(()), Err(parse_error)) => Err(parse_error),
+        (Ok(()), Ok(streamed)) => Ok(streamed),
+    }
+}
+
+/// One item of the streaming pipeline: the window metadata, then one bundle
+/// of raw rows per day.
+enum StreamItem {
+    /// Window metadata (sessions), always first.
+    Meta(RawWindowMeta),
+    /// One day's raw messages and their tool parts, in window order.
+    Batch(StreamBatch),
+}
+
+/// Sets the stream's cancellation flag when the pipeline future is dropped.
+///
+/// Ctrl+C in the TUI drops the runtime mid-stream; the guard flags the pump
+/// and parse tasks so they stop at the next batch boundary, and quitting
+/// never waits for the whole window to stream.
+struct AbortGuard(Arc<AtomicBool>);
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Runs an async future to completion from a blocking-pool thread.
+///
+/// The store pump fetches the GitHub pricing page before the first batch is
+/// sent; `Handle::block_on` parks the blocking thread and polls the future
+/// on the runtime workers.  The crate's runtimes are multi-thread, so this
+/// is safe — a `current_thread` runtime has no workers to park on, the same
+/// blind spot [`block_on`] documents.
+fn blocking_block_on<F: Future>(future: F) -> Result<F::Output, BillError> {
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|failure| BillError::Runtime(std::io::Error::other(failure.to_string())))?;
+
+    Ok(handle.block_on(future))
+}
+
+/// Folds one row with the estimated cost of its unknown-price call.
+///
+/// Rates resolve lazily per model key, exactly like a whole-window
+/// [`pricing::load_pricing`] lookup: catalog, GitHub, generic fallback, then
+/// the GitHub page as last resort.  The resolved rates join the pricing map,
+/// so the report's MODEL PRICING table covers every key of the bill.
+fn estimate_streamed_cost(
+    row: UsageRow,
+    pricing: &mut BTreeMap<ModelKey, ModelRates>,
+    catalog: &pricing::CatalogSource,
+    github: &pricing::GithubSource,
+    world: &World,
+) -> UsageRow {
+    if !row.cost_unknown {
+        return row;
+    }
+
+    let key = (row.provider, row.model);
+    let rates = match pricing.get(&key) {
+        Some(rates) => Some(*rates),
+        None => {
+            let rates = pricing::rates_for_key(&key, &world.interner, catalog, github);
+
+            if let Some(rates) = &rates {
+                pricing.insert(key, *rates);
+            }
+
+            rates
+        }
+    };
+
+    match rates {
+        Some(rates) => UsageRow {
+            cost_micros: pricing::estimated_cost_micros(&row.tokens, &rates),
+            ..row
+        },
+        None => row,
+    }
+}
+
+/// Renders a streamed window bill: scopes the agent summary and wall bounds
+/// under a provider filter, merges the year bars, and builds the report.
+fn summarize_streamed_async(
+    mut streamed: StreamedBill,
+    providers: &[String],
+    year: bool,
+    on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
+) -> Result<BillReport, BillError> {
+    if !providers.is_empty() {
+        // Agent classes without kept usage die, and session counts scope to
+        // the sessions that produced the kept usage; the wall bounds cover
+        // only the kept calls.
+        streamed.aggregates.by_agent = keep_agents_with_usage(
+            streamed.aggregates.by_agent,
+            providers,
+            &streamed.aggregates.kept_sessions,
+        );
+        streamed.world.wall_start = streamed.aggregates.wall_start;
+        streamed.world.wall_end = streamed.aggregates.wall_end;
+    }
+
+    let total = streamed.aggregates.total();
+    let graphs = if year {
+        year_graphs(streamed.aggregates.months, &total)
+    } else {
+        Vec::new()
+    };
+
+    progress.note_phase(4);
+    on_task("Building report");
+    Ok(build_report(
+        &streamed.world,
+        &streamed.aggregates.by_model,
+        &streamed.aggregates.by_agent,
+        &total,
+        &streamed.pricing,
+        &graphs,
+        &streamed.world.interner,
+    ))
 }
 
 /// Loads a session tree from the store and parses it into a world.
@@ -277,37 +633,15 @@ async fn load_system(
     parse_system(raw, progress)
 }
 
-/// Loads one calendar month from the store and parses it into a world.
-///
-/// The store read is I/O bound, so it runs on the tokio blocking pool; the
-/// month window is built inside the task because the store owns it only
-/// during the read.
-async fn load_month_system(
-    context: &StorageContext,
-    year: u32,
-    month: u32,
-    progress: &PipelineProgress,
-    on_task: &mut impl FnMut(&str),
-) -> Result<World, BillError> {
-    let data_dir = context.data_dir.clone();
-    let counters = progress.counters().clone();
-    let raw = blocking_load(move || {
-        Store::select(&data_dir).load_month(&CalendarMonth::new(year, month)?, &counters)
-    })
-    .await?;
-
-    on_task("Parsing messages");
-    parse_system(raw, progress)
-}
-
 /// Runs an I/O-bound store read on the tokio blocking pool.
 ///
 /// A failed join means the blocking task itself failed (only possible when
 /// it panicked — the crate has no panic paths), mapped to `BillError::Runtime`
 /// so every failure stays a `Result`.
-async fn blocking_load<F>(load: F) -> Result<RawLoad, BillError>
+async fn blocking_load<F, T>(load: F) -> Result<T, BillError>
 where
-    F: FnOnce() -> Result<RawLoad, BillError> + Send + 'static,
+    F: FnOnce() -> Result<T, BillError> + Send + 'static,
+    T: Send + 'static,
 {
     tokio::task::spawn_blocking(load)
         .await
@@ -401,7 +735,12 @@ fn aggregate_system(
 ) {
     let by_model = aggregate(&world.entities, progress);
     let by_agent = aggregate_agents(&world.entities, &world.sessions, progress);
-    let by_agent = keep_agents_with_usage(by_agent, providers, &world.entities);
+    let kept_sessions = world
+        .entities
+        .rows()
+        .map(|row| row.session_id)
+        .collect::<BTreeSet<_>>();
+    let by_agent = keep_agents_with_usage(by_agent, providers, &kept_sessions);
     let total = by_model.values().fold(Totals::default(), |mut sum, row| {
         sum.merge(row);
         sum
@@ -520,16 +859,11 @@ fn filter_providers(world: World, providers: &[String]) -> World {
 fn keep_agents_with_usage(
     by_agent: BTreeMap<AgentId, AgentUsage>,
     providers: &[String],
-    entities: &UsageStore,
+    kept_sessions: &BTreeSet<SessionId>,
 ) -> BTreeMap<AgentId, AgentUsage> {
     if providers.is_empty() {
         return by_agent;
     }
-
-    let kept_sessions = entities
-        .rows()
-        .map(|row| row.session_id)
-        .collect::<BTreeSet<_>>();
 
     by_agent
         .into_iter()
@@ -548,6 +882,7 @@ fn keep_agents_with_usage(
 mod tests {
     use super::*;
     use crate::context::DATABASE_FILE;
+    use crate::database::SqliteStore;
     use rusqlite::{Connection, params};
     use std::fs;
     use tempfile::TempDir;
@@ -1237,6 +1572,50 @@ Amount due:  $0.125000 USD
     }
 
     #[test]
+    fn month_streaming_pumps_one_batch_per_day() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // Same two-day fixture: the month window must stream the same way
+        // as the year window, with a batch boundary at the day change.
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_day2",
+                "ses_abcdef123456",
+                90_000_000_i64,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{"created":90000000},"tokens":{"input":5,"output":2,"reasoning":0,"cache":{"read":1,"write":0}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(context.data_dir.join(DATABASE_FILE));
+        let window = CalendarWindow::month(1970, 1)?;
+        let progress = BillProgress::default();
+        let mut batches = Vec::new();
+
+        store.stream_window_messages(&window, &progress, &mut |mut batch| {
+            batches.push(
+                batch
+                    .messages
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            batch.messages.clear();
+
+            Ok(batch)
+        })?;
+
+        assert_eq!(
+            batches,
+            [vec!["msg_1".to_owned()], vec!["msg_day2".to_owned()]],
+            "month windows stream one batch per calendar day too"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn generates_monthly_bill_from_legacy_json() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = TempDir::new()?;
         let session_id = "ses_legacy123456";
@@ -1647,6 +2026,34 @@ Amount due:  $0.125000 USD
             &["openai / gpt-test", "$1.250", "$0.125", "-", "$5.000"]
         ));
         assert!(!bill.contains("claude-test"));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_bill_shows_pricing_for_every_model() -> Result<(), Box<dyn std::error::Error>> {
+        let (temporary, _) = fixture()?;
+        let models_file = temporary.path().join("models.json");
+
+        fs::write(
+            &models_file,
+            r#"{"openai":{"models":{"gpt-test":{"cost":{"input":1.25,"output":5,"cache_read":0.125}}}}}"#,
+        )?;
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .models_file(&models_file)
+            .build()?;
+
+        // The fixture's message records a real cost, so no row needs
+        // zero-cost estimation — the pricing table must still cover the
+        // model, exactly like a whole-store bill.
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("MODEL PRICING (USD / 1M TOKENS)"));
+        assert!(has_table_row(
+            &bill,
+            &["openai / gpt-test", "$1.250", "$0.125", "-", "$5.000"]
+        ));
         Ok(())
     }
 

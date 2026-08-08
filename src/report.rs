@@ -115,6 +115,63 @@ pub(crate) fn build_report(
     }
 }
 
+/// The year bill's bar graphs: one per TOTAL metric of a month bill.
+///
+/// `months` holds the per-month totals, January first; `total` is the whole
+/// year total, which the graphs show as a value instead of a bar.
+pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph> {
+    vec![
+        BarGraph {
+            label: "REQUESTS",
+            bars: months.map(|month| month.requests),
+            total: total.requests,
+            kind: MetricKind::Count,
+        },
+        BarGraph {
+            label: "INPUT",
+            bars: months.map(|month| month.tokens.input),
+            total: total.tokens.input,
+            kind: MetricKind::Count,
+        },
+        BarGraph {
+            label: "CACHE READ",
+            bars: months.map(|month| month.tokens.cache_read),
+            total: total.tokens.cache_read,
+            kind: MetricKind::Count,
+        },
+        BarGraph {
+            label: "CACHE WRITE",
+            bars: months.map(|month| month.tokens.cache_write),
+            total: total.tokens.cache_write,
+            kind: MetricKind::Count,
+        },
+        BarGraph {
+            label: "OUTPUT",
+            bars: months.map(|month| month.tokens.output),
+            total: total.tokens.output,
+            kind: MetricKind::Count,
+        },
+        BarGraph {
+            label: "REASONING",
+            bars: months.map(|month| month.tokens.reasoning),
+            total: total.tokens.reasoning,
+            kind: MetricKind::Count,
+        },
+        BarGraph {
+            label: "API TIME",
+            bars: months.map(|month| month.api_ms),
+            total: total.api_ms,
+            kind: MetricKind::Duration,
+        },
+        BarGraph {
+            label: "AMOUNT DUE",
+            bars: months.map(|month| cost_to_micros(month.cost).max(0) as u64),
+            total: cost_to_micros(total.cost).max(0) as u64,
+            kind: MetricKind::Cost,
+        },
+    ]
+}
+
 /// Model entries in lexicographic (provider, model) string order.
 ///
 /// The aggregate folds key rows by compact handle pairs; the pre-migration
@@ -381,6 +438,41 @@ mod tests {
             rows[7],
             ("Amount due:".to_owned(), "$0.000000 USD".to_owned())
         );
+    }
+
+    #[test]
+    fn year_graphs_carry_bars_and_year_total() {
+        use crate::data::{Tokens, cost_from_micros};
+
+        let mut months = [Totals::default(); 12];
+
+        months[0].requests = 5;
+        months[1].requests = 7;
+        months[1].tokens.output = 10;
+        months[1].api_ms = 2;
+        months[1].cost = cost_from_micros(25);
+        let total = Totals {
+            requests: 12,
+            tokens: Tokens {
+                output: 10,
+                ..Tokens::default()
+            },
+            api_ms: 2,
+            cost: cost_from_micros(25),
+            ..Totals::default()
+        };
+        let graphs = year_graphs(months, &total);
+
+        assert_eq!(graphs.len(), 8);
+        assert_eq!(graphs[0].label, "REQUESTS");
+        assert_eq!(graphs[0].bars[0], 5);
+        assert_eq!(graphs[0].bars[1], 7);
+        assert_eq!(graphs[0].total, 12);
+        assert_eq!(graphs[6].label, "API TIME");
+        assert_eq!(graphs[6].bars[1], 2);
+        assert_eq!(graphs[7].label, "AMOUNT DUE");
+        assert_eq!(graphs[7].bars[1], 25);
+        assert_eq!(graphs[7].total, 25);
     }
 
     #[test]

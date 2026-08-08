@@ -14,7 +14,8 @@ use crate::parse::{
 };
 use crate::report::BillHeader;
 use crate::store::{
-    CalendarMonth, RawLoad, RawMessage, RawPart, RawSession, SessionStore, unique_match,
+    CalendarWindow, DAY_MILLIS, MESSAGE_BATCH_BYTES, MESSAGE_BATCH_LIMIT, RawLoad, RawMessage,
+    RawPart, RawSession, RawWindowMeta, SessionStore, StreamBatch, batch_full, unique_match,
 };
 
 /// Sessions stored in OpenCode's legacy JSON directory layout.
@@ -69,78 +70,175 @@ impl SessionStore for LegacyStore {
         })
     }
 
-    fn load_month(
+    fn load_window_meta(
         &self,
-        month: &CalendarMonth,
+        window: &CalendarWindow,
         progress: &BillProgress,
-    ) -> Result<RawLoad, BillError> {
+    ) -> Result<RawWindowMeta, BillError> {
         let message_root = self.storage.join("message");
         let mut sessions = Vec::new();
-        let mut messages = Vec::new();
-        let mut parts = Vec::new();
 
         if message_root.is_dir() {
-            let session_rows = session_directories(&message_root)?
-                .into_iter()
-                .filter_map(|session_path| {
-                    let session_id = session_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default();
+            for session_path in session_directories(&message_root)? {
+                let session_id = session_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
 
-                    month_session_rows(&self.storage, &session_path, session_id, month, progress)
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, BillError>>()?;
-
-            for (session, kept_messages, kept_parts) in session_rows {
-                sessions.push(session);
-                messages.extend(kept_messages);
-                parts.extend(kept_parts);
+                if let Some(session) =
+                    window_session_meta(&session_path, session_id, window, progress)?
+                {
+                    sessions.push(session);
+                }
             }
         }
 
-        debug!(
-            "loaded {} raw messages from {} legacy JSON sessions in {}",
-            messages.len(),
-            sessions.len(),
-            month.label
-        );
-        Ok(RawLoad {
-            header: BillHeader::Month {
-                label: month.label.clone(),
-            },
+        debug!("loaded {} raw sessions in {}", sessions.len(), window.label);
+        Ok(RawWindowMeta {
+            header: window.header.clone(),
             session_count: sessions.len(),
             sessions,
-            messages,
-            parts,
         })
+    }
+
+    fn stream_window_messages(
+        &self,
+        window: &CalendarWindow,
+        progress: &BillProgress,
+        on_batch: &mut impl FnMut(StreamBatch) -> Result<StreamBatch, BillError>,
+    ) -> Result<(), BillError> {
+        let message_root = self.storage.join("message");
+
+        if !message_root.is_dir() {
+            return Ok(());
+        }
+
+        // One batch per (session, day): the session visit order of
+        // `load_window` is preserved, and each session's kept rows are cut
+        // at day boundaries, so no chunk grows with the year.  Messages
+        // without a creation time share one leading bucket.  Each message
+        // keeps its own part rows, so a split can never separate a message
+        // from its parts.
+        for session_path in session_directories(&message_root)? {
+            let session_id = session_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let chunks = read_directory(&session_path)?
+                .map(|entry| entry.map_err(|source| read_error(&session_path, source)))
+                .collect::<Result<Vec<_>, BillError>>()?
+                .into_iter()
+                .map(|entry| entry.path())
+                .filter_map(|path| window_message(&path, session_id, window).transpose())
+                .collect::<Result<Vec<_>, BillError>>()?
+                .into_iter()
+                .fold(
+                    BTreeMap::<Option<usize>, Vec<(RawMessage, Vec<RawPart>)>>::new(),
+                    |mut chunks, (message, created)| {
+                        // Each kept message counts here, exactly once: the
+                        // metadata pass never counts messages, so loaded
+                        // stays equal to parsed.
+                        progress.loaded_row();
+                        let part_rows = legacy_part_rows(&self.storage, &message.id, progress)
+                            .unwrap_or_default();
+                        chunks
+                            .entry(day_bucket(created, window.start_ms))
+                            .or_default()
+                            .push((message, part_rows));
+
+                        chunks
+                    },
+                );
+
+            for (_, rows) in chunks {
+                let mut rows = rows;
+
+                // No pipeline batch may exceed the message limit or the
+                // payload budget; a session day larger than one batch is
+                // split in row order, message and parts together.
+                let mut bytes = rows.iter().map(row_bytes).sum::<usize>();
+
+                while batch_full(rows.len(), bytes, false) {
+                    let cut = if rows.len() > MESSAGE_BATCH_LIMIT {
+                        MESSAGE_BATCH_LIMIT
+                    } else {
+                        let mut budget = 0usize;
+                        let mut cut = 1;
+
+                        for (index, row) in rows.iter().enumerate() {
+                            budget += row_bytes(row);
+                            if budget > MESSAGE_BATCH_BYTES {
+                                cut = index + 1;
+                                break;
+                            }
+                        }
+                        cut
+                    };
+                    let remainder = rows.split_off(cut);
+                    let (messages, parts) = unzip_rows(rows);
+
+                    let _ = on_batch(StreamBatch { messages, parts })?;
+                    rows = remainder;
+                    bytes = rows.iter().map(row_bytes).sum::<usize>();
+                }
+
+                let (messages, parts) = unzip_rows(rows);
+                let _ = on_batch(StreamBatch { messages, parts })?;
+            }
+        }
+
+        Ok(())
     }
 }
 
-/// Rows of one kept legacy session: the session itself, its kept messages
-/// and their raw part rows.
-type KeptSessionRows = (RawSession, Vec<RawMessage>, Vec<RawPart>);
+/// Payload bytes of one kept message and its parts.
+fn row_bytes(row: &(RawMessage, Vec<RawPart>)) -> usize {
+    row.0
+        .json
+        .len()
+        .saturating_add(row.1.iter().map(|part| part.json.len()).sum::<usize>())
+}
 
-/// The rows of one legacy session that fall inside the month window.
+/// Splits one session day into the message and part lanes of a batch.
+fn unzip_rows(rows: Vec<(RawMessage, Vec<RawPart>)>) -> (Vec<RawMessage>, Vec<RawPart>) {
+    rows.into_iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut messages, mut parts), (message, message_parts)| {
+            messages.push(message);
+            parts.extend(message_parts);
+
+            (messages, parts)
+        },
+    )
+}
+
+/// Day bucket of one kept message: the day index within the window, or
+/// `None` for a message without a creation time.
+///
+/// The window filter guarantees a timestamped message falls inside the
+/// window, so the day difference cannot underflow and stays in range.
+fn day_bucket(created: Option<u64>, window_start_ms: u64) -> Option<usize> {
+    created.map(|created| ((created - window_start_ms) / DAY_MILLIS) as usize)
+}
+
+/// Metadata rows of one kept legacy session.
 ///
 /// `None` when no message of the session is kept; the session itself is only
-/// billed when it contributed at least one message.
-fn month_session_rows(
-    storage: &Path,
+/// billed when it contributed at least one message.  The message payloads
+/// and part rows are not retained here — the streaming message pump re-reads
+/// them.
+fn window_session_meta(
     session_path: &Path,
     session_id: &str,
-    month: &CalendarMonth,
+    window: &CalendarWindow,
     progress: &BillProgress,
-) -> Result<Option<KeptSessionRows>, BillError> {
+) -> Result<Option<RawSession>, BillError> {
     let rows = read_directory(session_path)?
         .map(|entry| entry.map_err(|source| read_error(session_path, source)))
         .collect::<Result<Vec<_>, BillError>>()?
         .into_iter()
         .map(|entry| entry.path())
-        .filter_map(|path| {
-            month_message_row(storage, &path, session_id, month, progress).transpose()
-        })
+        .filter_map(|path| window_message(&path, session_id, window).transpose())
         .collect::<Result<Vec<_>, BillError>>()?;
 
     if rows.is_empty() {
@@ -152,41 +250,31 @@ fn month_session_rows(
         id: session_id.to_owned(),
         agent: None,
     };
-    let mut messages = Vec::with_capacity(rows.len());
-    let mut parts = Vec::new();
-
-    for (message, message_parts) in rows {
-        messages.push(message);
-        parts.extend(message_parts);
-    }
-
-    Ok(Some((session, messages, parts)))
+    Ok(Some(session))
 }
 
-/// One kept legacy JSON message of a session, plus its raw part rows.
+/// One kept legacy JSON message of a session, without its part rows.
 ///
-/// `None` for non-JSON files and messages outside the month window.
-fn month_message_row(
-    storage: &Path,
+/// `None` for non-JSON files and messages outside the window.  The creation
+/// time is returned alongside so the streaming pump can bucket the message
+/// into its day without re-parsing.
+fn window_message(
     path: &Path,
     session_id: &str,
-    month: &CalendarMonth,
-    progress: &BillProgress,
-) -> Result<Option<(RawMessage, Vec<RawPart>)>, BillError> {
+    window: &CalendarWindow,
+) -> Result<Option<(RawMessage, Option<u64>)>, BillError> {
     if path.extension().and_then(|value| value.to_str()) != Some("json") {
         return Ok(None);
     }
 
     // The window filter needs the created time, so the payload is parsed
-    // here once; `parse_system` re-parses the raw string of every kept
-    // message.
+    // here once; the streaming pipeline re-parses the raw string of every
+    // kept message.
     let json = fs::read_to_string(path).map_err(|source| read_error(path, source))?;
     let value = parse_json(&json, &path.display().to_string())?;
+    let created = message_time(&value).0;
 
-    if message_time(&value)
-        .0
-        .is_none_or(|created| created < month.start_ms || created >= month.end_ms)
-    {
+    if created.is_none_or(|created| created < window.start_ms || created >= window.end_ms) {
         return Ok(None);
     }
 
@@ -194,16 +282,13 @@ fn month_message_row(
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    progress.loaded_row();
     let message = RawMessage {
         id: message_id.to_owned(),
         session_id: session_id.to_owned(),
         location: path.display().to_string(),
         json: extract_message_fields(&value),
     };
-    let parts = legacy_part_rows(storage, message_id, progress)?;
-
-    Ok(Some((message, parts)))
+    Ok(Some((message, created)))
 }
 
 /// Session JSON paths whose file stem starts with the reference.

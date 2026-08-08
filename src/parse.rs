@@ -115,6 +115,94 @@ fn parse_message_fields(json: &str, location: &str) -> Result<MessageFields, Bil
     Ok(MessageFields::from_array(&values))
 }
 
+/// Streaming envelope for oversized payloads.
+///
+/// Messages over the extraction threshold are parsed here instead of by
+/// `json_extract`: serde skips the unknown fields (the giant tool result)
+/// without building them, so a hundreds-of-megabytes payload costs a linear
+/// scan instead of SQLite's internal JSON tree.
+#[allow(non_snake_case)]
+#[derive(serde::Deserialize)]
+struct GiantEnvelope {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    providerID: Option<String>,
+    #[serde(default)]
+    modelID: Option<String>,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    time: Option<GiantTime>,
+    #[serde(default)]
+    tokens: Option<GiantTokens>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GiantTime {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct GiantTokens {
+    #[serde(default)]
+    input: Option<i64>,
+    #[serde(default)]
+    output: Option<i64>,
+    #[serde(default)]
+    reasoning: Option<i64>,
+    #[serde(default)]
+    cache: Option<GiantCache>,
+}
+
+#[derive(serde::Deserialize)]
+struct GiantCache {
+    #[serde(default)]
+    read: Option<i64>,
+    #[serde(default)]
+    write: Option<i64>,
+}
+
+/// Extracts one oversized message's internable fields, as the positional
+/// array text the pipeline parses.
+pub(crate) fn extract_giant_message_fields(
+    json: &str,
+    location: &str,
+) -> Result<String, BillError> {
+    let envelope: GiantEnvelope =
+        serde_json::from_str(json).map_err(|failure| BillError::InvalidData {
+            location: location.to_owned(),
+            detail: failure.to_string(),
+        })?;
+    let time = envelope.time.as_ref();
+    let tokens = envelope.tokens.as_ref();
+    let cache = tokens.and_then(|tokens| tokens.cache.as_ref());
+
+    Ok(serde_json::json!([
+        envelope.role.as_deref(),
+        envelope.providerID.as_deref(),
+        envelope.modelID.as_deref(),
+        envelope.cost,
+        time.and_then(|time| time.created),
+        time.and_then(|time| time.completed),
+        tokens.and_then(|tokens| tokens.input),
+        tokens.and_then(|tokens| tokens.output),
+        tokens.and_then(|tokens| tokens.reasoning),
+        cache.and_then(|cache| cache.read),
+        cache.and_then(|cache| cache.write),
+        envelope.agent.as_deref(),
+        envelope.mode.as_deref(),
+    ])
+    .to_string())
+}
+
 /// Extracts one message's internable fields from its parsed JSON, as the
 /// positional array text the pipeline parses.
 ///

@@ -9,7 +9,7 @@ use crate::data::BillProgress;
 use crate::database::SqliteStore;
 use crate::error::BillError;
 use crate::legacy::LegacyStore;
-use crate::store::{CalendarMonth, RawLoad, SessionStore};
+use crate::store::{CalendarWindow, RawLoad, RawWindowMeta, SessionStore, StreamBatch};
 
 /// Name of OpenCode's SQLite session database.
 pub(crate) const DATABASE_FILE: &str = "opencode.db";
@@ -67,14 +67,26 @@ impl SessionStore for Store {
         }
     }
 
-    fn load_month(
+    fn load_window_meta(
         &self,
-        month: &CalendarMonth,
+        window: &CalendarWindow,
         progress: &BillProgress,
-    ) -> Result<RawLoad, BillError> {
+    ) -> Result<RawWindowMeta, BillError> {
         match self {
-            Store::Database(store) => store.load_month(month, progress),
-            Store::Legacy(store) => store.load_month(month, progress),
+            Store::Database(store) => store.load_window_meta(window, progress),
+            Store::Legacy(store) => store.load_window_meta(window, progress),
+        }
+    }
+
+    fn stream_window_messages(
+        &self,
+        window: &CalendarWindow,
+        progress: &BillProgress,
+        on_batch: &mut impl FnMut(StreamBatch) -> Result<StreamBatch, BillError>,
+    ) -> Result<(), BillError> {
+        match self {
+            Store::Database(store) => store.stream_window_messages(window, progress, on_batch),
+            Store::Legacy(store) => store.stream_window_messages(window, progress, on_batch),
         }
     }
 }
