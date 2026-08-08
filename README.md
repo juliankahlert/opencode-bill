@@ -89,7 +89,11 @@ Usage
                          every session with messages in that window is
                          included; no session argument is required. This
                          is also what a bare `opencode-bill` (no arguments)
-                         does.
+                         does. The report replaces the TOTAL table with one
+                         bar graph per total metric: each graph has a
+                         vertical bar for every calendar week the month
+                         spans (four to six) plus the month total as a
+                         value (the total is not a bar).
 
   --year [YEAR]          Bill the calendar year instead of one session
                          and its sub-agents. With no value the current
@@ -128,9 +132,11 @@ is one calendar day in UTC (start of the day to start of the next day); the
 year window is one calendar year in UTC (start of January 1 to start of
 January 1 of the next year). The labeled day is the local calendar date; the
 window is that date in UTC. Year-graph bars bucket each call by the calendar
-month of its creation time. Provider corrections with negative token or cost
-values are clamped to zero, so a monthly total can exceed what a provider's
-own invoice shows when such corrections occurred.
+month of its creation time; month-graph bars bucket each call by the ISO
+calendar week of its creation time. Calls without a creation time count in
+the totals but belong to no bar. Provider corrections with negative token or
+cost values are clamped to zero, so a monthly total can exceed what a
+provider's own invoice shows when such corrections occurred.
 
 Examples:
 
