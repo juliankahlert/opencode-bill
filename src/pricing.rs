@@ -158,22 +158,38 @@ pub(crate) fn load_pricing<'a>(
     github: &GithubSource,
 ) -> Result<BTreeMap<ModelKey, ModelRates>, BillError> {
     let catalog = CatalogSource::new(models_file)?;
-    let fallback = ModelsDevFallback;
-    let pricing = keys
-        .filter_map(|key| {
-            let provider = interner.resolve_provider(key.0);
-            let model = interner.resolve_model(key.1);
+    let keys = keys.collect::<Vec<_>>();
+    let mut pricing = BTreeMap::new();
 
-            catalog
-                .rates(provider, model)
-                .or_else(|| github.rates(provider, model))
-                .or_else(|| fallback.rates(provider, model))
-                .or_else(|| github.rates_for_model(model))
-                .map(|rates| (*key, rates))
-        })
-        .collect();
+    for key in keys {
+        if let Some(rates) = rates_for_key(key, interner, &catalog, github) {
+            pricing.insert(*key, rates);
+        }
+    }
 
     Ok(pricing)
+}
+
+/// Rates for one model key through the shared chain: catalog, GitHub,
+/// generic fallback, then the GitHub page as last resort.
+///
+/// The streaming pipeline resolves keys lazily as rows arrive, so the chain
+/// lives here once: a streamed key resolves exactly like a whole-window
+/// [`load_pricing`] lookup.
+pub(crate) fn rates_for_key(
+    key: &ModelKey,
+    interner: &Interner,
+    catalog: &CatalogSource,
+    github: &GithubSource,
+) -> Option<ModelRates> {
+    let provider = interner.resolve_provider(key.0);
+    let model = interner.resolve_model(key.1);
+
+    catalog
+        .rates(provider, model)
+        .or_else(|| github.rates(provider, model))
+        .or_else(|| ModelsDevFallback.rates(provider, model))
+        .or_else(|| github.rates_for_model(model))
 }
 
 /// Estimated micro-dollar cost of one call from token usage and rates.
