@@ -278,12 +278,8 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
             .agent
             .filter(|agent| !agent.is_empty())
             .map(|agent| interner.intern_agent(&agent));
-        let parent = session
-            .parent
-            .filter(|parent| !parent.is_empty())
-            .map(|parent| interner.intern_session(&parent));
 
-        sessions.insert(id, SessionNode { agent, parent });
+        sessions.insert(id, SessionNode { agent });
         session_agents.entry(session.id).or_insert(agent);
     }
 
@@ -379,7 +375,6 @@ mod tests {
             sessions: vec![RawSession {
                 id: "ses_abc123456".to_owned(),
                 agent: Some("build".to_owned()),
-                parent: None,
             }],
             messages: vec![
                 RawMessage {
@@ -438,12 +433,10 @@ mod tests {
                 RawSession {
                     id: "ses_first".to_owned(),
                     agent: None,
-                    parent: None,
                 },
                 RawSession {
                     id: "ses_second".to_owned(),
                     agent: None,
-                    parent: None,
                 },
             ],
             messages: Vec::new(),
@@ -481,12 +474,10 @@ mod tests {
                 RawSession {
                     id: "ses_first".to_owned(),
                     agent: None,
-                    parent: None,
                 },
                 RawSession {
                     id: "ses_second".to_owned(),
                     agent: None,
-                    parent: None,
                 },
             ],
             messages: vec![

@@ -1,6 +1,6 @@
 //! Legacy JSON-file session store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,22 +35,22 @@ impl SessionStore for LegacyStore {
         let title = required_string(&session_json, "title", &session_path.display().to_string())?;
         let tree = legacy_session_tree(&session_root, &id)?;
         let session_count = tree.len();
-        let mut sessions = Vec::new();
-        let mut messages = Vec::new();
-        let mut parts = Vec::new();
+        let (sessions, messages, parts) = tree.iter().try_fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |(mut sessions, mut messages, mut parts), session_id| {
+                progress.loaded_row();
+                sessions.push(RawSession {
+                    id: session_id.clone(),
+                    agent: None,
+                });
+                let (loaded, loaded_parts) = legacy_messages(&self.storage, session_id, progress)?;
 
-        for (session_id, parent) in &tree {
-            progress.loaded_row();
-            sessions.push(RawSession {
-                id: session_id.clone(),
-                agent: None,
-                parent: parent.clone(),
-            });
-            let (loaded, loaded_parts) = legacy_messages(&self.storage, session_id, progress)?;
+                messages.extend(loaded);
+                parts.extend(loaded_parts);
 
-            messages.extend(loaded);
-            parts.extend(loaded_parts);
-        }
+                Ok((sessions, messages, parts))
+            },
+        )?;
 
         debug!(
             "loaded {} raw messages from {} legacy JSON sessions",
@@ -148,7 +148,6 @@ fn month_session_rows(
     let session = RawSession {
         id: session_id.to_owned(),
         agent: None,
-        parent: None,
     };
     let mut messages = Vec::with_capacity(rows.len());
     let mut parts = Vec::new();
@@ -252,14 +251,11 @@ fn json_file_paths(dir: &Path) -> Result<Vec<PathBuf>, BillError> {
         .collect())
 }
 
-/// The session tree of one root: every descendant id mapped to its parent id.
+/// The session tree of one root: every descendant session id.
 ///
 /// String-keyed so callers can intern and process sessions in deterministic
 /// string order.  Legacy session JSON carries no agent component.
-fn legacy_session_tree(
-    root: &Path,
-    root_id: &str,
-) -> Result<BTreeMap<String, Option<String>>, BillError> {
+fn legacy_session_tree(root: &Path, root_id: &str) -> Result<BTreeSet<String>, BillError> {
     let mut parents = BTreeMap::new();
 
     for path in legacy_session_paths(root)? {
@@ -274,8 +270,7 @@ fn legacy_session_tree(
         parents.insert(id, parent);
     }
 
-    let root_parent = parents.get(root_id).and_then(Clone::clone);
-    let mut descendants = BTreeMap::from([(root_id.to_owned(), root_parent)]);
+    let mut descendants = BTreeSet::from([root_id.to_owned()]);
     let mut changed = true;
 
     while changed {
@@ -284,8 +279,8 @@ fn legacy_session_tree(
         for (id, parent) in &parents {
             if parent
                 .as_ref()
-                .is_some_and(|value| descendants.contains_key(value))
-                && descendants.insert(id.clone(), parent.clone()).is_none()
+                .is_some_and(|value| descendants.contains(value))
+                && descendants.insert(id.clone())
             {
                 changed = true;
             }

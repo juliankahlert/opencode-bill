@@ -122,8 +122,8 @@ fn database_title(connection: &Connection, path: &Path, id: &str) -> Result<Stri
         .ok_or_else(|| BillError::SessionNotFound(id.to_owned()))
 }
 
-/// Raw session rows of one root: every descendant with its agent and
-/// parent-session components, ordered by session id.
+/// Raw session rows of one root: every descendant with its agent component,
+/// ordered by session id.
 fn database_session_rows(
     connection: &Connection,
     path: &Path,
@@ -131,19 +131,8 @@ fn database_session_rows(
     progress: &BillProgress,
 ) -> Result<Vec<RawSession>, BillError> {
     let has_agent = database_has_column(connection, path, "session", "agent")?;
-    let has_parent = database_has_column(connection, path, "session", "parent_id")?;
     let agent_column = if has_agent { ", session.agent" } else { "" };
-    let parent_column = if has_parent {
-        ", session.parent_id"
-    } else {
-        ""
-    };
     let agent_index = if has_agent { Some(1usize) } else { None };
-    let parent_index = if has_parent {
-        Some(1 + usize::from(has_agent))
-    } else {
-        None
-    };
     let mut statement = connection
         .prepare(&format!(
             r#"WITH RECURSIVE descendants(id) AS (
@@ -152,7 +141,7 @@ fn database_session_rows(
                    SELECT session.id FROM session
                    JOIN descendants ON session.parent_id = descendants.id
                )
-               SELECT session.id{agent_column}{parent_column} FROM session
+               SELECT session.id{agent_column} FROM session
                JOIN descendants ON session.id = descendants.id
                ORDER BY session.id"#
         ))
@@ -164,24 +153,19 @@ fn database_session_rows(
                 Some(index) => row.get::<_, Option<String>>(index)?,
                 None => None,
             };
-            let parent = match parent_index {
-                Some(index) => row.get::<_, Option<String>>(index)?,
-                None => None,
-            };
 
-            Ok((session_id, agent, parent))
+            Ok((session_id, agent))
         })
         .map_err(|source| database_error(path, source))?;
     let mut sessions = Vec::new();
 
     for row in rows {
-        let (session_id, agent, parent) = row.map_err(|source| database_error(path, source))?;
+        let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
 
         progress.loaded_row();
         sessions.push(RawSession {
             id: session_id,
             agent,
-            parent,
         });
     }
 
@@ -224,7 +208,6 @@ fn database_month_session_rows(
             sessions.push(RawSession {
                 id: session_id,
                 agent: Some(agent),
-                parent: None,
             });
         }
     }

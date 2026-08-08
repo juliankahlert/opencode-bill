@@ -86,11 +86,10 @@ pub(crate) struct RawLoad {
     pub(crate) parts: Vec<RawPart>,
 }
 
-/// One session row: identity plus the agent and parent-session components.
+/// One session row: identity plus its agent component.
 pub(crate) struct RawSession {
     pub(crate) id: String,
     pub(crate) agent: Option<String>,
-    pub(crate) parent: Option<String>,
 }
 
 /// One message row: raw JSON payload plus its storage location.

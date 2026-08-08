@@ -91,17 +91,12 @@ pub(crate) struct EntityId(pub(crate) u32);
 
 /// One session of the billed session tree.
 ///
-/// A session entity carries two components: its agent class (when declared)
-/// and its parent-session component, which models the tree of sessions.
+/// A session entity carries its agent class component, when declared.  The
+/// session tree itself is resolved by the stores during load.
 #[derive(Clone, Copy)]
 pub(crate) struct SessionNode {
     /// Agent class declared by the session, when known.
     pub(crate) agent: Option<AgentId>,
-    /// Parent session, when the session is a descendant.
-    ///
-    /// Modeled per the ECS design; no current system consumes the link.
-    #[allow(dead_code)]
-    pub(crate) parent: Option<SessionId>,
 }
 
 /// The billed session tree: every session keyed by id, with its components.
@@ -112,9 +107,9 @@ pub(crate) type SessionTree = BTreeMap<SessionId, SessionNode>;
 /// Every assistant call of the billed period is one message entity stored in
 /// [`World::entities`]; its components (session, agent, provider, model,
 /// tokens, cost, api time, wall bounds) are the [`UsageStore`] lanes indexed
-/// by [`EntityId`].  Sessions form a tree with a parent-session component.
-/// Systems are free functions over this world; no struct method hides
-/// mutation.
+/// by [`Entity`].  Sessions form a tree; stores resolve descendant
+/// membership during load.  Systems are free functions over this world; no
+/// struct method hides mutation.
 pub(crate) struct World {
     /// Identifies the billed period (session tree or calendar month).
     pub(crate) header: BillHeader,
@@ -720,20 +715,8 @@ mod tests {
         let child = interner.intern_session("ses_child");
         let build = interner.intern_agent("build");
         let sessions = SessionTree::from([
-            (
-                root,
-                SessionNode {
-                    agent: None,
-                    parent: None,
-                },
-            ),
-            (
-                child,
-                SessionNode {
-                    agent: Some(build),
-                    parent: Some(root),
-                },
-            ),
+            (root, SessionNode { agent: None }),
+            (child, SessionNode { agent: Some(build) }),
         ]);
         let mut entities = UsageStore::default();
         entities.push(usage_row_default());
@@ -751,8 +734,7 @@ mod tests {
             interner,
         };
 
-        assert_eq!(world.sessions[&child].parent, Some(root));
-        assert_eq!(world.sessions[&root].parent, None);
+        assert_eq!(world.sessions[&root].agent, None);
         assert_eq!(
             world
                 .interner

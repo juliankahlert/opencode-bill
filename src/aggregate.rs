@@ -178,7 +178,6 @@ mod tests {
             interner.intern_session("ses_0000"),
             SessionNode {
                 agent: Some(interner.intern_agent("agent_0000")),
-                parent: None,
             },
         );
 
