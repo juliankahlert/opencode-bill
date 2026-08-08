@@ -23,27 +23,26 @@ pub(crate) fn aggregate(
     let chunk_maps = rows
         .par_chunks(AGGREGATE_CHUNK)
         .map(|chunk| {
-            let mut local = BTreeMap::<ModelKey, Totals>::new();
+            chunk
+                .iter()
+                .fold(BTreeMap::<ModelKey, Totals>::new(), |mut local, row| {
+                    progress.folded_row();
 
-            for row in chunk {
-                progress.folded_row();
+                    local
+                        .entry((row.provider, row.model))
+                        .or_default()
+                        .accumulate(row);
 
-                local
-                    .entry((row.provider, row.model))
-                    .or_default()
-                    .accumulate(row);
-            }
-
-            local
+                    local
+                })
         })
         .collect::<Vec<_>>();
 
     chunk_maps
         .into_iter()
-        .fold(BTreeMap::new(), |mut usage, local| {
-            for (key, totals) in local {
-                usage.entry(key).or_default().merge(&totals);
-            }
+        .flatten()
+        .fold(BTreeMap::new(), |mut usage, (key, totals)| {
+            usage.entry(key).or_default().merge(&totals);
 
             usage
         })
