@@ -129,9 +129,9 @@ pub fn generate_monthly_bill(
 
 /// Loads a session and builds the report data, reporting each work step.
 ///
-/// `on_task` runs before every phase (loading, aggregation, pricing, report
-/// building) so a UI can show which step is currently in progress. When
-/// `providers` is non-empty, only usage from those providers is included.
+/// `on_task` runs before every phase (loading, parsing, pricing, aggregation,
+/// report building) so a UI can show which step is currently in progress.
+/// When `providers` is non-empty, only usage from those providers is included.
 ///
 /// The pipeline runs on tokio internally (store read on the blocking pool,
 /// gated GitHub pricing fetch in the pricing phase); the function itself
@@ -174,9 +174,9 @@ pub fn load_report_with_progress_counted(
 
 /// Loads one calendar month and builds the report data, reporting each step.
 ///
-/// `on_task` runs before every phase (loading, aggregation, pricing, report
-/// building) so a UI can show which step is currently in progress. When
-/// `providers` is non-empty, only usage from those providers is included.
+/// `on_task` runs before every phase (loading, parsing, pricing, aggregation,
+/// report building) so a UI can show which step is currently in progress.
+/// When `providers` is non-empty, only usage from those providers is included.
 ///
 /// The pipeline runs on tokio internally (store read on the blocking pool,
 /// gated GitHub pricing fetch in the pricing phase); the function itself
@@ -232,7 +232,7 @@ async fn load_report_async(
 ) -> Result<BillReport, BillError> {
     on_task("Loading session data");
     progress.note_phase(0);
-    let world = load_system(context, reference, progress).await?;
+    let world = load_system(context, reference, progress, on_task).await?;
 
     summarize_async(context, world, providers, on_task, progress).await
 }
@@ -250,7 +250,7 @@ async fn load_month_report_async(
 ) -> Result<BillReport, BillError> {
     on_task("Loading month data");
     progress.note_phase(0);
-    let world = load_month_system(context, year, month, progress).await?;
+    let world = load_month_system(context, year, month, progress, on_task).await?;
 
     summarize_async(context, world, providers, on_task, progress).await
 }
@@ -264,6 +264,7 @@ async fn load_system(
     context: &StorageContext,
     reference: &str,
     progress: &PipelineProgress,
+    on_task: &mut impl FnMut(&str),
 ) -> Result<World, BillError> {
     validate_reference(reference)?;
 
@@ -272,6 +273,7 @@ async fn load_system(
     let counters = progress.counters().clone();
     let raw = blocking_load(move || Store::select(&data_dir).load(&reference, &counters)).await?;
 
+    on_task("Parsing messages");
     parse_system(raw, progress)
 }
 
@@ -285,6 +287,7 @@ async fn load_month_system(
     year: u32,
     month: u32,
     progress: &PipelineProgress,
+    on_task: &mut impl FnMut(&str),
 ) -> Result<World, BillError> {
     let data_dir = context.data_dir.clone();
     let counters = progress.counters().clone();
@@ -293,6 +296,7 @@ async fn load_month_system(
     })
     .await?;
 
+    on_task("Parsing messages");
     parse_system(raw, progress)
 }
 
@@ -326,6 +330,7 @@ async fn summarize_async(
     progress.note_phase(2);
     let pricing = price_system_async(context, &mut world, on_task).await?;
 
+    on_task("Aggregating usage");
     progress.note_phase(3);
     let (by_model, by_agent, total) = aggregate_system(&world, providers, progress);
 
@@ -346,7 +351,6 @@ async fn price_system_async(
     world: &mut World,
     on_task: &mut impl FnMut(&str),
 ) -> Result<BTreeMap<ModelKey, ModelRates>, BillError> {
-    on_task("Loading model pricing");
     let keys = world
         .entities
         .rows()
@@ -361,7 +365,13 @@ async fn price_system_async(
     let github = pricing::GithubSource::default();
 
     if needs_github {
+        // The network fetch can stall seconds offline; announce it so the
+        // loading view does not sit on the catalog message.
+        on_task("Fetching GitHub pricing data");
         let _ = github.ensure_fetched().await;
+        on_task("Loading model pricing");
+    } else {
+        on_task("Loading model pricing");
     }
     let pricing = pricing::load_pricing(
         context.models_file.as_deref(),
@@ -370,7 +380,6 @@ async fn price_system_async(
         &github,
     )?;
 
-    on_task("Aggregating usage");
     estimate_zero_costs(&mut world.entities, &pricing);
     Ok(pricing)
 }
@@ -593,6 +602,7 @@ mod tests {
             tasks,
             [
                 "Loading session data",
+                "Parsing messages",
                 "Loading model pricing",
                 "Aggregating usage",
                 "Building report",
@@ -2012,10 +2022,11 @@ Amount due:  $0.125000 USD
     {
         let (_temporary, context) = fixture()?;
         let progress = PipelineProgress::default();
+        let mut noop = |_: &str| {};
 
-        let world = load_system(&context, "ses_abcdef", &progress).await?;
+        let world = load_system(&context, "ses_abcdef", &progress, &mut noop).await?;
 
-        summarize_async(&context, world, &[], &mut |_| {}, &progress).await?;
+        summarize_async(&context, world, &[], &mut noop, &progress).await?;
 
         assert_eq!(progress.phase.load(Ordering::Relaxed), 4);
         assert_eq!(progress.counters.loaded_rows(), 2);
