@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use log::debug;
 
+use crate::data::BillProgress;
 use crate::error::BillError;
 use crate::parse::{message_time, parse_json, read_error, read_json, required_string};
 use crate::report::BillHeader;
@@ -25,7 +26,7 @@ impl LegacyStore {
 }
 
 impl SessionStore for LegacyStore {
-    fn load(&self, reference: &str) -> Result<RawLoad, BillError> {
+    fn load(&self, reference: &str, progress: &BillProgress) -> Result<RawLoad, BillError> {
         let session_root = self.storage.join("session");
         let matches = legacy_matches(&session_root, reference)?;
         let session_path = unique_match(reference, matches)?;
@@ -39,12 +40,13 @@ impl SessionStore for LegacyStore {
         let mut parts = Vec::new();
 
         for (session_id, parent) in &tree {
+            progress.loaded_row();
             sessions.push(RawSession {
                 id: session_id.clone(),
                 agent: None,
                 parent: parent.clone(),
             });
-            let (loaded, loaded_parts) = legacy_messages(&self.storage, session_id)?;
+            let (loaded, loaded_parts) = legacy_messages(&self.storage, session_id, progress)?;
 
             messages.extend(loaded);
             parts.extend(loaded_parts);
@@ -64,7 +66,11 @@ impl SessionStore for LegacyStore {
         })
     }
 
-    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError> {
+    fn load_month(
+        &self,
+        month: &CalendarMonth,
+        progress: &BillProgress,
+    ) -> Result<RawLoad, BillError> {
         let message_root = self.storage.join("message");
         let mut sessions = Vec::new();
         let mut messages = Vec::new();
@@ -79,7 +85,8 @@ impl SessionStore for LegacyStore {
                         .and_then(|name| name.to_str())
                         .unwrap_or_default();
 
-                    month_session_rows(&self.storage, &session_path, session_id, month).transpose()
+                    month_session_rows(&self.storage, &session_path, session_id, month, progress)
+                        .transpose()
                 })
                 .collect::<Result<Vec<_>, BillError>>()?;
 
@@ -121,19 +128,23 @@ fn month_session_rows(
     session_path: &Path,
     session_id: &str,
     month: &CalendarMonth,
+    progress: &BillProgress,
 ) -> Result<Option<KeptSessionRows>, BillError> {
     let rows = read_directory(session_path)?
         .map(|entry| entry.map_err(|source| read_error(session_path, source)))
         .collect::<Result<Vec<_>, BillError>>()?
         .into_iter()
         .map(|entry| entry.path())
-        .filter_map(|path| month_message_row(storage, &path, session_id, month).transpose())
+        .filter_map(|path| {
+            month_message_row(storage, &path, session_id, month, progress).transpose()
+        })
         .collect::<Result<Vec<_>, BillError>>()?;
 
     if rows.is_empty() {
         return Ok(None);
     }
 
+    progress.loaded_row();
     let session = RawSession {
         id: session_id.to_owned(),
         agent: None,
@@ -158,6 +169,7 @@ fn month_message_row(
     path: &Path,
     session_id: &str,
     month: &CalendarMonth,
+    progress: &BillProgress,
 ) -> Result<Option<(RawMessage, Vec<RawPart>)>, BillError> {
     if path.extension().and_then(|value| value.to_str()) != Some("json") {
         return Ok(None);
@@ -180,13 +192,14 @@ fn month_message_row(
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
+    progress.loaded_row();
     let message = RawMessage {
         id: message_id.to_owned(),
         session_id: session_id.to_owned(),
         location: path.display().to_string(),
         json,
     };
-    let parts = legacy_part_rows(storage, message_id)?;
+    let parts = legacy_part_rows(storage, message_id, progress)?;
 
     Ok(Some((message, parts)))
 }
@@ -286,6 +299,7 @@ fn legacy_session_tree(
 fn legacy_messages(
     storage: &Path,
     session_id: &str,
+    progress: &BillProgress,
 ) -> Result<(Vec<RawMessage>, Vec<RawPart>), BillError> {
     let root = storage.join("message").join(session_id);
 
@@ -302,6 +316,7 @@ fn legacy_messages(
                 .unwrap_or_default();
             let json = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
 
+            progress.loaded_row();
             Ok((
                 RawMessage {
                     id: message_id.to_owned(),
@@ -309,7 +324,7 @@ fn legacy_messages(
                     location: path.display().to_string(),
                     json,
                 },
-                legacy_part_rows(storage, message_id)?,
+                legacy_part_rows(storage, message_id, progress)?,
             ))
         })
         .collect::<Result<Vec<_>, BillError>>()?;
@@ -326,7 +341,11 @@ fn legacy_messages(
 }
 
 /// Raw tool part rows stored alongside one legacy JSON message.
-fn legacy_part_rows(storage: &Path, message_id: &str) -> Result<Vec<RawPart>, BillError> {
+fn legacy_part_rows(
+    storage: &Path,
+    message_id: &str,
+    progress: &BillProgress,
+) -> Result<Vec<RawPart>, BillError> {
     let root = storage.join("part").join(message_id);
 
     if !root.is_dir() {
@@ -338,6 +357,7 @@ fn legacy_part_rows(storage: &Path, message_id: &str) -> Result<Vec<RawPart>, Bi
         .map(|path| {
             let json = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
 
+            progress.loaded_row();
             Ok(RawPart {
                 message_id: message_id.to_owned(),
                 location: path.display().to_string(),

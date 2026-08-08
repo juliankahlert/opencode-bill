@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::aggregate::{aggregate, aggregate_agents};
 use crate::context::{StorageContext, Store};
-use crate::data::{AgentId, AgentUsage, ModelKey, ModelRates, Totals, UsageStore, World};
+use crate::data::{
+    AgentId, AgentUsage, BillProgress, ModelKey, ModelRates, Totals, UsageStore, World,
+};
 use crate::error::BillError;
 use crate::parse::parse_system;
 use crate::pricing;
@@ -18,34 +20,46 @@ use crate::timing::{earliest, latest};
 /// Lockless progress counters of one bill pipeline run.
 ///
 /// Every counter is an atomic updated from the parallel workers, so no lock
-/// guards them.  The phase counter marks the pipeline stage; the message and
-/// row counters feed the TUI progress path (Phase 8) and are asserted by
-/// tests.  Systems stay pure: progress is external observation, not state
-/// the systems read to decide anything.
+/// guards them.  The phase counter marks the pipeline stage; the row
+/// counters feed the TUI loading view and are asserted by tests.  Systems
+/// stay pure: progress is external observation, not state the systems read
+/// to decide anything.  The row counters live in the shared
+/// [`BillProgress`] handle so an observing UI sees them live.
 #[derive(Default)]
 pub(crate) struct PipelineProgress {
     /// Pipeline phase: 0 load, 1 parse, 2 price, 3 aggregate, 4 render.
     phase: AtomicUsize,
-    /// Messages parsed so far, counted by the parallel parse workers.
-    parsed_messages: AtomicU64,
-    /// Rows folded during aggregation, counted in both aggregate folds.
-    folded_rows: AtomicU64,
+    /// Rows read, parsed, and folded, shared with the observing UI.
+    counters: BillProgress,
 }
 
 impl PipelineProgress {
+    /// Wraps shared counters so the pipeline and an observer see one count.
+    pub(crate) fn with_counters(counters: BillProgress) -> Self {
+        PipelineProgress {
+            phase: AtomicUsize::new(0),
+            counters,
+        }
+    }
+
+    /// The shared counters, for stores that read rows on another thread.
+    pub(crate) fn counters(&self) -> &BillProgress {
+        &self.counters
+    }
+
     /// Marks the pipeline phase that is about to run.
     pub(crate) fn note_phase(&self, phase: usize) {
         self.phase.store(phase, Ordering::Relaxed);
     }
 
-    /// Counts one parsed message from a parallel worker.
-    pub(crate) fn parsed_message(&self) {
-        self.parsed_messages.fetch_add(1, Ordering::Relaxed);
+    /// Counts one storage row processed by the parse phase.
+    pub(crate) fn parsed_row(&self) {
+        self.counters.parsed_row();
     }
 
     /// Counts one folded row from an aggregate worker.
     pub(crate) fn folded_row(&self) {
-        self.folded_rows.fetch_add(1, Ordering::Relaxed);
+        self.counters.folded_row();
     }
 }
 
@@ -128,13 +142,33 @@ pub fn load_report_with_progress(
     providers: &[String],
     on_task: impl FnMut(&str),
 ) -> Result<BillReport, BillError> {
+    let counters = BillProgress::default();
+
+    load_report_with_progress_counted(context, reference, providers, on_task, &counters)
+}
+
+/// Loads a session and builds the report data, reporting each work step and
+/// counting live progress.
+///
+/// Like [`load_report_with_progress`], but the pipeline also writes the
+/// loaded, parsed, and folded row counts into the shared `counters` handle
+/// while it runs, so a UI on another task can show live numbers.
+pub fn load_report_with_progress_counted(
+    context: &StorageContext,
+    reference: &str,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+    counters: &BillProgress,
+) -> Result<BillReport, BillError> {
     let mut on_task = on_task;
+    let progress = PipelineProgress::with_counters(counters.clone());
 
     block_on(load_report_async(
         context,
         reference,
         providers,
         &mut on_task,
+        &progress,
     ))?
 }
 
@@ -154,7 +188,27 @@ pub fn load_month_report_with_progress(
     providers: &[String],
     on_task: impl FnMut(&str),
 ) -> Result<BillReport, BillError> {
+    let counters = BillProgress::default();
+
+    load_month_report_with_progress_counted(context, year, month, providers, on_task, &counters)
+}
+
+/// Loads one calendar month and builds the report data, reporting each work
+/// step and counting live progress.
+///
+/// Like [`load_month_report_with_progress`], but the pipeline also writes the
+/// loaded, parsed, and folded row counts into the shared `counters` handle
+/// while it runs, so a UI on another task can show live numbers.
+pub fn load_month_report_with_progress_counted(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+    counters: &BillProgress,
+) -> Result<BillReport, BillError> {
     let mut on_task = on_task;
+    let progress = PipelineProgress::with_counters(counters.clone());
 
     block_on(load_month_report_async(
         context,
@@ -162,6 +216,7 @@ pub fn load_month_report_with_progress(
         month,
         providers,
         &mut on_task,
+        &progress,
     ))?
 }
 
@@ -173,14 +228,13 @@ async fn load_report_async(
     reference: &str,
     providers: &[String],
     on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
 ) -> Result<BillReport, BillError> {
-    let progress = PipelineProgress::default();
-
     on_task("Loading session data");
     progress.note_phase(0);
-    let world = load_system(context, reference, &progress).await?;
+    let world = load_system(context, reference, progress).await?;
 
-    summarize_async(context, world, providers, on_task, &progress).await
+    summarize_async(context, world, providers, on_task, progress).await
 }
 
 /// The async month pipeline: loads the store on the blocking pool, then
@@ -192,14 +246,13 @@ async fn load_month_report_async(
     month: u32,
     providers: &[String],
     on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
 ) -> Result<BillReport, BillError> {
-    let progress = PipelineProgress::default();
-
     on_task("Loading month data");
     progress.note_phase(0);
-    let world = load_month_system(context, year, month, &progress).await?;
+    let world = load_month_system(context, year, month, progress).await?;
 
-    summarize_async(context, world, providers, on_task, &progress).await
+    summarize_async(context, world, providers, on_task, progress).await
 }
 
 /// Loads a session tree from the store and parses it into a world.
@@ -216,7 +269,8 @@ async fn load_system(
 
     let data_dir = context.data_dir.clone();
     let reference = reference.to_owned();
-    let raw = blocking_load(move || Store::select(&data_dir).load(&reference)).await?;
+    let counters = progress.counters().clone();
+    let raw = blocking_load(move || Store::select(&data_dir).load(&reference, &counters)).await?;
 
     parse_system(raw, progress)
 }
@@ -233,8 +287,9 @@ async fn load_month_system(
     progress: &PipelineProgress,
 ) -> Result<World, BillError> {
     let data_dir = context.data_dir.clone();
+    let counters = progress.counters().clone();
     let raw = blocking_load(move || {
-        Store::select(&data_dir).load_month(&CalendarMonth::new(year, month)?)
+        Store::select(&data_dir).load_month(&CalendarMonth::new(year, month)?, &counters)
     })
     .await?;
 
@@ -557,6 +612,23 @@ mod tests {
         assert_eq!(report.agent_rows.len(), 1);
         assert!(report.pricing_rows.is_empty());
         assert_eq!(report.totals.len(), 11);
+        Ok(())
+    }
+
+    #[test]
+    fn counted_progress_shares_live_counters() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let counters = BillProgress::default();
+        let mut noop = |_: &str| {};
+
+        load_report_with_progress_counted(&context, "ses_abcdef", &[], &mut noop, &counters)?;
+
+        // The fixture stores one session and one message, and the parse
+        // phase re-counts the same universe; aggregation folds the one
+        // usage row in both aggregate passes.
+        assert_eq!(counters.loaded_rows(), 2);
+        assert_eq!(counters.parsed_rows(), 2);
+        assert_eq!(counters.folded_rows(), 2);
         Ok(())
     }
 
@@ -1863,7 +1935,7 @@ Amount due:  $0.125000 USD
         progress.note_phase(0);
         let (raw, load) = {
             let now = std::time::Instant::now();
-            let raw = Store::select(&context.data_dir).load("ses_profile")?;
+            let raw = Store::select(&context.data_dir).load("ses_profile", progress.counters())?;
 
             (raw, now.elapsed())
         };
@@ -1923,16 +1995,13 @@ Amount due:  $0.125000 USD
         }
         println!("  total     {total:>8.1?}");
 
-        // The lockless counters counted every message once and every row in
-        // both aggregate folds.
-        assert_eq!(
-            progress.parsed_messages.load(Ordering::Relaxed),
-            u64::from(MESSAGES)
-        );
-        assert_eq!(
-            progress.folded_rows.load(Ordering::Relaxed),
-            2 * u64::from(MESSAGES)
-        );
+        // The lockless counters counted every row as the store read it and
+        // as the parse phase processed it (one session, one part, and one
+        // message per synthetic message), and every row in both aggregate
+        // folds.
+        assert_eq!(progress.counters.loaded_rows(), u64::from(MESSAGES) * 2 + 1);
+        assert_eq!(progress.counters.parsed_rows(), u64::from(MESSAGES) * 2 + 1);
+        assert_eq!(progress.counters.folded_rows(), 2 * u64::from(MESSAGES));
         assert_eq!(progress.phase.load(Ordering::Relaxed), 4);
         assert!(!bill.is_empty());
         Ok(())
@@ -1949,8 +2018,9 @@ Amount due:  $0.125000 USD
         summarize_async(&context, world, &[], &mut |_| {}, &progress).await?;
 
         assert_eq!(progress.phase.load(Ordering::Relaxed), 4);
-        assert_eq!(progress.parsed_messages.load(Ordering::Relaxed), 1);
-        assert_eq!(progress.folded_rows.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.counters.loaded_rows(), 2);
+        assert_eq!(progress.counters.parsed_rows(), 2);
+        assert_eq!(progress.counters.folded_rows(), 2);
         Ok(())
     }
 }

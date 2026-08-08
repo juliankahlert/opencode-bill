@@ -2,9 +2,62 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::AddAssign;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::report::BillHeader;
 use crate::timing::{earliest, latest};
+
+/// Live counters of one bill pipeline run, shared with an observing UI.
+///
+/// The pipeline writes the atomics as its parallel workers progress; a UI
+/// reads them from another task while the pipeline runs, then drops its
+/// handle.  Pure external observation, matching the data-oriented design:
+/// systems never read the counters to decide anything, and no lock guards
+/// them.  Every counter counts storage rows: the load phase counts rows as
+/// the store reads them, the parse phase counts the same universe as it
+/// processes it, and the aggregate phase counts rows folded per fold.
+#[derive(Clone, Default)]
+pub struct BillProgress {
+    /// Rows read from storage (sessions, tool parts, messages).
+    loaded: Arc<AtomicU64>,
+    /// Rows processed by the parse phase (sessions, tool parts, messages).
+    parsed: Arc<AtomicU64>,
+    /// Rows folded during aggregation, counted in both aggregate folds.
+    folded: Arc<AtomicU64>,
+}
+
+impl BillProgress {
+    /// Storage rows read so far by the running pipeline.
+    pub fn loaded_rows(&self) -> u64 {
+        self.loaded.load(Ordering::Relaxed)
+    }
+
+    /// Storage rows processed by the parse phase so far.
+    pub fn parsed_rows(&self) -> u64 {
+        self.parsed.load(Ordering::Relaxed)
+    }
+
+    /// Rows folded during aggregation so far.
+    pub fn folded_rows(&self) -> u64 {
+        self.folded.load(Ordering::Relaxed)
+    }
+
+    /// Counts one storage row read by a store.
+    pub(crate) fn loaded_row(&self) {
+        self.loaded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one storage row processed by the parse phase.
+    pub(crate) fn parsed_row(&self) {
+        self.parsed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one folded row from an aggregate worker.
+    pub(crate) fn folded_row(&self) {
+        self.folded.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Handle of one session, interned once per bill input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

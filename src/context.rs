@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 
+use crate::data::BillProgress;
 use crate::database::SqliteStore;
 use crate::error::BillError;
 use crate::legacy::LegacyStore;
@@ -59,17 +60,21 @@ impl Store {
 }
 
 impl SessionStore for Store {
-    fn load(&self, reference: &str) -> Result<RawLoad, BillError> {
+    fn load(&self, reference: &str, progress: &BillProgress) -> Result<RawLoad, BillError> {
         match self {
-            Store::Database(store) => store.load(reference),
-            Store::Legacy(store) => store.load(reference),
+            Store::Database(store) => store.load(reference, progress),
+            Store::Legacy(store) => store.load(reference, progress),
         }
     }
 
-    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError> {
+    fn load_month(
+        &self,
+        month: &CalendarMonth,
+        progress: &BillProgress,
+    ) -> Result<RawLoad, BillError> {
         match self {
-            Store::Database(store) => store.load_month(month),
-            Store::Legacy(store) => store.load_month(month),
+            Store::Database(store) => store.load_month(month, progress),
+            Store::Legacy(store) => store.load_month(month, progress),
         }
     }
 }

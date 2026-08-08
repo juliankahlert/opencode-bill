@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use chrono::NaiveDate;
 
+use crate::data::BillProgress;
 use crate::error::BillError;
 use crate::report::BillHeader;
 
@@ -60,10 +61,16 @@ fn month_midnight(date: NaiveDate, year: u32, month: u32) -> Result<u64, BillErr
 /// intern, parse, or build worlds.  `parse_system` turns raw rows into a
 /// `World`.
 pub(crate) trait SessionStore {
-    /// Resolves a session reference and loads its raw storage rows.
-    fn load(&self, reference: &str) -> Result<RawLoad, BillError>;
-    /// Loads every raw storage row recorded in one calendar month.
-    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError>;
+    /// Resolves a session reference and loads its raw storage rows,
+    /// counting every row read into the shared progress handle.
+    fn load(&self, reference: &str, progress: &BillProgress) -> Result<RawLoad, BillError>;
+    /// Loads every raw storage row recorded in one calendar month,
+    /// counting every row read into the shared progress handle.
+    fn load_month(
+        &self,
+        month: &CalendarMonth,
+        progress: &BillProgress,
+    ) -> Result<RawLoad, BillError>;
 }
 
 /// Raw storage rows of one load: unparsed messages plus session components.

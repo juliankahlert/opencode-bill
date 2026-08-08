@@ -272,6 +272,7 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
     let mut session_agents = BTreeMap::new();
 
     for session in raw.sessions {
+        progress.parsed_row();
         let id = interner.intern_session(&session.id);
         let agent = session
             .agent
@@ -286,13 +287,13 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
         session_agents.entry(session.id).or_insert(agent);
     }
 
-    let tools = parse_tool_spans(raw.parts)?;
+    let tools = parse_tool_spans(raw.parts, progress)?;
 
     let results = raw
         .messages
         .par_iter()
         .map(|message| {
-            progress.parsed_message();
+            progress.parsed_row();
 
             parse_message(message, &session_agents, &tools)
         })
@@ -343,10 +344,14 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
 }
 
 /// Groups the raw tool part rows into per-message busy spans.
-fn parse_tool_spans(parts: Vec<RawPart>) -> Result<ToolSpans, BillError> {
+fn parse_tool_spans(
+    parts: Vec<RawPart>,
+    progress: &PipelineProgress,
+) -> Result<ToolSpans, BillError> {
     let mut spans = ToolSpans::new();
 
     for part in parts {
+        progress.parsed_row();
         let value = parse_json(&part.json, &part.location)?;
 
         if let Some(span) = tool_span(&value) {

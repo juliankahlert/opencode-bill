@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use log::{debug, warn};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+use crate::data::BillProgress;
 use crate::error::BillError;
 use crate::report::BillHeader;
 use crate::store::{
@@ -23,15 +24,15 @@ impl SqliteStore {
 }
 
 impl SessionStore for SqliteStore {
-    fn load(&self, reference: &str) -> Result<RawLoad, BillError> {
+    fn load(&self, reference: &str, progress: &BillProgress) -> Result<RawLoad, BillError> {
         let connection = open_database(&self.path)?;
         let matches = database_matches(&connection, &self.path, reference)?;
         let id = unique_match(reference, matches)?;
         let title = database_title(&connection, &self.path, &id)?;
-        let sessions = database_session_rows(&connection, &self.path, &id)?;
+        let sessions = database_session_rows(&connection, &self.path, &id, progress)?;
         let session_count = sessions.len();
-        let parts = database_tool_parts(&connection, &self.path, &id)?;
-        let messages = database_messages(&connection, &self.path, &id)?;
+        let parts = database_tool_parts(&connection, &self.path, &id, progress)?;
+        let messages = database_messages(&connection, &self.path, &id, progress)?;
 
         debug!(
             "loaded {} raw messages from {session_count} SQLite sessions",
@@ -46,11 +47,15 @@ impl SessionStore for SqliteStore {
         })
     }
 
-    fn load_month(&self, month: &CalendarMonth) -> Result<RawLoad, BillError> {
+    fn load_month(
+        &self,
+        month: &CalendarMonth,
+        progress: &BillProgress,
+    ) -> Result<RawLoad, BillError> {
         let connection = open_database(&self.path)?;
-        let sessions = database_month_session_rows(&connection, &self.path, month)?;
-        let parts = database_month_tool_parts(&connection, &self.path, month)?;
-        let messages = database_month_messages(&connection, &self.path, month)?;
+        let sessions = database_month_session_rows(&connection, &self.path, month, progress)?;
+        let parts = database_month_tool_parts(&connection, &self.path, month, progress)?;
+        let messages = database_month_messages(&connection, &self.path, month, progress)?;
         let session_count = database_month_session_count(&connection, &self.path, month)?;
 
         debug!(
@@ -123,6 +128,7 @@ fn database_session_rows(
     connection: &Connection,
     path: &Path,
     id: &str,
+    progress: &BillProgress,
 ) -> Result<Vec<RawSession>, BillError> {
     let has_agent = database_has_column(connection, path, "session", "agent")?;
     let has_parent = database_has_column(connection, path, "session", "parent_id")?;
@@ -171,6 +177,7 @@ fn database_session_rows(
     for row in rows {
         let (session_id, agent, parent) = row.map_err(|source| database_error(path, source))?;
 
+        progress.loaded_row();
         sessions.push(RawSession {
             id: session_id,
             agent,
@@ -188,6 +195,7 @@ fn database_month_session_rows(
     connection: &Connection,
     path: &Path,
     month: &CalendarMonth,
+    progress: &BillProgress,
 ) -> Result<Vec<RawSession>, BillError> {
     if !database_has_column(connection, path, "session", "agent")? {
         return Ok(Vec::new());
@@ -212,6 +220,7 @@ fn database_month_session_rows(
         let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
 
         if let Some(agent) = agent.filter(|agent| !agent.is_empty()) {
+            progress.loaded_row();
             sessions.push(RawSession {
                 id: session_id,
                 agent: Some(agent),
@@ -228,6 +237,7 @@ fn database_messages(
     connection: &Connection,
     path: &Path,
     id: &str,
+    progress: &BillProgress,
 ) -> Result<Vec<RawMessage>, BillError> {
     let mut statement = connection
         .prepare(
@@ -257,6 +267,7 @@ fn database_messages(
     for row in rows {
         let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
 
+        progress.loaded_row();
         messages.push(RawMessage {
             id: message_id,
             session_id,
@@ -273,6 +284,7 @@ fn database_month_messages(
     connection: &Connection,
     path: &Path,
     month: &CalendarMonth,
+    progress: &BillProgress,
 ) -> Result<Vec<RawMessage>, BillError> {
     let mut statement = connection
         .prepare(
@@ -296,6 +308,7 @@ fn database_month_messages(
     for row in rows {
         let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
 
+        progress.loaded_row();
         messages.push(RawMessage {
             id: message_id,
             session_id,
@@ -328,6 +341,7 @@ fn database_tool_parts(
     connection: &Connection,
     path: &Path,
     id: &str,
+    progress: &BillProgress,
 ) -> Result<Vec<RawPart>, BillError> {
     if !database_has_table(connection, path, "part")? {
         warn!("no 'part' table: API time will still include tool calls");
@@ -357,6 +371,7 @@ fn database_tool_parts(
     for row in rows {
         let (message_id, json) = row.map_err(|source| database_error(path, source))?;
 
+        progress.loaded_row();
         parts.push(RawPart {
             message_id,
             location: location.clone(),
@@ -372,6 +387,7 @@ fn database_month_tool_parts(
     connection: &Connection,
     path: &Path,
     month: &CalendarMonth,
+    progress: &BillProgress,
 ) -> Result<Vec<RawPart>, BillError> {
     if !database_has_table(connection, path, "part")? {
         warn!("no 'part' table: API time will still include tool calls");
@@ -396,6 +412,7 @@ fn database_month_tool_parts(
     for row in rows {
         let (message_id, json) = row.map_err(|source| database_error(path, source))?;
 
+        progress.loaded_row();
         parts.push(RawPart {
             message_id,
             location: location.clone(),
