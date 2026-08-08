@@ -18,8 +18,8 @@ use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use opencode_bill::{
-    BillHeader, BillReport, StorageContext, load_month_report_with_progress,
-    load_report_with_progress,
+    BillHeader, BillProgress, BillReport, StorageContext, load_month_report_with_progress_counted,
+    load_report_with_progress_counted,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -39,7 +39,7 @@ const SPINNER_TICK: Duration = Duration::from_millis(100);
 const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Height of the inline viewport: exactly the spinner box, so no empty rows
 /// pad it above or below while the report is generated.
-const VIEWPORT_HEIGHT: u16 = 5;
+const VIEWPORT_HEIGHT: u16 = 6;
 /// Unified column count shared by every report table.
 const COLUMNS: usize = 11;
 /// Natural width of every report table column.
@@ -63,24 +63,35 @@ enum Progress {
 /// Runs the worker that loads the report in the background.
 ///
 /// The worker is a tokio task on the runtime; the unbounded channel lets the
-/// sync `on_task` callback send progress without awaiting.
+/// sync `on_task` callback send progress without awaiting.  The shared
+/// `counters` handle carries the pipeline's live counts back to the UI task.
 async fn worker(
     context: StorageContext,
     request: crate::Request,
     providers: Vec<String>,
+    counters: BillProgress,
     sender: mpsc::UnboundedSender<Progress>,
 ) {
     let result = match request {
-        crate::Request::Session(reference) => {
-            load_report_with_progress(&context, &reference, &providers, |task| {
+        crate::Request::Session(reference) => load_report_with_progress_counted(
+            &context,
+            &reference,
+            &providers,
+            |task| {
                 let _ = sender.send(Progress::Task(task.to_owned()));
-            })
-        }
-        crate::Request::Month(year, month) => {
-            load_month_report_with_progress(&context, year, month, &providers, |task| {
+            },
+            &counters,
+        ),
+        crate::Request::Month(year, month) => load_month_report_with_progress_counted(
+            &context,
+            year,
+            month,
+            &providers,
+            |task| {
                 let _ = sender.send(Progress::Task(task.to_owned()));
-            })
-        }
+            },
+            &counters,
+        ),
     };
 
     let _ = sender.send(Progress::Done(
@@ -102,6 +113,8 @@ enum View {
 struct App {
     /// The currently visible view.
     view: View,
+    /// Live counts of the running pipeline, read every frame.
+    counters: BillProgress,
     /// When report generation started.
     started: Instant,
     /// Spinner frame counter.
@@ -127,8 +140,10 @@ pub async fn run(
     providers: Vec<String>,
 ) -> Result<TuiOutcome, String> {
     let (sender, mut receiver) = mpsc::unbounded_channel();
+    let counters = BillProgress::default();
+    let worker_counters = counters.clone();
 
-    let worker_task = tokio::spawn(worker(context, request, providers, sender));
+    let worker_task = tokio::spawn(worker(context, request, providers, worker_counters, sender));
 
     let mut guard = TerminalGuard::enter()?;
     // Start on a fresh row so the viewport does not overwrite the shell prompt line.
@@ -151,6 +166,7 @@ pub async fn run(
         view: View::Loading {
             task: "Starting".to_owned(),
         },
+        counters,
         started: Instant::now(),
         frame: 0,
         last_tick: Instant::now(),
@@ -370,11 +386,17 @@ impl App {
     }
 }
 
-/// Draws the loading indicator with the current task and elapsed time.
+/// Draws the loading indicator with the current task, live counts, and
+/// elapsed time.
 fn draw_loading(frame: &mut Frame, app: &App, task: &str) {
     let area = frame.area();
     let spinner = SPINNER_FRAMES[app.frame % SPINNER_FRAMES.len()];
-    let elapsed = app.started.elapsed().as_secs();
+    let elapsed = format_elapsed(app.started.elapsed());
+    let counts = counts_label(
+        app.counters.loaded_rows(),
+        app.counters.parsed_rows(),
+        app.counters.folded_rows(),
+    );
     let lines = vec![
         Line::from(Span::styled(
             "opencode-bill",
@@ -384,10 +406,8 @@ fn draw_loading(frame: &mut Frame, app: &App, task: &str) {
             Span::styled(spinner, Style::new().fg(Color::Yellow)),
             Span::raw(format!(" {task}")),
         ]),
-        Line::from(Span::styled(
-            format!("{elapsed}s elapsed"),
-            Style::new().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(elapsed, Style::new().fg(Color::DarkGray))),
+        Line::from(Span::styled(counts, Style::new().fg(Color::DarkGray))),
     ];
     let paragraph = Paragraph::new(lines)
         .alignment(Alignment::Center)
@@ -403,6 +423,45 @@ fn draw_loading(frame: &mut Frame, app: &App, task: &str) {
             VIEWPORT_HEIGHT.min(area.height),
         ),
     );
+}
+
+/// Formats an elapsed duration as seconds, or minutes and seconds once a
+/// bill runs past one minute.
+fn format_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs();
+
+    if total >= 60 {
+        format!("{}m {}s elapsed", total / 60, total % 60)
+    } else {
+        format!("{total}s elapsed")
+    }
+}
+
+/// The live-counts line: storage rows loaded, parsed, and aggregated.
+fn counts_label(loaded: u64, parsed: u64, folded: u64) -> String {
+    format!(
+        "{} loaded · {} parsed · {} aggregated",
+        grouped(loaded),
+        grouped(parsed),
+        grouped(folded),
+    )
+}
+
+/// Groups a count with thousands separators for readability.
+fn grouped(count: u64) -> String {
+    let digits = count.to_string();
+    let length = digits.len();
+
+    digits
+        .char_indices()
+        .map(|(index, digit)| {
+            if index > 0 && (length - index).is_multiple_of(3) {
+                format!(",{digit}")
+            } else {
+                digit.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Draws the failure message in the viewport.
@@ -863,6 +922,7 @@ mod tests {
             view: View::Loading {
                 task: "Starting".to_owned(),
             },
+            counters: BillProgress::default(),
             started: Instant::now(),
             frame: 0,
             last_tick: Instant::now(),
@@ -877,5 +937,37 @@ mod tests {
         assert!(quits(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!quits(KeyCode::Char('h'), KeyModifiers::empty()));
         assert!(!quits(KeyCode::Char('x'), KeyModifiers::empty()));
+    }
+
+    #[test]
+    fn formats_elapsed_seconds() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s elapsed");
+        assert_eq!(format_elapsed(Duration::from_secs(5)), "5s elapsed");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s elapsed");
+    }
+
+    #[test]
+    fn formats_elapsed_minutes_and_seconds() {
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 0s elapsed");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 5s elapsed");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m 5s elapsed");
+    }
+
+    #[test]
+    fn groups_counts_with_thousands_separators() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(12_345), "12,345");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn labels_live_counts() {
+        assert_eq!(counts_label(0, 0, 0), "0 loaded · 0 parsed · 0 aggregated");
+        assert_eq!(
+            counts_label(12_345, 12_345, 6_789),
+            "12,345 loaded · 12,345 parsed · 6,789 aggregated"
+        );
     }
 }
