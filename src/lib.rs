@@ -1,5 +1,5 @@
-//! OpenCode session, calendar-month, calendar-year, and calendar-day bill
-//! generation.
+//! OpenCode session, calendar-month, calendar-week, calendar-year, and
+//! calendar-day bill generation.
 //!
 //! The crate is split into data-oriented modules:
 //!
@@ -27,10 +27,11 @@ mod store;
 mod timing;
 
 pub use bill::{
-    generate_bill, generate_daily_bill, generate_monthly_bill, generate_yearly_bill,
-    load_day_report_with_progress, load_day_report_with_progress_counted,
+    generate_bill, generate_daily_bill, generate_monthly_bill, generate_weekly_bill,
+    generate_yearly_bill, load_day_report_with_progress, load_day_report_with_progress_counted,
     load_month_report_with_progress, load_month_report_with_progress_counted,
-    load_report_with_progress, load_report_with_progress_counted, load_year_report_with_progress,
+    load_report_with_progress, load_report_with_progress_counted, load_week_report_with_progress,
+    load_week_report_with_progress_counted, load_year_report_with_progress,
     load_year_report_with_progress_counted,
 };
 pub use context::{DataDirectorySet, MissingDataDirectory, StorageContext, StorageContextBuilder};

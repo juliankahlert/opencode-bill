@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, Days, NaiveDate, Weekday};
 
 use crate::data::BillProgress;
 use crate::error::BillError;
@@ -11,7 +11,8 @@ use crate::report::BillHeader;
 /// A session reference must contain at least this many characters.
 const MINIMUM_REFERENCE_LENGTH: usize = 6;
 
-/// One calendar period (a month, a day, or a year) as a billing window.
+/// One calendar period (a month, a day, a year, or an ISO week) as a billing
+/// window.
 #[derive(Clone)]
 pub(crate) struct CalendarWindow {
     /// Human label, e.g. "February 2026" or "August 8 2026".
@@ -85,6 +86,33 @@ impl CalendarWindow {
             start_ms: midnight_ms(first).ok_or_else(|| BillError::InvalidYear(detail.clone()))?,
             end_ms: midnight_ms(next_year).ok_or_else(|| BillError::InvalidYear(detail))?,
             header: BillHeader::Year { label },
+        })
+    }
+
+    /// Builds one ISO calendar week with its exact millisecond window.
+    ///
+    /// The week is the ISO week number 1..=53 of the week-year `year`; the
+    /// window runs Monday 00:00 UTC to the next Monday 00:00 UTC, so a week
+    /// can cross the calendar year boundary (week 1 of 2026 starts on
+    /// December 29, 2025).  Weeks the ISO calendar does not contain (week 0,
+    /// week 54, or week 53 of a 52-week year) are rejected.
+    pub(crate) fn week(year: u32, week: u32) -> Result<Self, BillError> {
+        let detail = format!("{year}-{week}");
+        if !(1970..=i32::MAX as u32).contains(&year) {
+            return Err(BillError::InvalidWeek(detail.clone()));
+        }
+        let monday = NaiveDate::from_isoywd_opt(year as i32, week, Weekday::Mon)
+            .ok_or_else(|| BillError::InvalidWeek(detail.clone()))?;
+        let next = monday
+            .checked_add_days(Days::new(7))
+            .ok_or_else(|| BillError::InvalidWeek(detail.clone()))?;
+        let label = format!("Week {week}, {year}");
+
+        Ok(Self {
+            label: label.clone(),
+            start_ms: midnight_ms(monday).ok_or_else(|| BillError::InvalidWeek(detail.clone()))?,
+            end_ms: midnight_ms(next).ok_or_else(|| BillError::InvalidWeek(detail))?,
+            header: BillHeader::Week { label },
         })
     }
 }

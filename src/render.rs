@@ -43,6 +43,11 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
             output.push_str(&format!("Year:    {label}\n"));
             output.push_str(&format!("Sessions: {}\n\n", report.session_count));
         }
+        BillHeader::Week { label } => {
+            output.push_str("OPENCODE WEEKLY BILL\n");
+            output.push_str(&format!("Week:    {label}\n"));
+            output.push_str(&format!("Sessions: {}\n\n", report.session_count));
+        }
     }
     output.push_str(&render_table(
         &[

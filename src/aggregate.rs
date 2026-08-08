@@ -68,6 +68,16 @@ fn week_index_of(created: Option<u64>, weeks: &[u32]) -> Option<usize> {
     weeks.iter().position(|listed| *listed == week)
 }
 
+/// Weekday index (0 = Monday .. 6 = Sunday) of a Unix-millisecond timestamp,
+/// if it parses.  The same timestamp guard as [`week_of`].
+fn weekday_index_of(created: Option<u64>) -> Option<usize> {
+    let created = created?;
+    let millis = i64::try_from(created).ok()?;
+    let time = chrono::DateTime::from_timestamp_millis(millis)?;
+
+    Some(time.weekday().num_days_from_monday() as usize)
+}
+
 /// One month's calendar weeks as ISO week numbers, in day order.
 ///
 /// A month spans four to six weeks; a January can start in ISO week 53 of
@@ -144,6 +154,10 @@ pub(crate) struct StreamedAggregates {
     pub(crate) weeks: Vec<u32>,
     /// Per-week totals of the billed month, aligned with [`Self::weeks`].
     pub(crate) week_totals: Vec<Totals>,
+    /// Whether the rows fold into per-weekday bars (week bills).
+    pub(crate) weekday_fold: bool,
+    /// Per-weekday totals, Monday first, for the week bars.
+    pub(crate) weekdays: [Totals; 7],
     /// Sessions that produced at least one kept usage row.
     pub(crate) kept_sessions: BTreeSet<SessionId>,
     /// Earliest kept call timestamp (Unix millis).
@@ -175,6 +189,12 @@ impl StreamedAggregates {
         self.weeks = weeks;
     }
 
+    /// Turns on per-weekday folding (week bills); the fold then buckets
+    /// rows into [`Self::weekdays`] bars, Monday first.
+    pub(crate) fn set_weekday_fold(&mut self) {
+        self.weekday_fold = true;
+    }
+
     /// Folds one kept usage row into every summary.
     ///
     /// The folds mirror the whole-store passes, so the folded counters (and
@@ -204,6 +224,15 @@ impl StreamedAggregates {
             progress.folded_row();
             if let Some(index) = week_index_of(row.created, &self.weeks)
                 && let Some(total) = self.week_totals.get_mut(index)
+            {
+                total.accumulate(row);
+            }
+        }
+
+        if self.weekday_fold {
+            progress.folded_row();
+            if let Some(index) = weekday_index_of(row.created)
+                && let Some(total) = self.weekdays.get_mut(index)
             {
                 total.accumulate(row);
             }
@@ -450,6 +479,73 @@ mod tests {
                 &weeks
             ),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn buckets_rows_into_their_creation_weekday() {
+        let mut interner = Interner::default();
+        let mut store = UsageStore::default();
+        let mut row = |created| UsageRow {
+            session_id: interner.intern_session("ses"),
+            agent: interner.intern_agent("build"),
+            provider: interner.intern_provider("openai"),
+            model: interner.intern_model("gpt-test"),
+            tokens: Tokens::default(),
+            cost_micros: 0,
+            cost_unknown: false,
+            api_ms: 0,
+            created,
+            completed: None,
+        };
+
+        // August 3 2026 is a Monday (weekday 0); August 7 is a Friday (4).
+        let monday = chrono::DateTime::parse_from_rfc3339("2026-08-03T12:00:00Z")
+            .expect("valid timestamp")
+            .timestamp_millis() as u64;
+        let friday = chrono::DateTime::parse_from_rfc3339("2026-08-07T12:00:00Z")
+            .expect("valid timestamp")
+            .timestamp_millis() as u64;
+
+        store.push(row(Some(monday)));
+        store.push(row(Some(monday)));
+        store.push(row(Some(friday)));
+        store.push(row(None));
+
+        let mut aggregates = StreamedAggregates::default();
+
+        aggregates.set_weekday_fold();
+        let progress = PipelineProgress::default();
+
+        for row in store.rows() {
+            aggregates.fold(&row, &progress);
+        }
+
+        assert_eq!(
+            aggregates
+                .weekdays
+                .iter()
+                .map(|day| day.requests)
+                .collect::<Vec<_>>(),
+            [2, 0, 0, 0, 1, 0, 0],
+            "the timestamp-less row belongs to no bar"
+        );
+    }
+
+    #[test]
+    fn weekday_index_of_parses_only_valid_timestamps() {
+        assert_eq!(weekday_index_of(None), None);
+        assert_eq!(weekday_index_of(Some(u64::MAX)), None);
+        // 1970-01-01 is a Thursday (weekday 3).
+        assert_eq!(weekday_index_of(Some(1_000)), Some(3));
+        assert_eq!(
+            weekday_index_of(Some(
+                chrono::DateTime::parse_from_rfc3339("2026-08-03T12:00:00Z")
+                    .expect("valid timestamp")
+                    .timestamp_millis() as u64
+            )),
+            Some(0),
+            "2026-08-03 is a Monday"
         );
     }
 

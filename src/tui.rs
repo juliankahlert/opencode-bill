@@ -20,7 +20,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use opencode_bill::{
     BarGraph, BillHeader, BillProgress, BillReport, StorageContext, graph_lines,
     load_day_report_with_progress_counted, load_month_report_with_progress_counted,
-    load_report_with_progress_counted, load_year_report_with_progress_counted,
+    load_report_with_progress_counted, load_week_report_with_progress_counted,
+    load_year_report_with_progress_counted,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -109,6 +110,16 @@ async fn worker(
         crate::Request::Year(year) => load_year_report_with_progress_counted(
             &context,
             year,
+            &providers,
+            |task| {
+                let _ = sender.send(Progress::Task(task.to_owned()));
+            },
+            &counters,
+        ),
+        crate::Request::Week(year, week) => load_week_report_with_progress_counted(
+            &context,
+            year,
+            week,
             &providers,
             |task| {
                 let _ = sender.send(Progress::Task(task.to_owned()));
@@ -537,10 +548,12 @@ fn draw_failure(frame: &mut Frame, failure: &str) {
 fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
     let mut rows = Vec::new();
 
-    // Month, day, and year bills carry their label; session bills have no
-    // header row here.
-    if let BillHeader::Month { label } | BillHeader::Day { label } | BillHeader::Year { label } =
-        &report.header
+    // Month, day, week, and year bills carry their label; session bills
+    // have no header row here.
+    if let BillHeader::Month { label }
+    | BillHeader::Day { label }
+    | BillHeader::Week { label }
+    | BillHeader::Year { label } = &report.header
     {
         rows.push(title_row(label));
     }
@@ -967,6 +980,29 @@ mod tests {
         let label = render_row(&table_buffer, 0, table_natural_width());
 
         assert!(label.contains("August 8 2026"), "label: {label}");
+    }
+
+    #[test]
+    fn prepends_week_label_row() {
+        let mut report = fixture_report();
+
+        report.header = BillHeader::Week {
+            label: "Week 32, 2026".to_owned(),
+        };
+        let rows = build_rows(&report);
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 11));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 11),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let label = render_row(&table_buffer, 0, table_natural_width());
+
+        assert!(label.contains("Week 32, 2026"), "label: {label}");
     }
 
     #[test]

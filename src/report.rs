@@ -36,6 +36,11 @@ pub enum BillHeader {
         /// Label like "2026".
         label: String,
     },
+    /// One ISO calendar week, identified by its label.
+    Week {
+        /// Label like "Week 32, 2026".
+        label: String,
+    },
 }
 
 /// How a [`BarGraph`] total is formatted: counts, durations, or money.
@@ -130,6 +135,9 @@ pub(crate) fn build_report(
 const MONTH_LABELS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/// One label per weekday, Monday first; the week graphs' bar labels.
+const WEEKDAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 /// The year bill's bar graphs: one per TOTAL metric of a month bill.
 ///
@@ -312,6 +320,91 @@ pub(crate) fn month_graphs(
             kind: MetricKind::Cost,
             unit: "WEEK",
             total_label: "Month total",
+        },
+    ]
+}
+
+/// The week bill's bar graphs: one per TOTAL metric of a day bill.
+///
+/// `weekdays` holds the per-weekday totals, Monday first; `total` is the
+/// whole-week total, shown as a value instead of a bar.
+pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph> {
+    let labels = WEEKDAY_LABELS.map(str::to_owned).to_vec();
+
+    vec![
+        BarGraph {
+            label: "REQUESTS",
+            bars: weekdays.map(|day| day.requests).to_vec(),
+            labels: labels.clone(),
+            total: total.requests,
+            kind: MetricKind::Count,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "INPUT",
+            bars: weekdays.map(|day| day.tokens.input).to_vec(),
+            labels: labels.clone(),
+            total: total.tokens.input,
+            kind: MetricKind::Count,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "CACHE READ",
+            bars: weekdays.map(|day| day.tokens.cache_read).to_vec(),
+            labels: labels.clone(),
+            total: total.tokens.cache_read,
+            kind: MetricKind::Count,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "CACHE WRITE",
+            bars: weekdays.map(|day| day.tokens.cache_write).to_vec(),
+            labels: labels.clone(),
+            total: total.tokens.cache_write,
+            kind: MetricKind::Count,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "OUTPUT",
+            bars: weekdays.map(|day| day.tokens.output).to_vec(),
+            labels: labels.clone(),
+            total: total.tokens.output,
+            kind: MetricKind::Count,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "REASONING",
+            bars: weekdays.map(|day| day.tokens.reasoning).to_vec(),
+            labels: labels.clone(),
+            total: total.tokens.reasoning,
+            kind: MetricKind::Count,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "API TIME",
+            bars: weekdays.map(|day| day.api_ms).to_vec(),
+            labels: labels.clone(),
+            total: total.api_ms,
+            kind: MetricKind::Duration,
+            unit: "DAY",
+            total_label: "Week total",
+        },
+        BarGraph {
+            label: "AMOUNT DUE",
+            bars: weekdays
+                .map(|day| cost_to_micros(day.cost).max(0) as u64)
+                .to_vec(),
+            labels,
+            total: cost_to_micros(total.cost).max(0) as u64,
+            kind: MetricKind::Cost,
+            unit: "DAY",
+            total_label: "Week total",
         },
     ]
 }
@@ -663,6 +756,46 @@ mod tests {
     #[test]
     fn month_graphs_without_weeks_fall_back_to_no_graphs() {
         assert!(month_graphs(&[], &[], &Totals::default()).is_empty());
+    }
+
+    #[test]
+    fn week_graphs_carry_bars_and_weekday_labels() {
+        use crate::data::{Tokens, cost_from_micros};
+
+        let mut weekdays = [Totals::default(); 7];
+
+        weekdays[0].requests = 5;
+        weekdays[1].requests = 7;
+        weekdays[1].tokens.output = 10;
+        weekdays[1].api_ms = 2;
+        weekdays[1].cost = cost_from_micros(25);
+        let total = Totals {
+            requests: 12,
+            tokens: Tokens {
+                output: 10,
+                ..Tokens::default()
+            },
+            api_ms: 2,
+            cost: cost_from_micros(25),
+            ..Totals::default()
+        };
+        let graphs = week_graphs(weekdays, &total);
+
+        assert_eq!(graphs.len(), 8);
+        assert_eq!(graphs[0].label, "REQUESTS");
+        assert_eq!(graphs[0].bars, [5, 7, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            graphs[0].labels,
+            ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        );
+        assert_eq!(graphs[0].total, 12);
+        assert_eq!(graphs[0].unit, "DAY");
+        assert_eq!(graphs[0].total_label, "Week total");
+        assert_eq!(graphs[6].label, "API TIME");
+        assert_eq!(graphs[6].bars[1], 2);
+        assert_eq!(graphs[7].label, "AMOUNT DUE");
+        assert_eq!(graphs[7].bars[1], 25);
+        assert_eq!(graphs[7].total, 25);
     }
 
     #[test]

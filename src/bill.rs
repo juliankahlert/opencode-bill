@@ -15,7 +15,7 @@ use crate::error::BillError;
 use crate::parse::{parse_message_batch, parse_metadata, parse_system};
 use crate::pricing;
 use crate::render::render_bill;
-use crate::report::{BarGraph, BillReport, build_report, month_graphs, year_graphs};
+use crate::report::{BarGraph, BillReport, build_report, month_graphs, week_graphs, year_graphs};
 use crate::store::{CalendarWindow, RawWindowMeta, SessionStore, StreamBatch, validate_reference};
 use crate::timing::{earliest, latest};
 
@@ -161,6 +161,25 @@ pub fn generate_yearly_bill(
     providers: &[String],
 ) -> Result<String, BillError> {
     let report = load_year_report_with_progress(context, year, providers, |_| {})?;
+
+    render_bill(&report)
+}
+
+/// Generates a deterministic plain-text bill for one calendar week.
+///
+/// The week is an ISO week number 1..=53 of the given year; every session
+/// whose messages were recorded in that window is included.  The report
+/// carries the full usage tables plus one bar graph per TOTAL metric of a
+/// day bill, with a vertical bar per weekday and the week total shown as a
+/// value. When `providers` is non-empty, only usage from those providers is
+/// included.
+pub fn generate_weekly_bill(
+    context: &StorageContext,
+    year: u32,
+    week: u32,
+    providers: &[String],
+) -> Result<String, BillError> {
+    let report = load_week_report_with_progress(context, year, week, providers, |_| {})?;
 
     render_bill(&report)
 }
@@ -354,6 +373,54 @@ pub fn load_year_report_with_progress_counted(
     ))?
 }
 
+/// Loads one calendar week and builds the report data, reporting each step.
+///
+/// `on_task` runs before every phase (loading, parsing, pricing, aggregation,
+/// report building) so a UI can show which step is currently in progress.
+/// When `providers` is non-empty, only usage from those providers is included.
+///
+/// The pipeline runs on tokio internally (store read on the blocking pool,
+/// gated GitHub pricing fetch in the pricing phase); the function itself
+/// stays synchronous.
+pub fn load_week_report_with_progress(
+    context: &StorageContext,
+    year: u32,
+    week: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+) -> Result<BillReport, BillError> {
+    let counters = BillProgress::default();
+
+    load_week_report_with_progress_counted(context, year, week, providers, on_task, &counters)
+}
+
+/// Loads one calendar week and builds the report data, reporting each work
+/// step and counting live progress.
+///
+/// Like [`load_week_report_with_progress`], but the pipeline also writes the
+/// loaded, parsed, and folded row counts into the shared `counters` handle
+/// while it runs, so a UI on another task can show live numbers.
+pub fn load_week_report_with_progress_counted(
+    context: &StorageContext,
+    year: u32,
+    week: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+    counters: &BillProgress,
+) -> Result<BillReport, BillError> {
+    let mut on_task = on_task;
+    let progress = PipelineProgress::with_counters(counters.clone());
+
+    block_on(load_week_report_async(
+        context,
+        year,
+        week,
+        providers,
+        &mut on_task,
+        &progress,
+    ))?
+}
+
 /// The async session pipeline: loads the store on the blocking pool, then
 /// parses, prices, aggregates, and renders on the calling thread.  The
 /// GitHub pricing page is fetched only when the bill uses `github-copilot`.
@@ -387,8 +454,16 @@ async fn load_month_report_async(
     progress.note_phase(0);
     let window = CalendarWindow::month(year, month)?;
     let weeks = month_weeks(year as i32, month).unwrap_or_default();
-    let streamed =
-        load_streaming_system(context, &window, weeks, providers, progress, on_task).await?;
+    let streamed = load_streaming_system(
+        context,
+        &window,
+        GraphMode::Month,
+        weeks,
+        providers,
+        progress,
+        on_task,
+    )
+    .await?;
 
     summarize_streamed_async(streamed, providers, GraphMode::Month, on_task, progress)
 }
@@ -409,8 +484,16 @@ async fn load_day_report_async(
     on_task("Loading day data");
     progress.note_phase(0);
     let window = CalendarWindow::day(year, month, day)?;
-    let streamed =
-        load_streaming_system(context, &window, Vec::new(), providers, progress, on_task).await?;
+    let streamed = load_streaming_system(
+        context,
+        &window,
+        GraphMode::None,
+        Vec::new(),
+        providers,
+        progress,
+        on_task,
+    )
+    .await?;
 
     summarize_streamed_async(streamed, providers, GraphMode::None, on_task, progress)
 }
@@ -429,22 +512,63 @@ async fn load_year_report_async(
     on_task("Loading year data");
     progress.note_phase(0);
     let window = CalendarWindow::year(year)?;
-    let streamed =
-        load_streaming_system(context, &window, Vec::new(), providers, progress, on_task).await?;
+    let streamed = load_streaming_system(
+        context,
+        &window,
+        GraphMode::Year,
+        Vec::new(),
+        providers,
+        progress,
+        on_task,
+    )
+    .await?;
 
     summarize_streamed_async(streamed, providers, GraphMode::Year, on_task, progress)
+}
+
+/// The async week pipeline: streams the store on the blocking pool one day
+/// at a time while a second blocking task parses and folds each day's batch,
+/// then renders with the per-weekday bar graphs.  The GitHub pricing page is
+/// fetched only when the bill uses `github-copilot`.
+async fn load_week_report_async(
+    context: &StorageContext,
+    year: u32,
+    week: u32,
+    providers: &[String],
+    on_task: &mut impl FnMut(&str),
+    progress: &PipelineProgress,
+) -> Result<BillReport, BillError> {
+    on_task("Loading week data");
+    progress.note_phase(0);
+    let window = CalendarWindow::week(year, week)?;
+    let streamed = load_streaming_system(
+        context,
+        &window,
+        GraphMode::Week,
+        Vec::new(),
+        providers,
+        progress,
+        on_task,
+    )
+    .await?;
+
+    summarize_streamed_async(streamed, providers, GraphMode::Week, on_task, progress)
 }
 
 /// Which bar graphs a streamed window report carries.
 ///
 /// Year bills carry one graph per month, month bills one graph per calendar
-/// week; day and session bills carry none and render the plain TOTAL table.
+/// week, week bills one graph per weekday; day and session bills carry none
+/// and render the plain TOTAL table.  The mode also tells the streaming
+/// pipeline which period buckets to fold.
 #[derive(Clone, Copy)]
 enum GraphMode {
     /// No graphs: the TOTAL table.
     None,
     /// One graph per calendar week of the billed month.
     Month,
+    /// One graph per calendar day of the billed week.
+    Week,
     /// One graph per calendar month of the billed year.
     Year,
 }
@@ -483,6 +607,7 @@ struct StreamedBill {
 async fn load_streaming_system(
     context: &StorageContext,
     window: &CalendarWindow,
+    mode: GraphMode,
     weeks: Vec<u32>,
     providers: &[String],
     progress: &PipelineProgress,
@@ -587,7 +712,11 @@ async fn load_streaming_system(
         let mut aggregates = StreamedAggregates::default();
 
         aggregates.seed_agents(&world.sessions);
-        aggregates.set_weeks(weeks);
+        match mode {
+            GraphMode::None | GraphMode::Year => {}
+            GraphMode::Month => aggregates.set_weeks(weeks),
+            GraphMode::Week => aggregates.set_weekday_fold(),
+        }
 
         // Pricing sources resolve lazily per key; the catalog and the GitHub
         // page (already fetched by the pump when needed) are shared across
@@ -789,6 +918,7 @@ fn summarize_streamed_async(
             &streamed.aggregates.weeks,
             &total,
         ),
+        GraphMode::Week => week_graphs(streamed.aggregates.weekdays, &total),
         GraphMode::Year => year_graphs(streamed.aggregates.months, &total),
     };
 
@@ -1173,7 +1303,8 @@ mod tests {
             }
             crate::report::BillHeader::Month { .. }
             | crate::report::BillHeader::Day { .. }
-            | crate::report::BillHeader::Year { .. } => {
+            | crate::report::BillHeader::Year { .. }
+            | crate::report::BillHeader::Week { .. } => {
                 panic!("expected a session header");
             }
         }
@@ -1887,6 +2018,117 @@ Amount due:  $0.125000 USD
         assert!(bill.contains("1   2   3   4   5"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn generates_weekly_bill_with_weekday_bars() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+        let monday =
+            chrono::DateTime::parse_from_rfc3339("1970-01-05T12:00:00Z")?.timestamp_millis();
+        let thursday =
+            chrono::DateTime::parse_from_rfc3339("1970-01-08T12:00:00Z")?.timestamp_millis();
+        let next_week =
+            chrono::DateTime::parse_from_rfc3339("1970-01-12T12:00:00Z")?.timestamp_millis();
+
+        // Week 2 of 1970 runs Monday January 5 to Sunday January 11: the
+        // first call lands on Monday, the second on Thursday; the third
+        // (next Monday) stays outside the window, like the fixture's
+        // January 1 call in week 1.
+        connection.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["ses_week1234567", "Week session"],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_mon",
+                "ses_week1234567",
+                monday,
+                format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{{"created":{monday}}},"tokens":{{"input":20,"output":5,"reasoning":1,"cache":{{"read":2,"write":0}}}}}}"#
+                )
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_thu",
+                "ses_week1234567",
+                thursday,
+                format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{{"created":{thursday}}},"tokens":{{"input":20,"output":5,"reasoning":1,"cache":{{"read":2,"write":0}}}}}}"#
+                )
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_out",
+                "ses_week1234567",
+                next_week,
+                format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.5,"time":{{"created":{next_week}}},"tokens":{{"input":30,"output":12,"reasoning":3,"cache":{{"read":7,"write":2}}}}}}"#
+                )
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_weekly_bill(&context, 1970, 2, &[])?;
+
+        assert!(bill.contains("OPENCODE WEEKLY BILL"));
+        assert!(bill.contains("Week:    Week 2, 1970"));
+        assert!(bill.contains("Sessions: 1"));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "2",
+                "40",
+                "4",
+                "0",
+                "10",
+                "2",
+                "0ms",
+                "$0.500000"
+            ]
+        ));
+        // The bar graphs replace the TOTAL table; calls outside the window
+        // (the fixture's week-1 message and the next-week message) are absent.
+        assert!(bill.contains("REQUESTS BY DAY      Week total: 2"));
+        assert!(bill.contains("AMOUNT DUE BY DAY    Week total: $0.500000 USD"));
+        assert!(bill.contains("Mon Tue Wed Thu Fri Sat Sun"));
+        assert!(!bill.contains("Amount due:"));
+        assert!(!bill.contains("TOTAL\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_week() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+
+        let before_epoch = generate_weekly_bill(&context, 1969, 1, &[])
+            .err()
+            .ok_or("expected an error")?;
+        let zero = generate_weekly_bill(&context, 2026, 0, &[])
+            .err()
+            .ok_or("expected an error")?;
+        let beyond_range = generate_weekly_bill(&context, 2026, 54, &[])
+            .err()
+            .ok_or("expected an error")?;
+        let short_year = generate_weekly_bill(&context, 2025, 53, &[])
+            .err()
+            .ok_or("expected an error")?;
+        let beyond_chrono = generate_weekly_bill(&context, 262_143, 1, &[])
+            .err()
+            .ok_or("expected an error")?;
+
+        assert!(matches!(before_epoch, BillError::InvalidWeek(_)));
+        assert!(matches!(zero, BillError::InvalidWeek(_)));
+        assert!(matches!(beyond_range, BillError::InvalidWeek(_)));
+        assert!(matches!(short_year, BillError::InvalidWeek(_)));
+        assert!(matches!(beyond_chrono, BillError::InvalidWeek(_)));
         Ok(())
     }
 

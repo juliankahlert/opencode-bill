@@ -23,6 +23,10 @@ pub enum BillError {
     #[error("invalid day: {0}")]
     InvalidDay(String),
 
+    /// The week window does not exist in the calendar.
+    #[error("invalid week: {0}")]
+    InvalidWeek(String),
+
     /// The year window does not exist in the calendar.
     #[error("invalid year: {0}")]
     InvalidYear(String),
