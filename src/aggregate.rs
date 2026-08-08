@@ -54,7 +54,7 @@ pub(crate) fn aggregate_agents(
     sessions: &SessionTree,
     progress: &PipelineProgress,
 ) -> BTreeMap<AgentId, AgentUsage> {
-    let mut usage = sessions
+    let usage = sessions
         .iter()
         .filter_map(|(session_id, node)| node.agent.map(|agent| (*session_id, agent)))
         .fold(
@@ -70,31 +70,32 @@ pub(crate) fn aggregate_agents(
     let chunk_maps = rows
         .par_chunks(AGGREGATE_CHUNK)
         .map(|chunk| {
-            let mut local = BTreeMap::<AgentId, AgentUsage>::new();
+            chunk
+                .iter()
+                .fold(BTreeMap::<AgentId, AgentUsage>::new(), |mut local, row| {
+                    progress.folded_row();
 
-            for row in chunk {
-                progress.folded_row();
+                    let entry = local.entry(row.agent).or_default();
 
-                let entry = local.entry(row.agent).or_default();
+                    entry.sessions.insert(row.session_id);
+                    entry.totals.accumulate(row);
 
-                entry.sessions.insert(row.session_id);
-                entry.totals.accumulate(row);
-            }
-
-            local
+                    local
+                })
         })
         .collect::<Vec<_>>();
 
-    for local in chunk_maps {
-        for (agent, entry) in local {
+    chunk_maps
+        .into_iter()
+        .flatten()
+        .fold(usage, |mut usage, (agent, entry)| {
             let target = usage.entry(agent).or_default();
 
             target.sessions.extend(entry.sessions);
             target.totals.merge(&entry.totals);
-        }
-    }
 
-    usage
+            usage
+        })
 }
 
 #[cfg(test)]
