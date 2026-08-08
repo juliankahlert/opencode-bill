@@ -262,10 +262,10 @@ pub async fn run(
                 .map_err(|failure| failure.to_string())?;
         }
 
-        // The year bill's bar graphs render as bordered blocks in a grid
-        // that fits the terminal width; they print after the table, outside
-        // its 11-column grid.
-        if let BillHeader::Year { .. } = &report.header {
+        // Bar graphs (year: one per month; month: one per calendar week)
+        // render as bordered blocks in a grid that fits the terminal width;
+        // they print after the table, outside its 11-column grid.
+        if !report.graphs.is_empty() {
             let (terminal_width, _) = size().map_err(|failure| failure.to_string())?;
             stdout
                 .write_all(b"\n")
@@ -978,9 +978,12 @@ mod tests {
         };
         report.graphs.push(opencode_bill::BarGraph {
             label: "REQUESTS",
-            bars: [1; 12],
+            bars: vec![1; 12],
+            labels: month_labels(),
             total: 12,
             kind: opencode_bill::MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         });
 
         let rows = build_rows(&report);
@@ -1010,6 +1013,16 @@ mod tests {
         );
     }
 
+    /// One label per month, January first; the year graphs' bar labels.
+    fn month_labels() -> Vec<String> {
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
     /// The eight year graphs mirroring the month TOTAL rows.
     fn year_graphs() -> Vec<BarGraph> {
         [
@@ -1025,9 +1038,41 @@ mod tests {
         .into_iter()
         .map(|label| BarGraph {
             label,
-            bars: [1; 12],
+            bars: vec![1; 12],
+            labels: month_labels(),
             total: 12,
             kind: opencode_bill::MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
+        })
+        .collect()
+    }
+
+    /// The eight month graphs mirroring the day TOTAL rows, with bars for
+    /// the six calendar weeks of August 2026.
+    fn month_graphs() -> Vec<BarGraph> {
+        [
+            "REQUESTS",
+            "INPUT",
+            "CACHE READ",
+            "CACHE WRITE",
+            "OUTPUT",
+            "REASONING",
+            "API TIME",
+            "AMOUNT DUE",
+        ]
+        .into_iter()
+        .map(|label| BarGraph {
+            label,
+            bars: vec![1; 6],
+            labels: vec!["31", "32", "33", "34", "35", "36"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            total: 6,
+            kind: opencode_bill::MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
         })
         .collect()
     }
@@ -1065,13 +1110,30 @@ mod tests {
     fn pads_short_year_graphs_to_their_row_height() {
         let mut graphs = year_graphs();
 
-        graphs[7].bars = [0; 12];
+        graphs[7].bars = vec![0; 12];
         graphs[7].total = 0;
         let grid = render_graph_grid(&graphs, 1000);
 
         assert_eq!(grid.len(), 12);
         // The zero-usage graph keeps its bordered block across the full row.
         assert!(grid[11].contains("└"), "row: {}", grid[11]);
+    }
+
+    #[test]
+    fn grids_month_graphs_into_blocks_that_fit_the_terminal_width() {
+        let grid = render_graph_grid(&month_graphs(), 200);
+
+        // The week graphs are narrower than the year graphs (their widest
+        // line is the title, not the labels), so five blocks fit per row:
+        // two rows of 12 lines.
+        assert_eq!(grid.len(), 24);
+        assert_eq!(grid[0].matches('┌').count(), 5);
+        assert!(grid[1].contains("REQUESTS BY WEEK"), "row: {}", grid[1]);
+        assert!(
+            grid[10].contains("31  32  33  34  35  36"),
+            "row: {}",
+            grid[10]
+        );
     }
 
     #[test]

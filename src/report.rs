@@ -49,20 +49,29 @@ pub enum MetricKind {
     Cost,
 }
 
-/// One metric of the year bill: a vertical bar per month, plus the year total.
+/// One metric of a window bill: a vertical bar per month or per calendar
+/// week, plus the window total.
 ///
-/// The 12 bars hold the metric's value per calendar month, January first;
-/// `total` is the whole-year value and is shown as text, never as a bar.
+/// The bars hold the metric's value per period, in calendar order; `total`
+/// is the whole-window value and is shown as text, never as a bar.
 #[derive(Clone)]
 pub struct BarGraph {
     /// Uppercase metric label, e.g. "REQUESTS" or "AMOUNT DUE".
     pub label: &'static str,
-    /// One value per month, January first; the bars of the graph.
-    pub bars: [u64; 12],
-    /// The whole-year total of the metric, displayed as a value.
+    /// One value per period, in calendar order; the bars of the graph.
+    pub bars: Vec<u64>,
+    /// One label per bar, e.g. "Jan" for a year bill or "31" for a month
+    /// bill's calendar weeks.
+    pub labels: Vec<String>,
+    /// The whole-window total of the metric, displayed as a value.
     pub total: u64,
     /// How the total is formatted for display.
     pub kind: MetricKind,
+    /// What each bar stands for, e.g. "MONTH" or "WEEK"; the title is
+    /// `"{label} BY {unit}"`.
+    pub unit: &'static str,
+    /// What the total is, e.g. "Year total" or "Month total".
+    pub total_label: &'static str,
 }
 
 /// Everything a renderer needs to show one bill.
@@ -79,9 +88,11 @@ pub struct BillReport {
     pub pricing_rows: Vec<Vec<String>>,
     /// Label/value pairs of the TOTAL section.
     pub totals: Vec<(String, String)>,
-    /// One bar graph per total metric; the year bill's TOTAL replacement.
+    /// One bar graph per total metric; the year bill's and the month bill's
+    /// TOTAL replacement.
     ///
-    /// Session, month, and day bills leave this empty.
+    /// Year bills carry one graph per month, month bills one graph per
+    /// calendar week; session and day bills leave this empty.
     pub graphs: Vec<BarGraph>,
 }
 
@@ -115,59 +126,192 @@ pub(crate) fn build_report(
     }
 }
 
+/// One label per month, January first; the year graphs' bar labels.
+const MONTH_LABELS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 /// The year bill's bar graphs: one per TOTAL metric of a month bill.
 ///
 /// `months` holds the per-month totals, January first; `total` is the whole
 /// year total, which the graphs show as a value instead of a bar.
 pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph> {
+    let labels = MONTH_LABELS.map(str::to_owned).to_vec();
+
     vec![
         BarGraph {
             label: "REQUESTS",
-            bars: months.map(|month| month.requests),
+            bars: months.map(|month| month.requests).to_vec(),
+            labels: labels.clone(),
             total: total.requests,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "INPUT",
-            bars: months.map(|month| month.tokens.input),
+            bars: months.map(|month| month.tokens.input).to_vec(),
+            labels: labels.clone(),
             total: total.tokens.input,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "CACHE READ",
-            bars: months.map(|month| month.tokens.cache_read),
+            bars: months.map(|month| month.tokens.cache_read).to_vec(),
+            labels: labels.clone(),
             total: total.tokens.cache_read,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "CACHE WRITE",
-            bars: months.map(|month| month.tokens.cache_write),
+            bars: months.map(|month| month.tokens.cache_write).to_vec(),
+            labels: labels.clone(),
             total: total.tokens.cache_write,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "OUTPUT",
-            bars: months.map(|month| month.tokens.output),
+            bars: months.map(|month| month.tokens.output).to_vec(),
+            labels: labels.clone(),
             total: total.tokens.output,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "REASONING",
-            bars: months.map(|month| month.tokens.reasoning),
+            bars: months.map(|month| month.tokens.reasoning).to_vec(),
+            labels: labels.clone(),
             total: total.tokens.reasoning,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "API TIME",
-            bars: months.map(|month| month.api_ms),
+            bars: months.map(|month| month.api_ms).to_vec(),
+            labels: labels.clone(),
             total: total.api_ms,
             kind: MetricKind::Duration,
+            unit: "MONTH",
+            total_label: "Year total",
         },
         BarGraph {
             label: "AMOUNT DUE",
-            bars: months.map(|month| cost_to_micros(month.cost).max(0) as u64),
+            bars: months
+                .map(|month| cost_to_micros(month.cost).max(0) as u64)
+                .to_vec(),
+            labels,
             total: cost_to_micros(total.cost).max(0) as u64,
             kind: MetricKind::Cost,
+            unit: "MONTH",
+            total_label: "Year total",
+        },
+    ]
+}
+
+/// The month bill's bar graphs: one per TOTAL metric of a day bill.
+///
+/// `weeks` holds the per-calendar-week totals in calendar order and
+/// `week_numbers` the matching ISO week numbers, which name the bars; `total`
+/// is the whole-month total, shown as a value instead of a bar.  An empty
+/// week list yields no graphs, so an out-of-range month falls back to the
+/// plain TOTAL table.
+pub(crate) fn month_graphs(
+    weeks: &[Totals],
+    week_numbers: &[u32],
+    total: &Totals,
+) -> Vec<BarGraph> {
+    if week_numbers.is_empty() {
+        return Vec::new();
+    }
+
+    let labels = week_numbers
+        .iter()
+        .map(|week| week.to_string())
+        .collect::<Vec<_>>();
+
+    vec![
+        BarGraph {
+            label: "REQUESTS",
+            bars: weeks.iter().map(|week| week.requests).collect(),
+            labels: labels.clone(),
+            total: total.requests,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "INPUT",
+            bars: weeks.iter().map(|week| week.tokens.input).collect(),
+            labels: labels.clone(),
+            total: total.tokens.input,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "CACHE READ",
+            bars: weeks.iter().map(|week| week.tokens.cache_read).collect(),
+            labels: labels.clone(),
+            total: total.tokens.cache_read,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "CACHE WRITE",
+            bars: weeks.iter().map(|week| week.tokens.cache_write).collect(),
+            labels: labels.clone(),
+            total: total.tokens.cache_write,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "OUTPUT",
+            bars: weeks.iter().map(|week| week.tokens.output).collect(),
+            labels: labels.clone(),
+            total: total.tokens.output,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "REASONING",
+            bars: weeks.iter().map(|week| week.tokens.reasoning).collect(),
+            labels: labels.clone(),
+            total: total.tokens.reasoning,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "API TIME",
+            bars: weeks.iter().map(|week| week.api_ms).collect(),
+            labels: labels.clone(),
+            total: total.api_ms,
+            kind: MetricKind::Duration,
+            unit: "WEEK",
+            total_label: "Month total",
+        },
+        BarGraph {
+            label: "AMOUNT DUE",
+            bars: weeks
+                .iter()
+                .map(|week| cost_to_micros(week.cost).max(0) as u64)
+                .collect(),
+            labels,
+            total: cost_to_micros(total.cost).max(0) as u64,
+            kind: MetricKind::Cost,
+            unit: "WEEK",
+            total_label: "Month total",
         },
     ]
 }
@@ -468,11 +612,57 @@ mod tests {
         assert_eq!(graphs[0].bars[0], 5);
         assert_eq!(graphs[0].bars[1], 7);
         assert_eq!(graphs[0].total, 12);
+        assert_eq!(graphs[0].labels[0], "Jan");
+        assert_eq!(graphs[0].labels[11], "Dec");
+        assert_eq!(graphs[0].unit, "MONTH");
+        assert_eq!(graphs[0].total_label, "Year total");
         assert_eq!(graphs[6].label, "API TIME");
         assert_eq!(graphs[6].bars[1], 2);
         assert_eq!(graphs[7].label, "AMOUNT DUE");
         assert_eq!(graphs[7].bars[1], 25);
         assert_eq!(graphs[7].total, 25);
+    }
+
+    #[test]
+    fn month_graphs_carry_bars_and_week_labels() {
+        use crate::data::{Tokens, cost_from_micros};
+
+        let mut weeks = [Totals::default(); 3];
+
+        weeks[0].requests = 5;
+        weeks[1].requests = 7;
+        weeks[1].tokens.output = 10;
+        weeks[1].api_ms = 2;
+        weeks[1].cost = cost_from_micros(25);
+        let total = Totals {
+            requests: 12,
+            tokens: Tokens {
+                output: 10,
+                ..Tokens::default()
+            },
+            api_ms: 2,
+            cost: cost_from_micros(25),
+            ..Totals::default()
+        };
+        let graphs = month_graphs(&weeks, &[31, 32, 33], &total);
+
+        assert_eq!(graphs.len(), 8);
+        assert_eq!(graphs[0].label, "REQUESTS");
+        assert_eq!(graphs[0].bars, [5, 7, 0]);
+        assert_eq!(graphs[0].labels, ["31", "32", "33"]);
+        assert_eq!(graphs[0].total, 12);
+        assert_eq!(graphs[0].unit, "WEEK");
+        assert_eq!(graphs[0].total_label, "Month total");
+        assert_eq!(graphs[6].label, "API TIME");
+        assert_eq!(graphs[6].bars[1], 2);
+        assert_eq!(graphs[7].label, "AMOUNT DUE");
+        assert_eq!(graphs[7].bars[1], 25);
+        assert_eq!(graphs[7].total, 25);
+    }
+
+    #[test]
+    fn month_graphs_without_weeks_fall_back_to_no_graphs() {
+        assert!(month_graphs(&[], &[], &Totals::default()).is_empty());
     }
 
     #[test]

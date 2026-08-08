@@ -10,13 +10,9 @@ const GRAPH_HEIGHT: u64 = 8;
 const GRAPH_BAR: &str = "██  ";
 /// Empty bar-column space, width-matched to [`GRAPH_BAR`].
 const GRAPH_GAP: &str = "    ";
-/// Title padding, one column wider than the longest graph title so the year
-/// total always starts with a space.
+/// Title padding, one column wider than the longest graph title so the
+/// window total always starts with a space.
 const GRAPH_TITLE_WIDTH: usize = 21;
-/// Month labels under the bars, one per 4-column bar.
-const MONTH_LABELS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
 
 /// Renders the full bill for one session, calendar month, or calendar day.
 pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
@@ -112,15 +108,16 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
     Ok(output)
 }
 
-/// Lines of one month-bar graph: a title with the year total, the vertical
-/// bars, and the month labels.
+/// Lines of one bar graph: a title with the window total, the vertical
+/// bars, and the period labels (months or calendar weeks).
 ///
 /// The overall total is a value in the title, never a bar.  A metric with no
-/// monthly usage renders only the title line.
+/// usage in the window renders only the title line.
 pub fn graph_lines(graph: &BarGraph) -> Vec<String> {
-    let title = format!("{} BY MONTH", graph.label);
+    let title = format!("{} BY {}", graph.label, graph.unit);
     let mut lines = vec![format!(
-        "{title:<GRAPH_TITLE_WIDTH$}Year total: {}",
+        "{title:<GRAPH_TITLE_WIDTH$}{}: {}",
+        graph.total_label,
         graph_total(graph)
     )];
     let max = graph.bars.iter().copied().max().unwrap_or(0);
@@ -141,7 +138,8 @@ pub fn graph_lines(graph: &BarGraph) -> Vec<String> {
             );
         }
         lines.push(
-            MONTH_LABELS
+            graph
+                .labels
                 .iter()
                 .map(|label| format!("{label:<4}"))
                 .collect(),
@@ -165,7 +163,7 @@ fn bar_height(value: u64, max: u64) -> u64 {
     u64::try_from(scaled.max(1)).unwrap_or(GRAPH_HEIGHT)
 }
 
-/// Formats a graph's year total per its metric kind.
+/// Formats a graph's window total per its metric kind.
 fn graph_total(graph: &BarGraph) -> String {
     match graph.kind {
         MetricKind::Count => compact_count(graph.total),
@@ -275,9 +273,17 @@ mod tests {
     fn renders_vertical_bars_per_month() {
         let graph = BarGraph {
             label: "REQUESTS",
-            bars: [10, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            bars: vec![10, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            labels: [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             total: 16,
             kind: MetricKind::Count,
+            unit: "MONTH",
+            total_label: "Year total",
         };
         let lines = graph_lines(&graph);
 
@@ -293,12 +299,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_vertical_bars_per_calendar_week() {
+        let graph = BarGraph {
+            label: "REQUESTS",
+            bars: vec![0, 10, 5, 1, 0, 0],
+            labels: vec!["31", "32", "33", "34", "35", "36"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            total: 16,
+            kind: MetricKind::Count,
+            unit: "WEEK",
+            total_label: "Month total",
+        };
+        let lines = graph_lines(&graph);
+
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "REQUESTS BY WEEK     Month total: 16");
+        assert!(lines[9].starts_with("31  32  33"));
+        assert!(lines[9].ends_with("36  "));
+    }
+
+    #[test]
     fn skips_bars_when_no_month_has_usage() {
         let graph = BarGraph {
             label: "AMOUNT DUE",
-            bars: [0; 12],
+            bars: vec![0; 12],
+            labels: vec!["Jan".to_owned()],
             total: 0,
             kind: MetricKind::Cost,
+            unit: "MONTH",
+            total_label: "Year total",
         };
 
         assert_eq!(
@@ -311,9 +342,12 @@ mod tests {
     fn formats_graph_total_per_kind() {
         let graph = BarGraph {
             label: "API TIME",
-            bars: [0; 12],
+            bars: vec![0; 12],
+            labels: vec!["Jan".to_owned()],
             total: 3_600_000,
             kind: MetricKind::Duration,
+            unit: "MONTH",
+            total_label: "Year total",
         };
 
         assert_eq!(

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::aggregate::{StreamedAggregates, aggregate, aggregate_agents};
+use crate::aggregate::{StreamedAggregates, aggregate, aggregate_agents, month_weeks};
 use crate::context::{StorageContext, Store};
 use crate::data::{
     AgentId, AgentUsage, BillProgress, ModelKey, ModelRates, SessionId, Totals, UsageRow,
@@ -15,7 +15,7 @@ use crate::error::BillError;
 use crate::parse::{parse_message_batch, parse_metadata, parse_system};
 use crate::pricing;
 use crate::render::render_bill;
-use crate::report::{BarGraph, BillReport, build_report, year_graphs};
+use crate::report::{BarGraph, BillReport, build_report, month_graphs, year_graphs};
 use crate::store::{CalendarWindow, RawWindowMeta, SessionStore, StreamBatch, validate_reference};
 use crate::timing::{earliest, latest};
 
@@ -373,8 +373,8 @@ async fn load_report_async(
 
 /// The async month pipeline: streams the store on the blocking pool one day
 /// at a time while a second blocking task parses and folds each day's batch,
-/// then renders.  The GitHub pricing page is fetched only when the bill uses
-/// `github-copilot`.
+/// then renders with the per-calendar-week bar graphs.  The GitHub pricing
+/// page is fetched only when the bill uses `github-copilot`.
 async fn load_month_report_async(
     context: &StorageContext,
     year: u32,
@@ -386,9 +386,11 @@ async fn load_month_report_async(
     on_task("Loading month data");
     progress.note_phase(0);
     let window = CalendarWindow::month(year, month)?;
-    let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
+    let weeks = month_weeks(year as i32, month).unwrap_or_default();
+    let streamed =
+        load_streaming_system(context, &window, weeks, providers, progress, on_task).await?;
 
-    summarize_streamed_async(streamed, providers, false, on_task, progress)
+    summarize_streamed_async(streamed, providers, GraphMode::Month, on_task, progress)
 }
 
 /// The async day pipeline: streams the store on the blocking pool (a day
@@ -407,9 +409,10 @@ async fn load_day_report_async(
     on_task("Loading day data");
     progress.note_phase(0);
     let window = CalendarWindow::day(year, month, day)?;
-    let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
+    let streamed =
+        load_streaming_system(context, &window, Vec::new(), providers, progress, on_task).await?;
 
-    summarize_streamed_async(streamed, providers, false, on_task, progress)
+    summarize_streamed_async(streamed, providers, GraphMode::None, on_task, progress)
 }
 
 /// The async year pipeline: streams the store on the blocking pool one day
@@ -426,9 +429,24 @@ async fn load_year_report_async(
     on_task("Loading year data");
     progress.note_phase(0);
     let window = CalendarWindow::year(year)?;
-    let streamed = load_streaming_system(context, &window, providers, progress, on_task).await?;
+    let streamed =
+        load_streaming_system(context, &window, Vec::new(), providers, progress, on_task).await?;
 
-    summarize_streamed_async(streamed, providers, true, on_task, progress)
+    summarize_streamed_async(streamed, providers, GraphMode::Year, on_task, progress)
+}
+
+/// Which bar graphs a streamed window report carries.
+///
+/// Year bills carry one graph per month, month bills one graph per calendar
+/// week; day and session bills carry none and render the plain TOTAL table.
+#[derive(Clone, Copy)]
+enum GraphMode {
+    /// No graphs: the TOTAL table.
+    None,
+    /// One graph per calendar week of the billed month.
+    Month,
+    /// One graph per calendar month of the billed year.
+    Year,
 }
 
 /// The result of one streamed window load: the parse world (without the
@@ -436,7 +454,7 @@ async fn load_year_report_async(
 struct StreamedBill {
     /// Parse world: header, sessions, interner, wall bounds.
     world: World,
-    /// The three summaries the rows folded into, row by row.
+    /// The summaries the rows folded into, row by row.
     aggregates: StreamedAggregates,
     /// Rates resolved lazily per model key, in key order.
     pricing: BTreeMap<ModelKey, ModelRates>,
@@ -465,6 +483,7 @@ struct StreamedBill {
 async fn load_streaming_system(
     context: &StorageContext,
     window: &CalendarWindow,
+    weeks: Vec<u32>,
     providers: &[String],
     progress: &PipelineProgress,
     on_task: &mut impl FnMut(&str),
@@ -568,6 +587,7 @@ async fn load_streaming_system(
         let mut aggregates = StreamedAggregates::default();
 
         aggregates.seed_agents(&world.sessions);
+        aggregates.set_weeks(weeks);
 
         // Pricing sources resolve lazily per key; the catalog and the GitHub
         // page (already fetched by the pump when needed) are shared across
@@ -740,11 +760,11 @@ fn estimate_streamed_cost(
 }
 
 /// Renders a streamed window bill: scopes the agent summary and wall bounds
-/// under a provider filter, merges the year bars, and builds the report.
+/// under a provider filter, merges the bar graphs, and builds the report.
 fn summarize_streamed_async(
     mut streamed: StreamedBill,
     providers: &[String],
-    year: bool,
+    mode: GraphMode,
     on_task: &mut impl FnMut(&str),
     progress: &PipelineProgress,
 ) -> Result<BillReport, BillError> {
@@ -762,10 +782,14 @@ fn summarize_streamed_async(
     }
 
     let total = streamed.aggregates.total();
-    let graphs = if year {
-        year_graphs(streamed.aggregates.months, &total)
-    } else {
-        Vec::new()
+    let graphs = match mode {
+        GraphMode::None => Vec::new(),
+        GraphMode::Month => month_graphs(
+            &streamed.aggregates.week_totals,
+            &streamed.aggregates.weeks,
+            &total,
+        ),
+        GraphMode::Year => year_graphs(streamed.aggregates.months, &total),
     };
 
     progress.note_phase(4);
@@ -1680,7 +1704,9 @@ Amount due:  $0.125000 USD
                 "$0.125000"
             ]
         ));
-        assert!(bill.contains("Amount due:  $0.125000 USD"));
+        // The bar graphs replace the TOTAL table.
+        assert!(bill.contains("REQUESTS BY WEEK     Month total: 1"));
+        assert!(bill.contains("AMOUNT DUE BY WEEK   Month total: $0.125000 USD"));
         // Wall-clock bounds belong to session bills only.
         assert!(!bill.contains("WALL TIME"));
         assert!(!bill.contains("Started:"));
@@ -1727,18 +1753,18 @@ Amount due:  $0.125000 USD
                 "$0.125000"
             ]
         ));
-        assert!(january.contains("Requests:    1"));
+        assert!(january.contains("REQUESTS BY WEEK     Month total: 1"));
 
         let september = generate_monthly_bill(&context, 2001, 9, &[])?;
 
         assert!(september.contains("Sessions: 1"));
-        assert!(september.contains("Requests:    1"));
-        assert!(september.contains("Amount due:  $0.500000 USD"));
+        assert!(september.contains("REQUESTS BY WEEK     Month total: 1"));
+        assert!(september.contains("AMOUNT DUE BY WEEK   Month total: $0.500000 USD"));
 
         let february = generate_monthly_bill(&context, 1970, 2, &[])?;
 
         assert!(february.contains("Sessions: 0"));
-        assert!(february.contains("Requests:    0"));
+        assert!(february.contains("REQUESTS BY WEEK     Month total: 0"));
         Ok(())
     }
 
@@ -1808,6 +1834,59 @@ Amount due:  $0.125000 USD
         // The fixture message has no creation time, so only June gets a bar;
         // its values still count in the year totals.
         assert!(bill.contains("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec "));
+        Ok(())
+    }
+
+    #[test]
+    fn generates_monthly_bill_with_week_bars() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+        let week_one =
+            chrono::DateTime::parse_from_rfc3339("1970-01-01T12:00:00Z")?.timestamp_millis();
+        let week_three =
+            chrono::DateTime::parse_from_rfc3339("1970-01-12T12:00:00Z")?.timestamp_millis();
+
+        // January 1970 spans ISO weeks 1..=5: the first call lands in week 1,
+        // the second (January 12, a Monday) in week 3.
+        connection.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["ses_week1234567", "Week session"],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_w1",
+                "ses_week1234567",
+                week_one,
+                format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{{"created":{week_one}}},"tokens":{{"input":20,"output":5,"reasoning":1,"cache":{{"read":2,"write":0}}}}}}"#
+                )
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_w3",
+                "ses_week1234567",
+                week_three,
+                format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.25,"time":{{"created":{week_three}}},"tokens":{{"input":20,"output":5,"reasoning":1,"cache":{{"read":2,"write":0}}}}}}"#
+                )
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("OPENCODE MONTHLY BILL"));
+        assert!(bill.contains("Month:   January 1970"));
+        // The bar graphs replace the TOTAL table; the fixture's timestamp-less
+        // message counts in the month total but belongs to no bar.
+        assert!(bill.contains("REQUESTS BY WEEK     Month total: 3"));
+        assert!(bill.contains("AMOUNT DUE BY WEEK   Month total: $0.625000 USD"));
+        assert!(bill.contains("1   2   3   4   5"));
+        assert!(!bill.contains("Amount due:"));
+        assert!(!bill.contains("TOTAL\n"));
         Ok(())
     }
 
@@ -2156,7 +2235,7 @@ Amount due:  $0.125000 USD
                 "$0.250000"
             ]
         ));
-        assert!(bill.contains("Amount due:  $0.250000 USD"));
+        assert!(bill.contains("AMOUNT DUE BY WEEK   Month total: $0.250000 USD"));
         Ok(())
     }
 
@@ -2563,8 +2642,8 @@ Amount due:  $0.125000 USD
             ]
         ));
         assert!(!openai_only.contains("anthropic / claude-test"));
-        assert!(openai_only.contains("Requests:    1"));
-        assert!(openai_only.contains("Amount due:  $0.125000 USD"));
+        assert!(openai_only.contains("REQUESTS BY WEEK     Month total: 1"));
+        assert!(openai_only.contains("AMOUNT DUE BY WEEK   Month total: $0.125000 USD"));
         Ok(())
     }
 
