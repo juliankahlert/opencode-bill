@@ -82,12 +82,35 @@ pub(crate) struct ModelId(u32);
 /// (provider, model) identity of one model row, as interned handles.
 pub(crate) type ModelKey = (ProviderId, ModelId);
 
-/// Identity of one message entity: its lane index in a [`UsageStore`].
+/// Identity of one message entity: its lane index and generation.
 ///
 /// Every assistant call of the billed period is an entity; the components of
 /// entity `n` are the lanes at index `n`.  Ids are consecutive from zero.
+/// The generation validates that a handle still names its original row: a
+/// removed-and-replaced entity keeps a fresh generation, so stale handles
+/// fail [`UsageStore::validate`] instead of aliasing the moved row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct EntityId(pub(crate) u32);
+pub(crate) struct Entity {
+    id: u32,
+    generation: u32,
+}
+
+impl Entity {
+    /// Builds an entity handle for lane `id` of the given generation.
+    pub(crate) fn new(id: u32, generation: u32) -> Self {
+        Entity { id, generation }
+    }
+
+    /// The lane index of this entity in its store.
+    pub(crate) fn id(self) -> u32 {
+        self.id
+    }
+
+    /// The generation this handle must match to stay valid.
+    pub(crate) fn generation(self) -> u32 {
+        self.generation
+    }
+}
 
 /// One session of the billed session tree.
 ///
@@ -111,7 +134,7 @@ pub(crate) type SessionTree = BTreeMap<SessionId, SessionNode>;
 /// membership during load.  Systems are free functions over this world; no
 /// struct method hides mutation.
 pub(crate) struct World {
-    /// Identifies the billed period (session tree or calendar month).
+    /// Identifies the billed period (session tree, calendar month, or day).
     pub(crate) header: BillHeader,
     /// Number of sessions that produced the billed usage.
     pub(crate) session_count: usize,
@@ -392,6 +415,8 @@ pub(crate) struct UsageStore {
     pub(crate) completed: Vec<u64>,
     /// Presence bitmask for the completed lane.
     pub(crate) completed_mask: Vec<u64>,
+    /// Generation component lane: bumping a slot invalidates stale handles.
+    pub(crate) generations: Vec<u32>,
 }
 
 impl UsageStore {
@@ -415,18 +440,32 @@ impl UsageStore {
         self.completed.push(row.completed.unwrap_or(0));
         self.completed_mask
             .push(present_bit(row.completed.is_some()));
+        self.generations.push(0);
     }
 
-    /// Overwrites one call's cost lane slot; `false` when the entity is out
-    /// of range (checked access, never a panic).
-    pub(crate) fn set_cost_micros(&mut self, entity: EntityId, micros: i64) -> bool {
-        match self.costs_micros.get_mut(entity.0 as usize) {
-            Some(slot) => {
-                *slot = micros;
-                true
-            }
-            None => false,
+    /// Whether an entity handle still names its original row.
+    ///
+    /// `false` for out-of-range ids and for handles whose generation does
+    /// not match the lane: a stale or foreign handle never aliases another
+    /// row.  Every entity lookup is gated through this routine.
+    pub(crate) fn validate(&self, entity: Entity) -> bool {
+        self.generations
+            .get(entity.id() as usize)
+            .is_some_and(|generation| *generation == entity.generation())
+    }
+
+    /// Overwrites one call's cost lane slot; `false` when the entity is
+    /// stale or out of range (checked access, never a panic).
+    pub(crate) fn set_cost_micros(&mut self, entity: Entity, micros: i64) -> bool {
+        if !self.validate(entity) {
+            return false;
         }
+        let Some(slot) = self.costs_micros.get_mut(entity.id() as usize) else {
+            return false;
+        };
+
+        *slot = micros;
+        true
     }
 
     /// Every stored call as a copyable row, in lane order.
@@ -454,6 +493,7 @@ impl UsageStore {
             self.len(),
             "completed-mask lane length"
         );
+        debug_assert_eq!(self.generations.len(), self.len(), "generation lane length");
 
         self.sessions
             .iter()
@@ -497,13 +537,16 @@ impl UsageStore {
             })
     }
 
-    /// Every entity of this store: its id and the components of one call.
+    /// Every entity of this store: its handle and the components of one call.
     ///
-    /// Ids are consecutive from zero, matching the lane index.
-    pub(crate) fn entities(&self) -> impl Iterator<Item = (EntityId, UsageRow)> + '_ {
+    /// Handles carry the lane's current generation; ids are consecutive from
+    /// zero, matching the lane index.  Handles yielded here always validate
+    /// against this store.
+    pub(crate) fn entities(&self) -> impl Iterator<Item = (Entity, UsageRow)> + '_ {
         self.rows()
+            .zip(self.generations.iter().copied())
             .enumerate()
-            .map(|(index, row)| (EntityId(index as u32), row))
+            .map(|(entity_id, (row, generation))| (Entity::new(entity_id as u32, generation), row))
     }
 }
 
@@ -678,6 +721,7 @@ mod tests {
         assert_eq!(store.created_mask.len(), 2);
         assert_eq!(store.completed.len(), 2);
         assert_eq!(store.completed_mask.len(), 2);
+        assert_eq!(store.generations.len(), 2);
 
         let rows = store.rows().collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
@@ -701,15 +745,66 @@ mod tests {
         store.push(row);
         store.push(row);
 
-        let ids = store
+        let entities = store
             .entities()
-            .map(|(id, _)| id)
-            .collect::<Vec<EntityId>>();
-        assert_eq!(ids, [EntityId(0), EntityId(1)]);
+            .map(|(entity, _)| entity)
+            .collect::<Vec<Entity>>();
+        assert_eq!(entities, [Entity::new(0, 0), Entity::new(1, 0)]);
     }
 
     #[test]
-    fn world_models_session_tree_with_parent_component() {
+    fn validate_rejects_out_of_range_entities() {
+        let mut store = UsageStore::default();
+        store.push(usage_row_default());
+
+        assert!(store.validate(Entity::new(0, 0)));
+        assert!(!store.validate(Entity::new(1, 0)));
+        assert!(!store.validate(Entity::new(10, 0)));
+    }
+
+    #[test]
+    fn validate_rejects_stale_generation() {
+        let mut store = UsageStore::default();
+        store.push(usage_row_default());
+
+        assert!(!store.validate(Entity::new(0, 1)));
+    }
+
+    #[test]
+    fn set_cost_micros_refuses_stale_or_foreign_entities() {
+        let mut store = UsageStore::default();
+        store.push(usage_row_default());
+
+        assert!(!store.set_cost_micros(Entity::new(0, 1), 7));
+        assert!(!store.set_cost_micros(Entity::new(1, 0), 7));
+        assert_eq!(store.costs_micros[0], 0);
+
+        assert!(store.set_cost_micros(Entity::new(0, 0), 7));
+        assert_eq!(store.costs_micros[0], 7);
+    }
+
+    #[test]
+    fn entities_and_validate_follow_the_generation_lane() {
+        let mut store = UsageStore::default();
+        store.push(usage_row_default());
+        store.generations[0] = 5;
+
+        let entities = store
+            .entities()
+            .map(|(entity, _)| entity)
+            .collect::<Vec<_>>();
+        assert_eq!(entities, [Entity::new(0, 5)]);
+        assert!(store.validate(Entity::new(0, 5)));
+        assert!(!store.validate(Entity::new(0, 0)));
+
+        assert!(store.set_cost_micros(Entity::new(0, 5), 9));
+        assert_eq!(store.costs_micros[0], 9);
+        assert!(!store.set_cost_micros(Entity::new(0, 0), 1));
+        assert_eq!(store.costs_micros[0], 9);
+    }
+
+    #[test]
+    fn world_models_session_tree_with_agent_component() {
         let mut interner = Interner::default();
         let root = interner.intern_session("ses_root");
         let child = interner.intern_session("ses_child");
@@ -745,9 +840,9 @@ mod tests {
             world
                 .entities
                 .entities()
-                .map(|(id, _)| id)
+                .map(|(entity, _)| entity)
                 .collect::<Vec<_>>(),
-            [EntityId(0)]
+            [Entity::new(0, 0)]
         );
     }
 

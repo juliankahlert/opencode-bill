@@ -422,17 +422,28 @@ fn render_system(
 /// known for the provider/model pair, the call is billed at that rate
 /// instead of leaving a zero row.  Provider corrections are never re-priced.
 fn estimate_zero_costs(store: &mut UsageStore, pricing: &BTreeMap<ModelKey, ModelRates>) {
-    let entities = store.entities().collect::<Vec<_>>();
+    // The store is borrowed read-only while its rows enumerate, so the cost
+    // writes are deferred until after the walk: only the rows that actually
+    // need a price are kept, never a full store copy.
+    let writes = store
+        .entities()
+        .filter(|(entity, row)| {
+            // Every lookup is gated through validate: stale or foreign
+            // handles are never written, even though this store's own
+            // enumeration can only produce valid handles.
+            store.validate(*entity) && row.cost_unknown
+        })
+        .filter_map(|(entity, row)| {
+            pricing
+                .get(&(row.provider, row.model))
+                .map(|rates| (entity, pricing::estimated_cost_micros(&row.tokens, rates)))
+        })
+        .collect::<Vec<_>>();
 
-    for (entity, row) in entities {
-        if row.cost_unknown
-            && let Some(rates) = pricing.get(&(row.provider, row.model))
-        {
-            // The entity came from this store's own lanes, so the checked
-            // write cannot miss; ignore the defensive `false`.
-            let _ =
-                store.set_cost_micros(entity, pricing::estimated_cost_micros(&row.tokens, rates));
-        }
+    for (entity, micros) in writes {
+        // The entity came from this store's own lanes, so the checked
+        // write cannot miss; ignore the defensive `false`.
+        let _ = store.set_cost_micros(entity, micros);
     }
 }
 
