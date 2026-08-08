@@ -34,8 +34,8 @@ only time spent waiting on the model endpoint is counted. Tool calls that run
 in parallel are merged before being subtracted, and a tool that outlives its
 message is clamped to it. Wall time appears only in the TOTAL section of
 session bills: the span from the first to the last message of the session,
-including user messages. Month bills skip Started, Ended, and Wall time
-because they span many unrelated sessions.
+including user messages. Month and day bills skip Started, Ended, and Wall
+time because they span many unrelated sessions.
 
 In session bills, the session start and end timestamps are printed in the
 local time zone of the machine rendering the bill, with the UTC offset
@@ -75,10 +75,13 @@ Usage
 
     opencode-bill [<session-id-or-prefix>] [--data-dir PATH]
     opencode-bill [--month [MONTH]] [--data-dir PATH]
+    opencode-bill [--year [YEAR]] [--data-dir PATH]
+    opencode-bill [--today] [--data-dir PATH]
 
   session-id-or-prefix   Full OpenCode session ID or a unique prefix
-                         (minimum 6 characters). With no session argument
-                         and no --month, the current month is billed.
+                         (minimum 6 characters). With no session argument,
+                         no --month, and no --year, the current month is
+                         billed.
 
   --month [MONTH]        Bill the calendar month (1-12) of the current
                          year instead of one session and its sub-agents.
@@ -87,6 +90,24 @@ Usage
                          included; no session argument is required. This
                          is also what a bare `opencode-bill` (no arguments)
                          does.
+
+  --year [YEAR]          Bill the calendar year instead of one session
+                         and its sub-agents. With no value the current
+                         year is billed, so every session with messages in
+                         that window is included; no session argument is
+                         required. The report carries the same usage,
+                         agent, and pricing tables as a `--month` bill for
+                         the whole year, and replaces the TOTAL table with
+                         one bar graph per total metric: each graph has a
+                         vertical bar for every month of the year plus the
+                         year total as a value (the total is not a bar).
+
+  --today                Bill the current calendar day instead of one
+                         session and its sub-agents. Every session with
+                         messages in that window is included; no session
+                         argument is required. A single-day slice of the
+                         month bill: the same data a `--month` bill covers,
+                         restricted to messages recorded today.
 
   --provider PROVIDER    Only include usage from this provider; repeatable.
                          When at least one is given, the usage, agent,
@@ -102,10 +123,14 @@ Usage
                          (e.g. ~/.local/share/opencode on Linux).
 
 The month window is the calendar month in UTC (start of the first day to
-start of the next month, in the timestamps OpenCode stores). Provider
-corrections with negative token or cost values are clamped to zero, so a
-monthly total can exceed what a provider's own invoice shows when such
-corrections occurred.
+start of the next month, in the timestamps OpenCode stores); the day window
+is one calendar day in UTC (start of the day to start of the next day); the
+year window is one calendar year in UTC (start of January 1 to start of
+January 1 of the next year). The labeled day is the local calendar date; the
+window is that date in UTC. Year-graph bars bucket each call by the calendar
+month of its creation time. Provider corrections with negative token or cost
+values are clamped to zero, so a monthly total can exceed what a provider's
+own invoice shows when such corrections occurred.
 
 Examples:
 
@@ -114,8 +139,13 @@ Examples:
     opencode-bill abc123 --data-dir /tmp/opencode-data
     opencode-bill --month
     opencode-bill --month 2
+    opencode-bill --year
+    opencode-bill --year 2025
+    opencode-bill --today
     opencode-bill abc123 --provider openai
     opencode-bill --month --provider openai --provider anthropic
+    opencode-bill --year --provider openai
+    opencode-bill --today --provider openai
 
 When stdout is a terminal the report is shown with a loading indicator
 that lists the current step (session load, message parsing, pricing
