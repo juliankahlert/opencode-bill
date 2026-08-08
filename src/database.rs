@@ -235,7 +235,11 @@ fn database_messages(
                    SELECT session.id FROM session
                    JOIN descendants ON session.parent_id = descendants.id
                )
-               SELECT message.id, message.session_id, message.data FROM message
+               SELECT message.id, message.session_id,
+                      json_extract(message.data, '$.role','$.providerID','$.modelID','$.cost',
+                                   '$.time.created','$.time.completed','$.tokens.input',
+                                   '$.tokens.output','$.tokens.reasoning','$.tokens.cache.read',
+                                   '$.tokens.cache.write','$.agent','$.mode') FROM message
                JOIN descendants ON message.session_id = descendants.id
                ORDER BY message.time_created, message.id"#,
         )
@@ -276,7 +280,11 @@ fn database_month_messages(
 ) -> Result<Vec<RawMessage>, BillError> {
     let mut statement = connection
         .prepare(
-            r#"SELECT message.id, message.session_id, message.data FROM message
+            r#"SELECT message.id, message.session_id,
+                      json_extract(message.data, '$.role','$.providerID','$.modelID','$.cost',
+                                   '$.time.created','$.time.completed','$.tokens.input',
+                                   '$.tokens.output','$.tokens.reasoning','$.tokens.cache.read',
+                                   '$.tokens.cache.write','$.agent','$.mode') FROM message
                WHERE message.time_created >= ?1 AND message.time_created < ?2
                ORDER BY message.time_created, message.id"#,
         )
@@ -344,7 +352,8 @@ fn database_tool_parts(
                    SELECT session.id FROM session
                    JOIN descendants ON session.parent_id = descendants.id
                )
-               SELECT part.message_id, part.data FROM part
+               SELECT part.message_id, json_extract(part.data,
+                      '$.type','$.state.time.start','$.state.time.end') FROM part
                JOIN descendants ON part.session_id = descendants.id"#,
         )
         .map_err(|source| database_error(path, source))?;
@@ -384,7 +393,8 @@ fn database_month_tool_parts(
 
     let mut statement = connection
         .prepare(
-            r#"SELECT part.message_id, part.data FROM part
+            r#"SELECT part.message_id, json_extract(part.data,
+                      '$.type','$.state.time.start','$.state.time.end') FROM part
                JOIN message ON part.message_id = message.id
                WHERE message.time_created >= ?1 AND message.time_created < ?2"#,
         )

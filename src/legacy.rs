@@ -8,7 +8,10 @@ use log::debug;
 
 use crate::data::BillProgress;
 use crate::error::BillError;
-use crate::parse::{message_time, parse_json, read_error, read_json, required_string};
+use crate::parse::{
+    extract_message_fields, extract_part_fields, message_time, parse_json, read_error, read_json,
+    required_string,
+};
 use crate::report::BillHeader;
 use crate::store::{
     CalendarMonth, RawLoad, RawMessage, RawPart, RawSession, SessionStore, unique_match,
@@ -196,7 +199,7 @@ fn month_message_row(
         id: message_id.to_owned(),
         session_id: session_id.to_owned(),
         location: path.display().to_string(),
-        json,
+        json: extract_message_fields(&value),
     };
     let parts = legacy_part_rows(storage, message_id, progress)?;
 
@@ -310,6 +313,8 @@ fn legacy_messages(
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
             let json = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
+            let value = parse_json(&json, &path.display().to_string())?;
+            let fields = extract_message_fields(&value);
 
             progress.loaded_row();
             Ok((
@@ -317,7 +322,7 @@ fn legacy_messages(
                     id: message_id.to_owned(),
                     session_id: session_id.to_owned(),
                     location: path.display().to_string(),
-                    json,
+                    json: fields,
                 },
                 legacy_part_rows(storage, message_id, progress)?,
             ))
@@ -351,12 +356,14 @@ fn legacy_part_rows(
         .into_iter()
         .map(|path| {
             let json = fs::read_to_string(&path).map_err(|source| read_error(&path, source))?;
+            let value = parse_json(&json, &path.display().to_string())?;
+            let fields = extract_part_fields(&value);
 
             progress.loaded_row();
             Ok(RawPart {
                 message_id: message_id.to_owned(),
                 location: path.display().to_string(),
-                json,
+                json: fields,
             })
         })
         .collect()

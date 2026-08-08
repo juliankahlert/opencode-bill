@@ -24,6 +24,180 @@ pub(crate) fn parse_json(json: &str, location: &str) -> Result<Value, BillError>
     })
 }
 
+/// The internable fields of one message, in a fixed extraction order.
+///
+/// The stores extract these fields (SQLite via `json_extract`, legacy from
+/// its parsed file JSON) so the raw payload — which can be hundreds of
+/// megabytes when a tool result is embedded — never crosses into the
+/// pipeline.  The fields travel as a positional JSON array text.
+#[allow(non_snake_case)]
+struct MessageFields {
+    role: Option<String>,
+    providerID: Option<String>,
+    modelID: Option<String>,
+    cost: Option<f64>,
+    time_created: Option<i64>,
+    time_completed: Option<i64>,
+    tokens_input: Option<i64>,
+    tokens_output: Option<i64>,
+    tokens_reasoning: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+    agent: Option<String>,
+    mode: Option<String>,
+}
+
+impl MessageFields {
+    /// Builds the fields from the positional extraction array.
+    fn from_array(values: &[Option<serde_json::Value>]) -> MessageFields {
+        MessageFields {
+            role: string_at(values, 0),
+            providerID: string_at(values, 1),
+            modelID: string_at(values, 2),
+            cost: values
+                .get(3)
+                .and_then(|value| value.as_ref().and_then(Value::as_f64)),
+            time_created: int_at(values, 4),
+            time_completed: int_at(values, 5),
+            tokens_input: int_at(values, 6),
+            tokens_output: int_at(values, 7),
+            tokens_reasoning: int_at(values, 8),
+            cache_read: int_at(values, 9),
+            cache_write: int_at(values, 10),
+            agent: string_at(values, 11),
+            mode: string_at(values, 12),
+        }
+    }
+}
+
+/// One tool part's extraction: type plus the busy span bounds.
+struct PartFields {
+    r#type: Option<String>,
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+impl PartFields {
+    /// Builds the fields from the positional extraction array.
+    fn from_array(values: &[Option<serde_json::Value>]) -> PartFields {
+        PartFields {
+            r#type: string_at(values, 0),
+            start: int_at(values, 1),
+            end: int_at(values, 2),
+        }
+    }
+}
+
+/// A string field of the positional extraction array.
+fn string_at(values: &[Option<serde_json::Value>], index: usize) -> Option<String> {
+    values
+        .get(index)
+        .and_then(|value| value.as_ref().and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+/// An integer field of the positional extraction array.
+fn int_at(values: &[Option<serde_json::Value>], index: usize) -> Option<i64> {
+    values
+        .get(index)
+        .and_then(|value| value.as_ref().and_then(Value::as_i64))
+}
+
+/// Parses a message's extracted fields text.
+fn parse_message_fields(json: &str, location: &str) -> Result<MessageFields, BillError> {
+    let values = serde_json::from_str::<Vec<Option<Value>>>(json).map_err(|failure| {
+        BillError::InvalidData {
+            location: location.to_owned(),
+            detail: failure.to_string(),
+        }
+    })?;
+
+    Ok(MessageFields::from_array(&values))
+}
+
+/// Extracts one message's internable fields from its parsed JSON, as the
+/// positional array text the pipeline parses.
+///
+/// The legacy store extracts here (its files are small); the SQLite store
+/// extracts with `json_extract` in the same fixed order.
+pub(crate) fn extract_message_fields(value: &Value) -> String {
+    serde_json::json!([
+        value.get("role").and_then(Value::as_str),
+        value.get("providerID").and_then(Value::as_str),
+        value.get("modelID").and_then(Value::as_str),
+        value.get("cost").and_then(Value::as_f64),
+        value
+            .get("time")
+            .and_then(|time| time.get("created"))
+            .and_then(Value::as_i64),
+        value
+            .get("time")
+            .and_then(|time| time.get("completed"))
+            .and_then(Value::as_i64),
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("input"))
+            .and_then(Value::as_i64),
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("output"))
+            .and_then(Value::as_i64),
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("reasoning"))
+            .and_then(Value::as_i64),
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("cache"))
+            .and_then(|cache| cache.get("read"))
+            .and_then(Value::as_i64),
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("cache"))
+            .and_then(|cache| cache.get("write"))
+            .and_then(Value::as_i64),
+        value.get("agent").and_then(Value::as_str),
+        value.get("mode").and_then(Value::as_str),
+    ])
+    .to_string()
+}
+
+/// Extracts one tool part's span fields from its parsed JSON, as the
+/// positional array text the pipeline parses.
+pub(crate) fn extract_part_fields(value: &Value) -> String {
+    serde_json::json!([
+        value.get("type").and_then(Value::as_str),
+        value
+            .get("state")
+            .and_then(|state| state.get("time"))
+            .and_then(|time| time.get("start"))
+            .and_then(Value::as_i64),
+        value
+            .get("state")
+            .and_then(|state| state.get("time"))
+            .and_then(|time| time.get("end"))
+            .and_then(Value::as_i64),
+    ])
+    .to_string()
+}
+
+/// Parses a tool part's extracted fields text.
+fn parse_part_fields(json: &str, location: &str) -> Result<PartFields, BillError> {
+    let values = serde_json::from_str::<Vec<Option<Value>>>(json).map_err(|failure| {
+        BillError::InvalidData {
+            location: location.to_owned(),
+            detail: failure.to_string(),
+        }
+    })?;
+
+    Ok(PartFields::from_array(&values))
+}
+
+/// A timestamp as unsigned millis, `None` when negative or missing.
+fn non_negative(value: Option<i64>) -> Option<u64> {
+    value.and_then(|value| u64::try_from(value).ok())
+}
+
 /// Reads and parses a JSON file.
 pub(crate) fn read_json(path: &Path) -> Result<Value, BillError> {
     let json = fs::read_to_string(path).map_err(|source| read_error(path, source))?;
@@ -54,25 +228,12 @@ pub(crate) fn message_time(value: &Value) -> (Option<u64>, Option<u64>) {
     )
 }
 
-/// Returns the busy span of a tool part, if it ran to completion.
-pub(crate) fn tool_span(value: &Value) -> Option<(u64, u64)> {
-    if value.get("type").and_then(Value::as_str) != Some("tool") {
-        return None;
-    }
-
-    let time = value.get("state").and_then(|state| state.get("time"))?;
-    let start = time.get("start").and_then(Value::as_u64)?;
-    let end = time.get("end").and_then(Value::as_u64)?;
-
-    (end > start).then_some((start, end))
-}
-
 /// One parsed message: its wall-clock bounds plus an internable usage row.
 ///
 /// Parallel workers parse JSON and extract raw strings; interning happens
 /// later in one ordered pass, so handle assignment — and with it the
 /// byte-identical bill output — stays deterministic.
-struct ParsedMessage {
+pub(crate) struct ParsedMessage {
     /// Session id of the message, for ordered interning.
     session_id: String,
     /// Message creation timestamp (Unix millis).
@@ -119,13 +280,16 @@ fn parse_message(
     session_agents: &BTreeMap<String, Option<AgentId>>,
     tools: &ToolSpans,
 ) -> Result<ParsedMessage, BillError> {
-    let value = parse_json(&message.json, &message.location)?;
-    let (created, completed) = message_time(&value);
+    let fields = parse_message_fields(&message.json, &message.location)?;
+    let (created, completed) = (
+        non_negative(fields.time_created),
+        non_negative(fields.time_completed),
+    );
     let session_agent = session_agents.get(&message.session_id).copied().flatten();
 
-    let row = if value.get("role").and_then(Value::as_str) == Some("assistant") {
+    let row = if fields.role.as_deref() == Some("assistant") {
         Some(parse_assistant_row(
-            &value,
+            &fields,
             &message.location,
             session_agent,
             tools.get(&message.id).map_or(&[][..], Vec::as_slice),
@@ -148,41 +312,38 @@ fn parse_message(
 /// interned: the message-level agent fallback is only extracted when the
 /// session declares no agent, so the interning order stays byte-identical.
 fn parse_assistant_row(
-    value: &Value,
+    fields: &MessageFields,
     location: &str,
     session_agent: Option<AgentId>,
     tools: &[(u64, u64)],
 ) -> Result<ParsedRow, BillError> {
-    let tokens = value
-        .get("tokens")
-        .ok_or_else(|| invalid_field(location, "tokens"))?;
-    let cache = tokens
-        .get("cache")
-        .ok_or_else(|| invalid_field(location, "tokens.cache"))?;
-    let provider = required_string(value, "providerID", location)?;
-    let model = required_string(value, "modelID", location)?;
+    let provider = required_envelope_string(&fields.providerID, location, "providerID")?;
+    let model = required_envelope_string(&fields.modelID, location, "modelID")?;
     let usage = Tokens {
-        input: required_u64(tokens, "input", location)?,
-        output: required_u64(tokens, "output", location)?,
-        reasoning: required_u64(tokens, "reasoning", location)?,
-        cache_read: required_u64(cache, "read", location)?,
-        cache_write: required_u64(cache, "write", location)?,
+        input: required_envelope_u64(fields.tokens_input, location, "tokens.input")?,
+        output: required_envelope_u64(fields.tokens_output, location, "tokens.output")?,
+        reasoning: required_envelope_u64(fields.tokens_reasoning, location, "tokens.reasoning")?,
+        cache_read: required_envelope_u64(fields.cache_read, location, "tokens.cache.read")?,
+        cache_write: required_envelope_u64(fields.cache_write, location, "tokens.cache.write")?,
     };
     let message_agent = if session_agent.is_some() {
         None
     } else {
         Some(
-            value
-                .get("agent")
-                .and_then(Value::as_str)
-                .or_else(|| value.get("mode").and_then(Value::as_str))
+            fields
+                .agent
+                .as_deref()
+                .or(fields.mode.as_deref())
                 .filter(|agent| !agent.is_empty())
                 .unwrap_or("unknown")
                 .to_owned(),
         )
     };
-    let (created, completed) = message_time(value);
-    let cost = required_f64(value, "cost", location)?;
+    let (created, completed) = (
+        non_negative(fields.time_created),
+        non_negative(fields.time_completed),
+    );
+    let cost = fields.cost.ok_or_else(|| invalid_field(location, "cost"))?;
 
     if !cost.is_finite() {
         return Err(invalid_field(location, "cost must be finite"));
@@ -212,6 +373,27 @@ fn parse_assistant_row(
     })
 }
 
+/// Reads a required non-empty typed string field.
+fn required_envelope_string(
+    field: &Option<String>,
+    location: &str,
+    name: &str,
+) -> Result<String, BillError> {
+    field
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_field(location, name))
+}
+
+/// Reads a required typed integer field, clamping negative corrections to
+/// zero.
+fn required_envelope_u64(field: Option<i64>, location: &str, name: &str) -> Result<u64, BillError> {
+    field
+        .map(|count| u64::try_from(count.max(0)).unwrap_or(0))
+        .ok_or_else(|| invalid_field(location, name))
+}
+
 /// Reads a required non-empty string field.
 pub(crate) fn required_string(
     value: &Value,
@@ -223,26 +405,6 @@ pub(crate) fn required_string(
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| invalid_field(location, field))
-}
-
-/// Reads a required integer field, clamping negative corrections to zero.
-fn required_u64(value: &Value, field: &str, location: &str) -> Result<u64, BillError> {
-    value
-        .get(field)
-        .and_then(|count| {
-            count
-                .as_u64()
-                .or_else(|| count.as_i64().filter(|count| *count < 0).map(|_| 0))
-        })
-        .ok_or_else(|| invalid_field(location, field))
-}
-
-/// Reads a required floating-point field.
-fn required_f64(value: &Value, field: &str, location: &str) -> Result<f64, BillError> {
-    value
-        .get(field)
-        .and_then(Value::as_f64)
         .ok_or_else(|| invalid_field(location, field))
 }
 
@@ -348,14 +510,26 @@ fn parse_tool_spans(
 
     for part in parts {
         progress.parsed_row();
-        let value = parse_json(&part.json, &part.location)?;
+        let fields = parse_part_fields(&part.json, &part.location)?;
 
-        if let Some(span) = tool_span(&value) {
+        if let Some(span) = part_span(&fields) {
             spans.entry(part.message_id).or_default().push(span);
         }
     }
 
     Ok(spans)
+}
+
+/// Returns the busy span of an extracted tool part, if it ran to completion.
+fn part_span(fields: &PartFields) -> Option<(u64, u64)> {
+    if fields.r#type.as_deref() != Some("tool") {
+        return None;
+    }
+
+    let start = non_negative(fields.start)?;
+    let end = non_negative(fields.end)?;
+
+    (end > start).then_some((start, end))
 }
 
 #[cfg(test)]
@@ -381,20 +555,20 @@ mod tests {
                     id: "msg_1".to_owned(),
                     session_id: "ses_abc123456".to_owned(),
                     location: "fixture".to_owned(),
-                    json: r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":0.125,"time":{"created":1000,"completed":3000},"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}}}"#
+                    json: r#"["assistant","openai","gpt-test",0.125,1000,3000,10,4,2,6,1,"build","primary"]"#
                         .to_owned(),
                 },
                 RawMessage {
                     id: "msg_user".to_owned(),
                     session_id: "ses_abc123456".to_owned(),
                     location: "fixture".to_owned(),
-                    json: r#"{"role":"user","time":{"created":500}}"#.to_owned(),
+                    json: r#"["user",null,null,null,500,null,null,null,null,null,null,null,null]"#.to_owned(),
                 },
             ],
             parts: vec![RawPart {
                 message_id: "msg_1".to_owned(),
                 location: "fixture".to_owned(),
-                json: r#"{"type":"tool","state":{"status":"completed","time":{"start":1000,"end":2500}}}"#
+                json: r#"["tool",1000,2500]"#
                     .to_owned(),
             }],
         };
@@ -511,10 +685,8 @@ mod tests {
         Ok(())
     }
 
-    /// Assistant message JSON whose agent comes only from the message.
+    /// Assistant message fields whose agent comes only from the message.
     fn assistant_json(agent: &str) -> String {
-        format!(
-            r#"{{"role":"assistant","agent":"{agent}","providerID":"prov","modelID":"model","cost":0.1,"time":{{"created":1000,"completed":2000}},"tokens":{{"input":1,"output":1,"reasoning":0,"cache":{{"read":0,"write":0}}}}}}"#,
-        )
+        format!(r#"["assistant","prov","model",0.1,1000,2000,1,1,0,0,0,"{agent}",null]"#,)
     }
 }
