@@ -118,15 +118,17 @@ Examples:
     opencode-bill --month --provider openai --provider anthropic
 
 When stdout is a terminal the report is shown with a loading indicator
-that lists the current step (session load, aggregation, pricing lookup)
-until the report is ready; the loading viewport is then erased and the
-styled report table is printed over it from the top, right below your
-shell prompt, so the report replaces the spinner without any blank
-padding, and the app exits. The indicator renders inline in the
-terminal's main buffer instead of an alternate (exclusive) screen: it
-appends below your existing shell output and refreshes in place while it
-runs. Press `q` or Ctrl-C to cancel while it is loading. When stdout is
-piped or redirected the plain-text bill is printed as before.
+that lists the current step (session load, message parsing, pricing
+lookup, aggregation, report build) with live loaded/parsed/aggregated
+row counts and the elapsed time until the report is ready; the loading
+viewport is then erased and the styled report table is printed over it
+from the top, right below your shell prompt, so the report replaces the
+spinner without any blank padding, and the app exits. The indicator
+renders inline in the terminal's main buffer instead of an alternate
+(exclusive) screen: it appends below your existing shell output and
+refreshes in place while it runs. Press `q` or Ctrl-C to cancel while it
+is loading. When stdout is piped or redirected the plain-text bill is
+printed as before.
 
 Build from source
 -----------------
