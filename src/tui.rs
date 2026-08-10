@@ -18,8 +18,8 @@ use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use opencode_bill::{
-    BarGraph, BillError, BillHeader, BillProgress, BillReport, RecentRoot, StorageContext,
-    format_local_iso, graph_lines, load_day_report_with_progress_counted,
+    BarGraph, BillError, BillHeader, BillProgress, BillReport, ESTIMATED_NOTE, RecentRoot,
+    StorageContext, format_local_iso, graph_lines, load_day_report_with_progress_counted,
     load_month_report_with_progress_counted, load_report_with_progress_counted,
     load_week_report_with_progress_counted, load_year_report_with_progress_counted, recent_roots,
 };
@@ -67,7 +67,7 @@ enum Progress {
     /// A work phase is about to start.
     Task(String),
     /// The report is ready, or the failure that stopped it.
-    Done(Result<BillReport, String>),
+    Done(Box<Result<BillReport, String>>),
 }
 
 /// Runs the worker that loads the report in the background.
@@ -138,9 +138,9 @@ async fn worker(
         )),
     };
 
-    let _ = sender.send(Progress::Done(
+    let _ = sender.send(Progress::Done(Box::new(
         result.map_err(|failure| failure.to_string()),
-    ));
+    )));
 }
 
 /// What the UI is showing right now.
@@ -148,7 +148,7 @@ enum View {
     /// Report generation is still running.
     Loading { task: String },
     /// The report is ready and will be printed as a styled table.
-    Ready { report: BillReport },
+    Ready { report: Box<BillReport> },
     /// Report generation failed.
     Failed(String),
 }
@@ -443,8 +443,14 @@ impl App {
         loop {
             match receiver.try_recv() {
                 Ok(Progress::Task(task)) => self.view = View::Loading { task },
-                Ok(Progress::Done(Ok(report))) => self.view = View::Ready { report },
-                Ok(Progress::Done(Err(failure))) => self.view = View::Failed(failure),
+                Ok(Progress::Done(result)) => match *result {
+                    Ok(report) => {
+                        self.view = View::Ready {
+                            report: Box::new(report),
+                        }
+                    }
+                    Err(failure) => self.view = View::Failed(failure),
+                },
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) if matches!(self.view, View::Loading { .. }) => {
                     self.view = View::Failed("report generation stopped unexpectedly".to_owned());
@@ -712,6 +718,9 @@ fn picker_lines(roots: &[RecentRoot], selected: usize) -> Vec<Line<'static>> {
 
 /// Builds every report row as one 11-column table, padded to a shared grid.
 fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
+    debug_assert_eq!(report.usage_rows.len(), report.usage_cost_estimated.len());
+    debug_assert_eq!(report.agent_rows.len(), report.agent_cost_estimated.len());
+
     let mut rows = Vec::new();
 
     // Month, day, week, and year bills carry their label; session bills
@@ -742,7 +751,7 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "API TIME",
         "COST (USD)",
     ]));
-    rows.extend(data_rows(&report.usage_rows));
+    rows.extend(data_rows(&report.usage_rows, &report.usage_cost_estimated));
     rows.push(blank_row());
 
     rows.push(title_row("USAGE BY AGENT CLASS"));
@@ -758,7 +767,7 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "API TIME",
         "COST (USD)",
     ]));
-    rows.extend(data_rows(&report.agent_rows));
+    rows.extend(data_rows(&report.agent_rows, &report.agent_cost_estimated));
     rows.push(blank_row());
 
     if !report.pricing_rows.is_empty() {
@@ -770,7 +779,8 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
             "CACHE WRITE",
             "OUTPUT",
         ]));
-        rows.extend(data_rows(&report.pricing_rows));
+        rows.extend(pricing_data_rows(&report.pricing_rows));
+        rows.push(note_row(ESTIMATED_NOTE));
         rows.push(blank_row());
     }
 
@@ -779,7 +789,11 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
     if report.graphs.is_empty() {
         rows.push(title_row("TOTAL"));
         for (label, value) in &report.totals {
-            rows.push(totals_row(label, value));
+            rows.push(totals_row(
+                label,
+                value,
+                report.amount_due_estimated && label == "Amount due:",
+            ));
         }
     }
 
@@ -916,15 +930,25 @@ fn header_row(headers: &[&str]) -> Row<'static> {
 }
 
 /// Data rows with numeric columns aligned right.
-fn data_rows(rows: &[Vec<String>]) -> Vec<Row<'static>> {
+///
+/// The last column of a marked row is the cost cell: rows whose figure
+/// includes any estimated amount render it in italic.
+fn data_rows(rows: &[Vec<String>], estimated: &[bool]) -> Vec<Row<'static>> {
     rows.iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(index, row)| {
             let cells = row
                 .iter()
                 .enumerate()
                 .map(|(column, cell)| {
+                    let mut line = Line::from(cell.clone());
+
+                    if estimated.get(index).copied().unwrap_or(false) && column + 1 == row.len() {
+                        line = line.style(Style::new().add_modifier(Modifier::ITALIC));
+                    }
+
                     aligned_cell(
-                        Line::from(cell.clone()),
+                        line,
                         if column == 0 {
                             Alignment::Left
                         } else {
@@ -939,14 +963,57 @@ fn data_rows(rows: &[Vec<String>]) -> Vec<Row<'static>> {
         .collect()
 }
 
-/// One dimmed TOTAL row.
-fn totals_row(label: &str, value: &str) -> Row<'static> {
+/// MODEL PRICING rows: every rate comes from an external source, so the
+/// whole row renders in italic to match the asterisk of the plain-text bill.
+fn pricing_data_rows(rows: &[Vec<String>]) -> Vec<Row<'static>> {
+    rows.iter()
+        .map(|row| {
+            let cells = row
+                .iter()
+                .enumerate()
+                .map(|(column, cell)| {
+                    aligned_cell(
+                        Line::from(cell.clone()).style(Style::new().add_modifier(Modifier::ITALIC)),
+                        if column == 0 {
+                            Alignment::Left
+                        } else {
+                            Alignment::Right
+                        },
+                    )
+                })
+                .collect();
+
+            padded_row(cells, Style::default())
+        })
+        .collect()
+}
+
+/// One dimmed TOTAL row; the amount-due value turns italic when it includes
+/// any estimated cost.
+fn totals_row(label: &str, value: &str, estimated: bool) -> Row<'static> {
+    let mut value_style = Style::default();
+
+    if estimated {
+        value_style = value_style.add_modifier(Modifier::ITALIC);
+    }
+
     let cells = vec![
         Cell::from(label.to_owned()),
-        aligned_cell(Line::from(value.to_owned()), Alignment::Right),
+        aligned_cell(
+            Line::from(value.to_owned()).style(value_style),
+            Alignment::Right,
+        ),
     ];
 
     padded_row(cells, Style::new().fg(Color::DarkGray))
+}
+
+/// One dimmed footnote row explaining the estimated marker.
+fn note_row(note: &str) -> Row<'static> {
+    padded_row(
+        vec![Cell::from(note.to_owned())],
+        Style::new().fg(Color::DarkGray),
+    )
 }
 
 /// One dimmed session-identity row: the root id and its creation time.
@@ -1103,6 +1170,9 @@ mod tests {
                 "$0.125000".to_owned(),
             ]],
             pricing_rows: Vec::new(),
+            usage_cost_estimated: vec![false],
+            agent_cost_estimated: vec![false],
+            amount_due_estimated: false,
             totals: vec![
                 ("Requests:".to_owned(), "1".to_owned()),
                 ("Amount due:".to_owned(), "$0.125000 USD".to_owned()),
@@ -1118,6 +1188,135 @@ mod tests {
         // title + id rows, usage header + row + blank, agent title + header +
         // row + blank, total title + 2 rows.
         assert_eq!(rows.len(), 12);
+    }
+
+    #[test]
+    fn italicizes_estimated_cost_cells() {
+        let mut report = fixture_report();
+        report.usage_cost_estimated = vec![true];
+        let buffer = render_rows(build_rows(&report));
+
+        // The usage data row is the fourth table row; the cost column is the
+        // ninth of the 11-column grid.
+        assert!(
+            buffer[(cost_column_x(), 3)]
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC),
+            "cost cell of an estimated row should be italic"
+        );
+        assert!(
+            !buffer[(0, 3)]
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC),
+            "model cell of an estimated row stays plain"
+        );
+
+        report.usage_cost_estimated = vec![false];
+        let buffer = render_rows(build_rows(&report));
+
+        assert!(
+            !buffer[(cost_column_x(), 3)]
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC),
+            "cost cell of a historic-only row stays plain"
+        );
+    }
+
+    #[test]
+    fn italicizes_whole_pricing_rows() {
+        let mut report = fixture_report();
+
+        report.pricing_rows = vec![vec![
+            "openai / gpt-test*".to_owned(),
+            "$1.250".to_owned(),
+            "$0.125".to_owned(),
+            "-".to_owned(),
+            "$5.000".to_owned(),
+        ]];
+        let buffer = render_rows(build_rows(&report));
+
+        // The pricing data row is the 12th table row; the model cell sits at
+        // column zero, the first rate cell at the second column.
+        let pricing_y = 11;
+        assert!(
+            buffer[(0, pricing_y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC)
+                && buffer[(model_rate_x(), pricing_y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::ITALIC),
+            "every cell of a pricing row should be italic"
+        );
+    }
+
+    #[test]
+    fn italicizes_estimated_amount_due() {
+        let mut report = fixture_report();
+
+        report.amount_due_estimated = true;
+        let buffer = render_rows(build_rows(&report));
+
+        // The amount-due row is the last row; its value sits in the second
+        // column of the 11-column grid.
+        assert!(
+            buffer[(model_rate_x(), 11)]
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC),
+            "the amount-due value of an estimated bill should be italic"
+        );
+    }
+
+    #[test]
+    fn adds_estimated_note_after_pricing_table() {
+        let mut report = fixture_report();
+
+        report.pricing_rows = vec![vec![
+            "openai / gpt-test*".to_owned(),
+            "$1.250".to_owned(),
+            "$0.125".to_owned(),
+            "-".to_owned(),
+            "$5.000".to_owned(),
+        ]];
+        let buffer = render_rows(build_rows(&report));
+
+        // The note row comes right after the pricing data row.
+        let note_line = render_row(&buffer, 12, table_natural_width());
+
+        assert!(
+            note_line.contains(ESTIMATED_NOTE),
+            "the estimated note should appear after the pricing table: {note_line}"
+        );
+    }
+
+    /// Renders report rows into a buffer of the natural table width.
+    fn render_rows(rows: Vec<Row<'static>>) -> Buffer {
+        let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), height));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), height),
+            &mut buffer,
+            &mut table_state,
+        );
+        buffer
+    }
+
+    /// X offset of the cost column (8) in the unified grid.
+    fn cost_column_x() -> u16 {
+        COLUMN_WIDTHS[..8].iter().sum::<u16>() + COLUMN_SPACING * 8
+    }
+
+    /// X offset of the first numeric column (1) in the unified grid.
+    fn model_rate_x() -> u16 {
+        COLUMN_WIDTHS[..1].iter().sum::<u16>() + COLUMN_SPACING
     }
 
     #[test]
