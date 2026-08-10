@@ -126,6 +126,10 @@ async fn worker(
             },
             &counters,
         ),
+        // Unreachable: run() resolves a pick before spawning the worker.
+        crate::Request::Pick => Err(BillError::InvalidSessionReference(
+            "the session picker is resolved before billing".to_owned(),
+        )),
     };
 
     let _ = sender.send(Progress::Done(

@@ -87,6 +87,9 @@ enum Request {
     Day(u32, u32, u32),
     /// One ISO calendar week of the current year.
     Week(u32, u32),
+    /// No window was requested: on a terminal, pick one of the most recent
+    /// root sessions interactively.
+    Pick,
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -97,6 +100,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None => StorageContext::builder().platform_data_dir()?.build()?,
     };
     let today = chrono::Local::now().date_naive();
+    let has_session = arguments.session.is_some();
     let request = resolve_request(
         arguments.month,
         arguments.year,
@@ -107,6 +111,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if io::stdout().is_terminal() {
+        // A bare invocation on a terminal opens the interactive root-session
+        // picker; an explicit --month/--year/--week/--today or a session (or
+        // --month without a value, clap's Some(0)) still bills that window.
+        let request = if wants_picker(
+            arguments.month,
+            arguments.year,
+            arguments.today,
+            arguments.week,
+            has_session,
+        ) {
+            Request::Pick
+        } else {
+            request
+        };
+
         return match tui::run(context, request, arguments.providers).await? {
             tui::TuiOutcome::Success => Ok(()),
             tui::TuiOutcome::Failed(failure) => Err(failure.into()),
@@ -122,12 +141,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             generate_daily_bill(&context, *year, *month, *day, providers)?
         }
         Request::Week(year, week) => generate_weekly_bill(&context, *year, *week, providers)?,
+        // Unreachable: the picker only runs on a terminal.
+        Request::Pick => return Err("cannot pick a session without a terminal".into()),
     };
     let mut stdout = io::stdout().lock();
 
     stdout.write_all(bill.as_bytes())?;
     stdout.flush()?;
     Ok(())
+}
+
+/// Whether a bare invocation should open the interactive root picker.
+///
+/// True only when no window flag and no session argument at all were given
+/// (month is `None`, not `Some(0)` — `--month` without a value is still an
+/// explicit request for the current month), so every existing window bill
+/// keeps its behavior.
+fn wants_picker(
+    month: Option<u8>,
+    year: Option<u32>,
+    today: bool,
+    week: Option<u8>,
+    has_session: bool,
+) -> bool {
+    month.is_none() && year.is_none() && !today && week.is_none() && !has_session
 }
 
 /// Map the CLI arguments to one bill request.
@@ -194,6 +231,21 @@ mod tests {
             resolve_request(None, None, false, None, None, today),
             Request::Month(2026, 8)
         );
+    }
+
+    #[test]
+    fn bare_invocation_opens_the_picker() {
+        assert!(wants_picker(None, None, false, None, false));
+    }
+
+    #[test]
+    fn every_window_arg_and_session_skips_the_picker() {
+        assert!(!wants_picker(Some(0), None, false, None, false));
+        assert!(!wants_picker(Some(2), None, false, None, false));
+        assert!(!wants_picker(None, Some(0), false, None, false));
+        assert!(!wants_picker(None, None, true, None, false));
+        assert!(!wants_picker(None, None, false, Some(0), false));
+        assert!(!wants_picker(None, None, false, None, true));
     }
 
     #[test]
