@@ -20,7 +20,7 @@ with negative costs are clamped to zero and never re-priced.
 
 Sections in the bill include:
 
-  * Session ID, title, and message count
+  * Session ID, title, creation time, and message count
   * Usage per provider / model (tokens, cost, API time)
   * Usage per agent (tokens, cost, API time)
   * Pricing table for each model used
@@ -82,7 +82,9 @@ Usage
   session-id-or-prefix   Full OpenCode session ID or a unique prefix
                          (minimum 6 characters). With no session argument,
                          no --month, no --year, no --week, and no --today,
-                         the current month is billed.
+                         a terminal shows an interactive picker of the most
+                         recent root sessions; without a terminal the
+                         current month is billed.
 
   --month [MONTH]        Bill the calendar month (1-12) of the current
                          year instead of one session and its sub-agents.
@@ -90,11 +92,13 @@ Usage
                          every session with messages in that window is
                          included; no session argument is required. This
                          is also what a bare `opencode-bill` (no arguments)
-                         does. The report replaces the TOTAL table with one
-                         bar graph per total metric: each graph has a
-                         vertical bar for every calendar week the month
-                         spans (four to six) plus the month total as a
-                         value (the total is not a bar).
+                         does when stdout is piped or redirected (on a
+                         terminal it opens the session picker instead). The
+                         report replaces the TOTAL table with one bar graph
+                         per total metric: each graph has a vertical bar
+                         for every calendar week the month spans (four to
+                         six) plus the month total as a value (the total is
+                         not a bar).
 
   --year [YEAR]          Bill the calendar year instead of one session
                          and its sub-agents. With no value the current
@@ -182,6 +186,16 @@ renders inline in the terminal's main buffer instead of an alternate
 refreshes in place while it runs. Press `q` or Ctrl-C to cancel while it
 is loading. When stdout is piped or redirected the plain-text bill is
 printed as before.
+
+A bare `opencode-bill` on a terminal opens an interactive picker listing
+the eight most recent root sessions (sessions without a parent), one per
+row with the session creation time first and the title after; the
+selected row is highlighted. Press `↑`/`↓` or `j`/`k` to move, `Enter`
+or a digit `1`-`8` to bill that session, and `q`, `Q`, `Esc`, or Ctrl-C
+to quit without billing anything. After the pick, the loading box and
+the report replace the menu in place, and the report table gains a
+session title row plus an id/creation-time row at the top. Quitting the
+picker prints nothing and exits cleanly.
 
 Build from source
 -----------------

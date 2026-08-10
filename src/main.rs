@@ -17,12 +17,13 @@ mod tui;
 #[command(
     name = "opencode-bill",
     version,
-    about = "Generate a bill for an OpenCode session, calendar month, calendar week, calendar year, or calendar day"
+    about = "Generate a bill for an OpenCode session, calendar month, calendar week, calendar year, or calendar day; with no arguments and a terminal, pick one of the most recent root sessions interactively"
 )]
 struct Arguments {
-    /// Full OpenCode session ID or a unique prefix; with no session, no
-    /// --month, no --year, no --week, and no --today the current month is
-    /// billed
+    /// Full OpenCode session ID or a unique prefix. With no session, no
+    /// --month, no --year, no --week, and no --today, a terminal shows an
+    /// interactive picker of the most recent root sessions; without a
+    /// terminal the current month is billed.
     #[arg(conflicts_with = "month")]
     session: Option<String>,
 
