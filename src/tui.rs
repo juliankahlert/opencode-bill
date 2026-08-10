@@ -56,7 +56,7 @@ const COLUMNS: usize = 11;
 /// width must fit the longest header that lands in that column: col2 carries
 /// "CACHE READ" in the pricing table, col3 carries "CACHE WRITE" in pricing,
 /// col5 carries "CACHE WRITE" in the agent table.
-const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 10, 11, 11, 11, 10, 10, 10, 11, 11];
+const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 10, 11, 11, 11, 10, 10, 12, 13, 11];
 /// Spaces between adjacent table columns.
 const COLUMN_SPACING: u16 = 2;
 /// Horizontal gap between adjacent graph blocks in the year grid.
@@ -1569,7 +1569,7 @@ mod tests {
 
     #[test]
     fn computes_natural_table_width() {
-        assert_eq!(table_natural_width(), 169);
+        assert_eq!(table_natural_width(), 173);
     }
 
     #[test]
