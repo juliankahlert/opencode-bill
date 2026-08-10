@@ -585,6 +585,11 @@ pub(crate) struct Totals {
     pub(crate) tokens: Tokens,
     /// Summed cost in micro-dollars.
     pub(crate) cost: Cost,
+    /// Summed portion of `cost` estimated from external list prices.
+    ///
+    /// Only zero-cost calls with a known rate contribute; the rest of
+    /// `cost` is historic per-message pricing recorded in the bill data.
+    pub(crate) estimated_cost: Cost,
     /// Summed endpoint-busy time in milliseconds.
     pub(crate) api_ms: u64,
     /// Earliest wall-clock start (Unix millis).
@@ -599,6 +604,7 @@ impl Default for Totals {
             requests: 0,
             tokens: Tokens::default(),
             cost: cost_from_micros(0),
+            estimated_cost: cost_from_micros(0),
             api_ms: 0,
             wall_start: None,
             wall_end: None,
@@ -612,6 +618,9 @@ impl Totals {
         self.requests += 1;
         self.tokens += &row.tokens;
         self.cost = cost_add(self.cost, cost_from_micros(row.cost_micros));
+        if row.cost_unknown && row.cost_micros > 0 {
+            self.estimated_cost = cost_add(self.estimated_cost, cost_from_micros(row.cost_micros));
+        }
         self.api_ms = self.api_ms.saturating_add(row.api_ms);
         self.wall_start = earliest(self.wall_start, row.created);
         self.wall_end = latest(self.wall_end, row.completed.or(row.created));
@@ -622,6 +631,7 @@ impl Totals {
         self.requests += other.requests;
         self.tokens += &other.tokens;
         self.cost = cost_add(self.cost, other.cost);
+        self.estimated_cost = cost_add(self.estimated_cost, other.estimated_cost);
         self.api_ms = self.api_ms.saturating_add(other.api_ms);
         self.wall_start = earliest(self.wall_start, other.wall_start);
         self.wall_end = latest(self.wall_end, other.wall_end);
