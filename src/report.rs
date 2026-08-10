@@ -11,6 +11,15 @@ use crate::timing::{format_duration, format_timestamp, span_ms};
 const MILLION: u64 = 1_000_000;
 const THOUSAND: u64 = 1_000;
 
+/// Footnote for every value marked with an asterisk in a bill.
+///
+/// The marker means the figure was estimated from external list prices, not
+/// read from the recorded bill data: cost cells carry it when their total
+/// includes any estimated amount, and every MODEL PRICING row carries it
+/// because rates always come from external sources.  Short enough to fit
+/// the TUI's first table column.
+pub const ESTIMATED_NOTE: &str = "* = estimated from external list prices";
+
 /// Identifies the period a bill covers.
 #[derive(Clone)]
 pub enum BillHeader {
@@ -94,6 +103,17 @@ pub struct BillReport {
     pub agent_rows: Vec<Vec<String>>,
     /// One pricing row per priced model.
     pub pricing_rows: Vec<Vec<String>>,
+    /// Whether each usage row's cost cell includes an estimated amount.
+    ///
+    /// Parallel to [`Self::usage_rows`]; the renderers use it to emphasize
+    /// the cell (italic in the TUI).
+    pub usage_cost_estimated: Vec<bool>,
+    /// Whether each agent row's cost cell includes an estimated amount.
+    ///
+    /// Parallel to [`Self::agent_rows`].
+    pub agent_cost_estimated: Vec<bool>,
+    /// Whether the Amount due figure includes any estimated amount.
+    pub amount_due_estimated: bool,
     /// Label/value pairs of the TOTAL section.
     pub totals: Vec<(String, String)>,
     /// One bar graph per total metric; the year bill's and the month bill's
@@ -114,24 +134,46 @@ pub(crate) fn build_report(
     graphs: &[BarGraph],
     interner: &Interner,
 ) -> BillReport {
+    let usage = sorted_usage(by_model, interner);
+    let agents = sorted_agents(by_agent, interner);
+    let usage_estimated = usage
+        .iter()
+        .map(|(_, totals)| has_estimated_cost(totals))
+        .collect::<Vec<_>>();
+    let agent_estimated = agents
+        .iter()
+        .map(|(_, usage)| has_estimated_cost(&usage.totals))
+        .collect::<Vec<_>>();
+
+    debug_assert_eq!(usage.len(), usage_estimated.len());
+    debug_assert_eq!(agents.len(), agent_estimated.len());
+
     BillReport {
         header: world.header.clone(),
         session_count: world.session_count,
-        usage_rows: sorted_usage(by_model, interner)
-            .into_iter()
-            .map(|entry| usage_row(entry, interner))
+        usage_rows: usage
+            .iter()
+            .map(|entry| usage_row(*entry, interner))
             .collect(),
-        agent_rows: sorted_agents(by_agent, interner)
-            .into_iter()
-            .map(|entry| agent_row(entry, interner))
+        agent_rows: agents
+            .iter()
+            .map(|entry| agent_row(*entry, interner))
             .collect(),
         pricing_rows: sorted_usage(pricing, interner)
             .into_iter()
             .map(|entry| pricing_row(entry, interner))
             .collect(),
+        usage_cost_estimated: usage_estimated,
+        agent_cost_estimated: agent_estimated,
+        amount_due_estimated: has_estimated_cost(total),
         totals: total_rows(world, total),
         graphs: graphs.to_vec(),
     }
+}
+
+/// Whether a total includes any estimated (externally priced) cost.
+fn has_estimated_cost(totals: &Totals) -> bool {
+    cost_to_micros(totals.estimated_cost) > 0
 }
 
 /// One label per month, January first; the year graphs' bar labels.
@@ -470,7 +512,7 @@ fn usage_row(entry: (&ModelKey, &Totals), interner: &Interner) -> Vec<String> {
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format_cost(cost_to_micros(totals.cost)),
+        marked_cost(cost_to_micros(totals.cost), has_estimated_cost(totals)),
     ]
 }
 
@@ -489,7 +531,7 @@ fn agent_row(entry: (&AgentId, &AgentUsage), interner: &Interner) -> Vec<String>
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
-        format_cost(cost_to_micros(totals.cost)),
+        marked_cost(cost_to_micros(totals.cost), has_estimated_cost(totals)),
     ]
 }
 
@@ -498,8 +540,10 @@ fn pricing_row(entry: (&ModelKey, &ModelRates), interner: &Interner) -> Vec<Stri
     let ((provider, model), rates) = entry;
 
     vec![
+        // Every rate comes from an external source, never from the parsed
+        // bill data, so the whole row carries the estimated marker.
         format!(
-            "{} / {}",
+            "{} / {}*",
             interner.resolve_provider(*provider),
             interner.resolve_model(*model)
         ),
@@ -508,6 +552,18 @@ fn pricing_row(entry: (&ModelKey, &ModelRates), interner: &Interner) -> Vec<Stri
         format_rate(rates.cache_write),
         format_rate(rates.output),
     ]
+}
+
+/// A cost figure with the estimated marker appended when it includes any
+/// externally priced amount.
+fn marked_cost(cost_micros: i64, estimated: bool) -> String {
+    let mut cost = format_cost(cost_micros);
+
+    if estimated {
+        cost.push('*');
+    }
+
+    cost
 }
 
 /// Label/value pairs of the TOTAL section.
@@ -549,7 +605,10 @@ fn total_rows(world: &World, total: &Totals) -> Vec<(String, String)> {
     }
     rows.push((
         "Amount due:".to_owned(),
-        format!("{} USD", format_cost(cost_to_micros(total.cost))),
+        format!(
+            "{} USD",
+            marked_cost(cost_to_micros(total.cost), has_estimated_cost(total))
+        ),
     ));
 
     rows
@@ -895,7 +954,152 @@ mod tests {
         assert_eq!(report.usage_rows[1][0], "zzz-provider / zzz-model");
         assert_eq!(report.agent_rows[0][0], "aaa-agent");
         assert_eq!(report.agent_rows[1][0], "zzz-agent");
-        assert_eq!(report.pricing_rows[0][0], "aaa-provider / aaa-model");
-        assert_eq!(report.pricing_rows[1][0], "zzz-provider / zzz-model");
+        assert_eq!(report.pricing_rows[0][0], "aaa-provider / aaa-model*");
+        assert_eq!(report.pricing_rows[1][0], "zzz-provider / zzz-model*");
+    }
+
+    #[test]
+    fn marks_estimated_cost_cells_and_amount_due() {
+        use crate::data::cost_from_micros;
+
+        let mut interner = Interner::default();
+        let provider = interner.intern_provider("openai");
+        let model = interner.intern_model("gpt-test");
+        let agent = interner.intern_agent("build");
+
+        // The model row and the total mix historic and estimated cost; the
+        // agent row is purely historic.
+        let estimated = Totals {
+            cost: cost_from_micros(5_000_000),
+            estimated_cost: cost_from_micros(2_000_000),
+            ..Totals::default()
+        };
+        let historic = Totals {
+            cost: cost_from_micros(3_000_000),
+            ..Totals::default()
+        };
+        let total = Totals {
+            cost: cost_from_micros(8_000_000),
+            estimated_cost: cost_from_micros(2_000_000),
+            ..Totals::default()
+        };
+
+        let mut by_model = BTreeMap::new();
+        by_model.insert((provider, model), estimated);
+        let mut by_agent = BTreeMap::new();
+        by_agent.insert(
+            agent,
+            AgentUsage {
+                sessions: Default::default(),
+                totals: historic,
+            },
+        );
+        let mut pricing = BTreeMap::new();
+        pricing.insert(
+            (provider, model),
+            ModelRates {
+                input: Some(1.0),
+                cache_read: None,
+                cache_write: None,
+                output: Some(2.0),
+            },
+        );
+
+        let world = World {
+            header: BillHeader::Session {
+                id: "ses".to_owned(),
+                title: "Test".to_owned(),
+                created_ms: None,
+            },
+            session_count: 1,
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner: Interner::default(),
+        };
+        let report = build_report(
+            &world,
+            &by_model,
+            &by_agent,
+            &total,
+            &pricing,
+            &[],
+            &interner,
+        );
+
+        assert_eq!(report.usage_cost_estimated, [true]);
+        assert_eq!(report.usage_rows[0][8], "$5.000000*");
+        assert_eq!(report.agent_cost_estimated, [false]);
+        assert_eq!(report.agent_rows[0][9], "$3.000000");
+        assert!(report.amount_due_estimated);
+        let amount_due = &report.totals.last().expect("amount due row").1;
+        assert_eq!(amount_due, "$8.000000* USD");
+        assert_eq!(report.pricing_rows[0][0], "openai / gpt-test*");
+    }
+
+    #[test]
+    fn leaves_historic_only_bills_unmarked() {
+        use crate::data::cost_from_micros;
+
+        let mut interner = Interner::default();
+        let provider = interner.intern_provider("openai");
+        let model = interner.intern_model("gpt-test");
+        let agent = interner.intern_agent("build");
+        let historic = Totals {
+            cost: cost_from_micros(3_000_000),
+            ..Totals::default()
+        };
+
+        let mut by_model = BTreeMap::new();
+        by_model.insert((provider, model), historic);
+        let mut by_agent = BTreeMap::new();
+        by_agent.insert(
+            agent,
+            AgentUsage {
+                sessions: Default::default(),
+                totals: historic,
+            },
+        );
+        let mut pricing = BTreeMap::new();
+        pricing.insert(
+            (provider, model),
+            ModelRates {
+                input: Some(1.0),
+                cache_read: None,
+                cache_write: None,
+                output: Some(2.0),
+            },
+        );
+
+        let world = World {
+            header: BillHeader::Session {
+                id: "ses".to_owned(),
+                title: "Test".to_owned(),
+                created_ms: None,
+            },
+            session_count: 1,
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner: Interner::default(),
+        };
+        let report = build_report(
+            &world,
+            &by_model,
+            &by_agent,
+            &historic,
+            &pricing,
+            &[],
+            &interner,
+        );
+
+        assert_eq!(report.usage_cost_estimated, [false]);
+        assert_eq!(report.usage_rows[0][8], "$3.000000");
+        assert_eq!(report.agent_cost_estimated, [false]);
+        assert!(!report.amount_due_estimated);
+        let amount_due = &report.totals.last().expect("amount due row").1;
+        assert_eq!(amount_due, "$3.000000 USD");
     }
 }

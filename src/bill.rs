@@ -1588,9 +1588,9 @@ AGENT   | SESSIONS | REQUESTS | INPUT | CACHE READ | CACHE WRITE | OUTPUT | REAS
 unknown |        1 |        1 |    10 |          6 |           1 |      4 |         2 |      0ms |  $0.125000
 
 MODEL PRICING (USD / 1M TOKENS)
-PROVIDER / MODEL  |  INPUT | CACHE READ | CACHE WRITE | OUTPUT
-------------------+--------+------------+-------------+-------
-openai / gpt-test | $1.250 |     $0.125 |           - | $5.000
+PROVIDER / MODEL   |  INPUT | CACHE READ | CACHE WRITE | OUTPUT
+-------------------+--------+------------+-------------+-------
+openai / gpt-test* | $1.250 |     $0.125 |           - | $5.000
 
 TOTAL
 Requests:    1
@@ -1843,7 +1843,7 @@ Amount due:  $0.125000 USD
         assert!(bill.contains("MODEL PRICING (USD / 1M TOKENS)"));
         assert!(has_table_row(
             &bill,
-            &["openai / gpt-test", "$1.250", "$0.125", "-", "$5.000"]
+            &["openai / gpt-test*", "$1.250", "$0.125", "-", "$5.000"]
         ));
         Ok(())
     }
@@ -2847,10 +2847,10 @@ Amount due:  $0.125000 USD
                 "4",
                 "2",
                 "0ms",
-                "$0.000043"
+                "$0.000043*"
             ]
         ));
-        assert!(bill.contains("Amount due:  $0.000043 USD"));
+        assert!(bill.contains("Amount due:  $0.000043* USD"));
         Ok(())
     }
 
@@ -3126,7 +3126,7 @@ Amount due:  $0.125000 USD
         assert!(bill.contains("MODEL PRICING (USD / 1M TOKENS)"));
         assert!(has_table_row(
             &bill,
-            &["openai / gpt-test", "$1.250", "$0.125", "-", "$5.000"]
+            &["openai / gpt-test*", "$1.250", "$0.125", "-", "$5.000"]
         ));
         assert!(!bill.contains("claude-test"));
         Ok(())
@@ -3155,7 +3155,7 @@ Amount due:  $0.125000 USD
         assert!(bill.contains("MODEL PRICING (USD / 1M TOKENS)"));
         assert!(has_table_row(
             &bill,
-            &["openai / gpt-test", "$1.250", "$0.125", "-", "$5.000"]
+            &["openai / gpt-test*", "$1.250", "$0.125", "-", "$5.000"]
         ));
         Ok(())
     }
