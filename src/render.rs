@@ -1,7 +1,9 @@
 //! Plain-text bill rendering from the structured report data.
 
 use crate::error::BillError;
-use crate::report::{BarGraph, BillHeader, BillReport, MetricKind, compact_count, format_cost};
+use crate::report::{
+    BarGraph, BillHeader, BillReport, ESTIMATED_NOTE, MetricKind, compact_count, format_cost,
+};
 use crate::timing::format_duration;
 
 /// Height of a bar graph in rows, one bar row per character.
@@ -103,6 +105,8 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
             ],
             &report.pricing_rows,
         )?);
+        output.push_str(ESTIMATED_NOTE);
+        output.push('\n');
     }
 
     if report.graphs.is_empty() {

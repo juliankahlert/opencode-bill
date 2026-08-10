@@ -1591,6 +1591,7 @@ MODEL PRICING (USD / 1M TOKENS)
 PROVIDER / MODEL   |  INPUT | CACHE READ | CACHE WRITE | OUTPUT
 -------------------+--------+------------+-------------+-------
 openai / gpt-test* | $1.250 |     $0.125 |           - | $5.000
+* = estimated from external list prices
 
 TOTAL
 Requests:    1
