@@ -40,3 +40,4 @@ pub use error::BillError;
 pub use render::{graph_lines, render_bill};
 pub use report::{BarGraph, BillHeader, BillReport, MetricKind};
 pub use store::RecentRoot;
+pub use timing::format_local_iso;

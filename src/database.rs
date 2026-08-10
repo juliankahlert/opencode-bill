@@ -31,6 +31,7 @@ impl SessionStore for SqliteStore {
         let matches = database_matches(&connection, &self.path, reference)?;
         let id = unique_match(reference, matches)?;
         let title = database_title(&connection, &self.path, &id)?;
+        let created_ms = database_created_ms(&connection, &self.path, &id)?;
         let sessions = database_session_rows(&connection, &self.path, &id, progress)?;
         let session_count = sessions.len();
         let parts = database_tool_parts(&connection, &self.path, &id, progress)?;
@@ -41,7 +42,11 @@ impl SessionStore for SqliteStore {
             messages.len()
         );
         Ok(RawLoad {
-            header: BillHeader::Session { id, title },
+            header: BillHeader::Session {
+                id,
+                title,
+                created_ms,
+            },
             session_count,
             sessions,
             messages,
@@ -323,6 +328,30 @@ fn database_title(connection: &Connection, path: &Path, id: &str) -> Result<Stri
         .optional()
         .map_err(|source| database_error(path, source))?
         .ok_or_else(|| BillError::SessionNotFound(id.to_owned()))
+}
+
+/// Creation time of one session row, when its table stores it.
+///
+/// Schemas that predate the `time_created` column yield `None` instead of a
+/// broken query.
+fn database_created_ms(
+    connection: &Connection,
+    path: &Path,
+    id: &str,
+) -> Result<Option<i64>, BillError> {
+    if !database_has_column(connection, path, "session", "time_created")? {
+        return Ok(None);
+    }
+
+    connection
+        .query_row(
+            "SELECT time_created FROM session WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|source| database_error(path, source))
+        .map(|created| created.flatten())
 }
 
 /// Raw session rows of one root: every descendant with its agent component,

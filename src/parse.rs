@@ -720,6 +720,7 @@ mod tests {
             header: BillHeader::Session {
                 id: "ses_abc123456".to_owned(),
                 title: "Test session".to_owned(),
+                created_ms: None,
             },
             session_count: 1,
             sessions: vec![RawSession {
@@ -846,6 +847,7 @@ mod tests {
             header: BillHeader::Session {
                 id: "ses_abc123456".to_owned(),
                 title: "Test session".to_owned(),
+                created_ms: None,
             },
             session_count: 1,
             sessions: vec![RawSession {

@@ -1315,7 +1315,7 @@ mod tests {
             ]
         );
         match &report.header {
-            crate::report::BillHeader::Session { id, title } => {
+            crate::report::BillHeader::Session { id, title, .. } => {
                 assert_eq!(id, "ses_abcdef123456");
                 assert_eq!(title, "Test session");
             }

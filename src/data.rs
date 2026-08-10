@@ -820,6 +820,7 @@ mod tests {
             header: BillHeader::Session {
                 id: "ses_root".to_owned(),
                 title: "Test".to_owned(),
+                created_ms: None,
             },
             session_count: 2,
             sessions,

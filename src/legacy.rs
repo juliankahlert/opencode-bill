@@ -38,6 +38,10 @@ impl SessionStore for LegacyStore {
         let session_json = read_json(&session_path)?;
         let id = required_string(&session_json, "id", &session_path.display().to_string())?;
         let title = required_string(&session_json, "title", &session_path.display().to_string())?;
+        let created_ms = session_json
+            .get("time")
+            .and_then(|time| time.get("created"))
+            .and_then(serde_json::Value::as_i64);
         let tree = legacy_session_tree(&session_root, &id)?;
         let session_count = tree.len();
         let (sessions, messages, parts) = tree.iter().try_fold(
@@ -63,7 +67,11 @@ impl SessionStore for LegacyStore {
             session_count
         );
         Ok(RawLoad {
-            header: BillHeader::Session { id, title },
+            header: BillHeader::Session {
+                id,
+                title,
+                created_ms,
+            },
             session_count,
             sessions,
             messages,

@@ -20,6 +20,9 @@ pub enum BillHeader {
         id: String,
         /// Root session title.
         title: String,
+        /// Root session creation time (Unix milliseconds), when the store
+        /// records one.
+        created_ms: Option<i64>,
     },
     /// One calendar month, identified by its label.
     Month {
@@ -602,6 +605,7 @@ mod tests {
             header: BillHeader::Session {
                 id: "ses".to_owned(),
                 title: "Test".to_owned(),
+                created_ms: None,
             },
             session_count: 1,
             sessions: SessionTree::new(),
@@ -868,6 +872,7 @@ mod tests {
             header: BillHeader::Session {
                 id: "ses".to_owned(),
                 title: "Test".to_owned(),
+                created_ms: None,
             },
             session_count: 0,
             sessions: SessionTree::new(),

@@ -18,10 +18,10 @@ use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use opencode_bill::{
-    BarGraph, BillHeader, BillProgress, BillReport, StorageContext, graph_lines,
-    load_day_report_with_progress_counted, load_month_report_with_progress_counted,
-    load_report_with_progress_counted, load_week_report_with_progress_counted,
-    load_year_report_with_progress_counted,
+    BarGraph, BillError, BillHeader, BillProgress, BillReport, RecentRoot, StorageContext,
+    format_local_iso, graph_lines, load_day_report_with_progress_counted,
+    load_month_report_with_progress_counted, load_report_with_progress_counted,
+    load_week_report_with_progress_counted, load_year_report_with_progress_counted, recent_roots,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -549,13 +549,20 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
     let mut rows = Vec::new();
 
     // Month, day, week, and year bills carry their label; session bills
-    // have no header row here.
-    if let BillHeader::Month { label }
-    | BillHeader::Day { label }
-    | BillHeader::Week { label }
-    | BillHeader::Year { label } = &report.header
-    {
-        rows.push(title_row(label));
+    // carry the title plus the root id and its creation time.
+    match &report.header {
+        BillHeader::Session {
+            id,
+            title,
+            created_ms,
+        } => {
+            rows.push(title_row(title));
+            rows.push(identity_row(id, *created_ms));
+        }
+        BillHeader::Month { label }
+        | BillHeader::Day { label }
+        | BillHeader::Week { label }
+        | BillHeader::Year { label } => rows.push(title_row(label)),
     }
 
     rows.push(header_row(&[
@@ -776,6 +783,16 @@ fn totals_row(label: &str, value: &str) -> Row<'static> {
     padded_row(cells, Style::new().fg(Color::DarkGray))
 }
 
+/// One dimmed session-identity row: the root id and its creation time.
+fn identity_row(id: &str, created_ms: Option<i64>) -> Row<'static> {
+    let identity = created_ms.map_or_else(
+        || id.to_owned(),
+        |millis| format!("{id} · {}", format_local_iso(millis)),
+    );
+
+    padded_row(vec![Cell::from(identity)], Style::new().fg(Color::DarkGray))
+}
+
 /// A cell whose content is aligned within its column.
 fn aligned_cell(content: Line<'static>, alignment: Alignment) -> Cell<'static> {
     Cell::new(content.alignment(alignment))
@@ -893,6 +910,7 @@ mod tests {
             header: BillHeader::Session {
                 id: "ses_abcdef123456".to_owned(),
                 title: "Test session".to_owned(),
+                created_ms: None,
             },
             session_count: 1,
             usage_rows: vec![vec![
@@ -931,9 +949,9 @@ mod tests {
     fn builds_unified_report_table() {
         let rows = build_rows(&fixture_report());
 
-        // usage header + row + blank, agent title + header + row + blank,
-        // total title + 2 rows.
-        assert_eq!(rows.len(), 10);
+        // title + id rows, usage header + row + blank, agent title + header +
+        // row + blank, total title + 2 rows.
+        assert_eq!(rows.len(), 12);
     }
 
     #[test]
@@ -1194,10 +1212,10 @@ mod tests {
         let rows = build_rows(&fixture_report());
         let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
         let mut table_state = TableState::new().with_offset(0);
-        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
 
         table.render(
-            Rect::new(0, 0, table_natural_width(), 10),
+            Rect::new(0, 0, table_natural_width(), 12),
             &mut table_buffer,
             &mut table_state,
         );
@@ -1205,7 +1223,7 @@ mod tests {
         let mut header = String::new();
 
         for x in 0..table_natural_width() {
-            header.push_str(table_buffer[(x, 0)].symbol());
+            header.push_str(table_buffer[(x, 2)].symbol());
         }
 
         assert!(header.contains("PROVIDER / MODEL"), "header: {header}");
@@ -1213,19 +1231,70 @@ mod tests {
     }
 
     #[test]
-    fn renders_styled_header_row() {
+    fn renders_session_identity_rows() {
         let rows = build_rows(&fixture_report());
         let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
         let mut table_state = TableState::new().with_offset(0);
-        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
 
         table.render(
-            Rect::new(0, 0, table_natural_width(), 10),
+            Rect::new(0, 0, table_natural_width(), 12),
             &mut table_buffer,
             &mut table_state,
         );
 
-        let line = render_row(&table_buffer, 0, table_natural_width());
+        let title = render_row(&table_buffer, 0, table_natural_width());
+        let identity = render_row(&table_buffer, 1, table_natural_width());
+
+        assert!(title.contains("Test session"), "title: {title}");
+        assert!(
+            identity.contains("ses_abcdef123456"),
+            "identity: {identity}"
+        );
+    }
+
+    #[test]
+    fn renders_session_creation_time_in_identity_row() {
+        let mut report = fixture_report();
+
+        report.header = BillHeader::Session {
+            id: "ses_abcdef123456".to_owned(),
+            title: "Test session".to_owned(),
+            created_ms: Some(1_786_315_623_640),
+        };
+        let rows = build_rows(&report);
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 12),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let identity = render_row(&table_buffer, 1, table_natural_width());
+
+        assert!(
+            identity.contains("ses_abcdef123456 · "),
+            "identity: {identity}"
+        );
+    }
+
+    #[test]
+    fn renders_styled_header_row() {
+        let rows = build_rows(&fixture_report());
+        let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
+        let mut table_state = TableState::new().with_offset(0);
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
+
+        table.render(
+            Rect::new(0, 0, table_natural_width(), 12),
+            &mut table_buffer,
+            &mut table_state,
+        );
+
+        let line = render_row(&table_buffer, 2, table_natural_width());
 
         assert!(line.starts_with("\x1b[0m\x1b[1;4m"), "line: {line}");
         assert!(line.contains("PROVIDER / MODEL"), "line: {line}");
@@ -1237,17 +1306,17 @@ mod tests {
         let rows = build_rows(&fixture_report());
         let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
         let mut table_state = TableState::new().with_offset(0);
-        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
 
         table.render(
-            Rect::new(0, 0, table_natural_width(), 10),
+            Rect::new(0, 0, table_natural_width(), 12),
             &mut table_buffer,
             &mut table_state,
         );
 
-        // Row 4 is the agent header; REQUESTS and CACHE WRITE once fit only
+        // Row 6 is the agent header; REQUESTS and CACHE WRITE once fit only
         // truncated (QUESTS / E WRITE) because they landed in narrow columns.
-        let line = render_row(&table_buffer, 4, table_natural_width());
+        let line = render_row(&table_buffer, 6, table_natural_width());
 
         assert!(line.contains("AGENT"), "line: {line}");
         assert!(line.contains("SESSIONS"), "line: {line}");
@@ -1262,16 +1331,16 @@ mod tests {
         let rows = build_rows(&fixture_report());
         let table = Table::new(rows, column_widths()).column_spacing(COLUMN_SPACING);
         let mut table_state = TableState::new().with_offset(0);
-        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 10));
+        let mut table_buffer = Buffer::empty(Rect::new(0, 0, table_natural_width(), 12));
 
         table.render(
-            Rect::new(0, 0, table_natural_width(), 10),
+            Rect::new(0, 0, table_natural_width(), 12),
             &mut table_buffer,
             &mut table_state,
         );
 
-        // Row 9 is the last TOTAL row ("Amount due: ...").
-        let line = render_row(&table_buffer, 9, table_natural_width());
+        // Row 11 is the last TOTAL row ("Amount due: ...").
+        let line = render_row(&table_buffer, 11, table_natural_width());
 
         assert!(line.contains("\x1b[0m\x1b[90m"), "line: {line}");
         assert!(line.contains("Amount due"), "line: {line}");

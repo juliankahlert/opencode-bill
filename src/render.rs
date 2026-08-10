@@ -19,10 +19,20 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
     let mut output = String::new();
 
     match &report.header {
-        BillHeader::Session { id, title } => {
+        BillHeader::Session {
+            id,
+            title,
+            created_ms,
+        } => {
             output.push_str("OPENCODE SESSION BILL\n");
             output.push_str(&format!("Session: {id}\n"));
             output.push_str(&format!("Title:   {title}\n"));
+            if let Some(created_ms) = created_ms {
+                output.push_str(&format!(
+                    "Created: {}\n",
+                    crate::timing::format_local_iso(*created_ms)
+                ));
+            }
             output.push_str(&format!(
                 "Sessions: {} (root + descendants)\n\n",
                 report.session_count

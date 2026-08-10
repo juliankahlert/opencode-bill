@@ -5,6 +5,21 @@ use chrono::{DateTime, Local};
 /// Timestamp format used for the bill's start and end lines.
 pub(crate) const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S %:z";
 
+/// Renders a Unix millisecond timestamp as local RFC3339, seconds precision.
+///
+/// The duration-style ISO form (e.g. `2026-08-10T00:47:03+02:00`) names when
+/// a root session started; the picker menu and the session bill header row
+/// show it.  A timestamp chrono cannot represent renders as `-`.
+pub fn format_local_iso(created_ms: i64) -> String {
+    DateTime::from_timestamp_millis(created_ms)
+        .map(|instant| {
+            instant
+                .with_timezone(&Local)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 /// The earlier of two optional millisecond timestamps.
 pub(crate) fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
     [first, second].into_iter().flatten().min()
@@ -154,6 +169,17 @@ mod tests {
         assert_eq!(format_duration(3_200), "3s");
         assert_eq!(format_duration(65_000), "1m 5s");
         assert_eq!(format_duration(3_661_000), "1h 1m");
+    }
+
+    #[test]
+    fn formats_local_iso_seconds_precision() {
+        // RFC3339 seconds with an offset is always 25 chars, whatever the
+        // test machine's zone: YYYY-MM-DDTHH:MM:SS+HH:MM.
+        let rendered = format_local_iso(1_786_315_623_640);
+
+        assert_eq!(rendered.len(), 25, "rendered: {rendered}");
+        assert!(rendered.contains('T'), "rendered: {rendered}");
+        assert_eq!(format_local_iso(i64::MIN), "-");
     }
 
     #[test]
