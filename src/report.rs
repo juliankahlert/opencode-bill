@@ -148,17 +148,22 @@ pub(crate) fn build_report(
     debug_assert_eq!(usage.len(), usage_estimated.len());
     debug_assert_eq!(agents.len(), agent_estimated.len());
 
+    let mut usage_rows = usage
+        .iter()
+        .map(|entry| usage_row(*entry, interner))
+        .collect::<Vec<_>>();
+    let mut agent_rows = agents
+        .iter()
+        .map(|entry| agent_row(*entry, interner))
+        .collect::<Vec<_>>();
+    align_estimated_columns(&mut usage_rows);
+    align_estimated_columns(&mut agent_rows);
+
     BillReport {
         header: world.header.clone(),
         session_count: world.session_count,
-        usage_rows: usage
-            .iter()
-            .map(|entry| usage_row(*entry, interner))
-            .collect(),
-        agent_rows: agents
-            .iter()
-            .map(|entry| agent_row(*entry, interner))
-            .collect(),
+        usage_rows,
+        agent_rows,
         pricing_rows: sorted_usage(pricing, interner)
             .into_iter()
             .map(|entry| pricing_row(entry, interner))
@@ -564,6 +569,34 @@ fn marked_cost(cost_micros: i64, estimated: bool) -> String {
     }
 
     cost
+}
+
+/// Pads unmarked cost cells with a trailing space when a table's cost
+/// column mixes estimated and historic figures.
+///
+/// The estimated marker sits after the last digit, so under right
+/// alignment an unmarked cell ("$3.000000") ends one column earlier than
+/// a marked one ("$5.000000*") and its decimal point does not line up.
+/// One trailing space on every unmarked cell of the column keeps the
+/// decimal points aligned in both the plain-text and the TUI tables.
+fn align_estimated_columns(rows: &mut [Vec<String>]) {
+    let has_marked = rows
+        .iter()
+        .filter_map(|row| row.last())
+        .any(|cell| cell.ends_with('*'));
+    let has_unmarked = rows
+        .iter()
+        .filter_map(|row| row.last())
+        .any(|cell| !cell.ends_with('*'));
+
+    if !(has_marked && has_unmarked) {
+        return;
+    }
+
+    rows.iter_mut()
+        .filter_map(|row| row.last_mut())
+        .filter(|cell| !cell.ends_with('*'))
+        .for_each(|cell| cell.push(' '));
 }
 
 /// Label/value pairs of the TOTAL section.
@@ -1036,6 +1069,119 @@ mod tests {
         let amount_due = &report.totals.last().expect("amount due row").1;
         assert_eq!(amount_due, "$8.000000* USD");
         assert_eq!(report.pricing_rows[0][0], "openai / gpt-test*");
+    }
+
+    #[test]
+    fn pads_unmarked_cost_cells_when_column_mixes_marked_and_plain() {
+        let mut rows = vec![
+            vec!["m / a".to_owned(), "$5.000000*".to_owned()],
+            vec!["m / b".to_owned(), "$3.000000".to_owned()],
+            vec!["m / c".to_owned(), "$2.000000*".to_owned()],
+        ];
+
+        align_estimated_columns(&mut rows);
+
+        assert_eq!(rows[0][1], "$5.000000*");
+        assert_eq!(rows[1][1], "$3.000000 ");
+        assert_eq!(rows[2][1], "$2.000000*");
+    }
+
+    #[test]
+    fn leaves_uniform_cost_columns_untouched() {
+        let mut marked = vec![
+            vec!["m / a".to_owned(), "$5.000000*".to_owned()],
+            vec!["m / b".to_owned(), "$2.000000*".to_owned()],
+        ];
+        align_estimated_columns(&mut marked);
+
+        assert_eq!(marked[0][1], "$5.000000*");
+        assert_eq!(marked[1][1], "$2.000000*");
+
+        let mut plain = vec![vec!["m / a".to_owned(), "$5.000000".to_owned()]];
+        align_estimated_columns(&mut plain);
+
+        assert_eq!(plain[0][1], "$5.000000");
+    }
+
+    #[test]
+    fn build_report_pads_cost_columns_of_mixed_tables() {
+        use crate::data::cost_from_micros;
+
+        let mut interner = Interner::default();
+        let provider = interner.intern_provider("openai");
+        let estimated_model = interner.intern_model("gpt-estimated");
+        let historic_model = interner.intern_model("gpt-historic");
+        let estimated_agent = interner.intern_agent("est");
+        let historic_agent = interner.intern_agent("his");
+
+        let estimated = Totals {
+            cost: cost_from_micros(5_000_000),
+            estimated_cost: cost_from_micros(2_000_000),
+            ..Totals::default()
+        };
+        let historic = Totals {
+            cost: cost_from_micros(3_000_000),
+            ..Totals::default()
+        };
+
+        let mut by_model = BTreeMap::new();
+        by_model.insert((provider, estimated_model), estimated);
+        by_model.insert((provider, historic_model), historic);
+        let mut by_agent = BTreeMap::new();
+        by_agent.insert(
+            estimated_agent,
+            AgentUsage {
+                sessions: Default::default(),
+                totals: estimated,
+            },
+        );
+        by_agent.insert(
+            historic_agent,
+            AgentUsage {
+                sessions: Default::default(),
+                totals: historic,
+            },
+        );
+
+        let world = World {
+            header: BillHeader::Session {
+                id: "ses".to_owned(),
+                title: "Test".to_owned(),
+                created_ms: None,
+            },
+            session_count: 2,
+            sessions: SessionTree::new(),
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner: Interner::default(),
+        };
+        let report = build_report(
+            &world,
+            &by_model,
+            &by_agent,
+            &Totals::default(),
+            &BTreeMap::new(),
+            &[],
+            &interner,
+        );
+
+        let usage_cost = report
+            .usage_rows
+            .iter()
+            .map(|row| row[8].as_str())
+            .collect::<Vec<_>>();
+        let agent_cost = report
+            .agent_rows
+            .iter()
+            .map(|row| row[9].as_str())
+            .collect::<Vec<_>>();
+        // The estimated cells keep their marker; the historic cells gain
+        // one trailing space so every cost cell has the same width.
+        assert!(usage_cost.contains(&"$5.000000*"));
+        assert!(usage_cost.contains(&"$3.000000 "));
+        assert!(agent_cost.contains(&"$5.000000*"));
+        assert!(agent_cost.contains(&"$3.000000 "));
     }
 
     #[test]
