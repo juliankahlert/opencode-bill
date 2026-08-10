@@ -42,6 +42,12 @@ const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Height of the inline viewport: exactly the spinner box, so no empty rows
 /// pad it above or below while the report is generated.
 const VIEWPORT_HEIGHT: u16 = 6;
+/// How many recent root sessions the no-argument picker lists.
+const PICKER_LIMIT: usize = 8;
+/// Title of the picker block.
+const PICKER_TITLE: &str = "Select a session";
+/// Key hint shown at the bottom of the picker.
+const PICKER_HINT: &str = "↑/↓ or j/k move · Enter or 1-8 select · q quit";
 /// Unified column count shared by every report table.
 const COLUMNS: usize = 11;
 /// Natural width of every report table column.
@@ -177,28 +183,66 @@ pub async fn run(
     request: crate::Request,
     providers: Vec<String>,
 ) -> Result<TuiOutcome, String> {
+    let mut guard = TerminalGuard::enter()?;
+    // Start on a fresh row so the viewport does not overwrite the shell prompt line.
+    execute!(io::stdout(), Print("\n")).map_err(|failure| failure.to_string())?;
+
+    // Optional phase: the no-argument root-session picker.  The picker owns
+    // the terminal when a session is chosen, so the loading box and the bill
+    // replace its menu in the same viewport instead of leaving a second box
+    // in the scrollback.
+    let mut terminal;
+    let request = match request {
+        crate::Request::Pick => {
+            let roots =
+                recent_roots(&context, PICKER_LIMIT).map_err(|failure| failure.to_string())?;
+            let (_, terminal_height) = size().unwrap_or((0, 24));
+            let height = picker_height(roots.len(), terminal_height);
+            let mut picker = Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(height),
+                },
+            )
+            .map_err(|failure| failure.to_string())?;
+
+            {
+                let frame = picker.get_frame();
+
+                guard.park_below(frame.area().bottom().saturating_sub(1));
+            }
+            match run_picker(&mut picker, &roots)? {
+                Some(index) => {
+                    terminal = picker;
+                    crate::Request::Session(roots[index].id.clone())
+                }
+                None => return Ok(TuiOutcome::Success),
+            }
+        }
+        other => {
+            terminal = Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+                },
+            )
+            .map_err(|failure| failure.to_string())?;
+            let viewport_bottom = {
+                let frame = terminal.get_frame();
+
+                frame.area().bottom().saturating_sub(1)
+            };
+
+            guard.park_below(viewport_bottom);
+            other
+        }
+    };
+
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let counters = BillProgress::default();
     let worker_counters = counters.clone();
 
     let worker_task = tokio::spawn(worker(context, request, providers, worker_counters, sender));
-
-    let mut guard = TerminalGuard::enter()?;
-    // Start on a fresh row so the viewport does not overwrite the shell prompt line.
-    execute!(io::stdout(), Print("\n")).map_err(|failure| failure.to_string())?;
-    let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
-        },
-    )
-    .map_err(|failure| failure.to_string())?;
-    let viewport_bottom = {
-        let frame = terminal.get_frame();
-
-        frame.area().bottom().saturating_sub(1)
-    };
-    guard.park_below(viewport_bottom);
 
     let mut app = App {
         view: View::Loading {
@@ -470,12 +514,7 @@ fn draw_loading(frame: &mut Frame, app: &App, task: &str) {
     frame.render_widget(Clear, area);
     frame.render_widget(
         paragraph,
-        Rect::new(
-            area.x,
-            area.y,
-            60.min(area.width),
-            VIEWPORT_HEIGHT.min(area.height),
-        ),
+        Rect::new(area.x, area.y, 60.min(area.width), area.height),
     );
 }
 
@@ -546,6 +585,129 @@ fn draw_failure(frame: &mut Frame, failure: &str) {
             VIEWPORT_HEIGHT.min(area.height),
         ),
     );
+}
+
+/// Height of the picker viewport: the block borders, the root rows, and the
+/// hint line, clamped to the terminal height so inline rows never wrap.
+fn picker_height(count: usize, terminal_height: u16) -> u16 {
+    let needed = (4 + count as u16).max(5);
+
+    needed.min(terminal_height.saturating_sub(1).max(5))
+}
+
+/// Runs the picker loop until the user selects a root or quits.
+///
+/// Returns the chosen root index, or `None` when the user quit the picker
+/// without choosing.
+fn run_picker(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    roots: &[RecentRoot],
+) -> Result<Option<usize>, String> {
+    let mut selected = 0usize;
+
+    loop {
+        if event::poll(EVENT_TIMEOUT).map_err(|failure| failure.to_string())? {
+            let event = event::read().map_err(|failure| failure.to_string())?;
+
+            if let Event::Key(key) = event
+                && (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat)
+            {
+                match pick_key(key, selected, roots.len()) {
+                    PickAction::Quit => return Ok(None),
+                    PickAction::Select(index) => return Ok(Some(index)),
+                    PickAction::MoveUp => selected = selected.saturating_sub(1),
+                    PickAction::MoveDown => {
+                        selected = (selected + 1).min(roots.len().saturating_sub(1));
+                    }
+                    PickAction::Nothing => {}
+                }
+            }
+        }
+        terminal
+            .draw(|frame| draw_picker(frame, roots, selected))
+            .map_err(|failure| failure.to_string())?;
+    }
+}
+
+/// One key press of the picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickAction {
+    /// Move the selection up one row.
+    MoveUp,
+    /// Move the selection down one row.
+    MoveDown,
+    /// Bill the root session at this index.
+    Select(usize),
+    /// Quit without billing anything.
+    Quit,
+    /// The key did not map to an action.
+    Nothing,
+}
+
+/// Maps one picker key event to an action.
+///
+/// A pure function of the key and the selection state, so it is unit-testable
+/// without a terminal.
+fn pick_key(key: KeyEvent, selected: usize, count: usize) -> PickAction {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => PickAction::MoveUp,
+        KeyCode::Down | KeyCode::Char('j') => PickAction::MoveDown,
+        KeyCode::Enter if count > 0 => PickAction::Select(selected.min(count - 1)),
+        KeyCode::Char(ch) if ch.is_ascii_digit() => {
+            let index = ch
+                .to_digit(10)
+                .and_then(|value| usize::try_from(value).ok())
+                .and_then(|value| value.checked_sub(1));
+
+            match index {
+                Some(index) if index < count => PickAction::Select(index),
+                _ => PickAction::Nothing,
+            }
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => PickAction::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => PickAction::Quit,
+        _ => PickAction::Nothing,
+    }
+}
+
+/// Draws the picker menu in the current frame.
+fn draw_picker(frame: &mut Frame, roots: &[RecentRoot], selected: usize) {
+    let area = frame.area();
+    let paragraph =
+        Paragraph::new(picker_lines(roots, selected)).block(Block::bordered().title(PICKER_TITLE));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
+/// One line per root plus the hint line.
+///
+/// The creation date comes first, the title after, and the selected row is
+/// highlighted.  Lines longer than the viewport are clipped, never wrapped.
+fn picker_lines(roots: &[RecentRoot], selected: usize) -> Vec<Line<'static>> {
+    let mut lines = roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let created = root
+                .created_ms
+                .map_or_else(|| "-".to_owned(), format_local_iso);
+            let text = format!("▶ {created}  {}", root.title);
+            let style = if index == selected {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            Line::from(Span::styled(text, style))
+        })
+        .collect::<Vec<_>>();
+
+    lines.push(Line::from(Span::styled(
+        PICKER_HINT,
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines
 }
 
 /// Builds every report row as one 11-column table, padded to a shared grid.
@@ -1403,5 +1565,108 @@ mod tests {
             counts_label(12_345, 12_345, 6_789),
             "12,345 loaded · 12,345 parsed · 6,789 aggregated"
         );
+    }
+
+    #[test]
+    fn picker_selects_with_arrows_and_letters() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+        assert_eq!(pick_key(key(KeyCode::Down), 0, 8), PickAction::MoveDown);
+        assert_eq!(
+            pick_key(key(KeyCode::Char('j')), 0, 8),
+            PickAction::MoveDown
+        );
+        assert_eq!(pick_key(key(KeyCode::Up), 1, 8), PickAction::MoveUp);
+        assert_eq!(pick_key(key(KeyCode::Char('k')), 1, 8), PickAction::MoveUp);
+        assert_eq!(pick_key(key(KeyCode::Enter), 3, 8), PickAction::Select(3));
+        assert_eq!(
+            pick_key(key(KeyCode::Char('7')), 0, 8),
+            PickAction::Select(6)
+        );
+        assert_eq!(pick_key(key(KeyCode::Char('9')), 0, 8), PickAction::Nothing);
+        assert_eq!(pick_key(key(KeyCode::Char('3')), 0, 2), PickAction::Nothing);
+    }
+
+    #[test]
+    fn picker_quits_on_q_esc_or_ctrl_c() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+
+        assert_eq!(
+            pick_key(key(KeyCode::Char('q'), KeyModifiers::empty()), 0, 8),
+            PickAction::Quit
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::Char('Q'), KeyModifiers::empty()), 0, 8),
+            PickAction::Quit
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::Esc, KeyModifiers::empty()), 0, 8),
+            PickAction::Quit
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), 0, 8),
+            PickAction::Quit
+        );
+    }
+
+    #[test]
+    fn picker_ignores_moves_and_selects_on_an_empty_list() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+        assert_eq!(pick_key(key(KeyCode::Enter), 0, 0), PickAction::Nothing);
+        assert_eq!(pick_key(key(KeyCode::Down), 0, 0), PickAction::MoveDown);
+    }
+
+    #[test]
+    fn picker_ignores_the_zero_key() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+        assert_eq!(pick_key(key(KeyCode::Char('0')), 0, 8), PickAction::Nothing);
+    }
+
+    #[test]
+    fn picker_clamps_enter_to_the_last_row() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+        assert_eq!(pick_key(key(KeyCode::Enter), 9, 3), PickAction::Select(2));
+    }
+
+    #[test]
+    fn picker_rows_put_the_date_before_the_title() {
+        let roots = vec![RecentRoot {
+            id: "ses_a".to_owned(),
+            title: "A root session".to_owned(),
+            created_ms: Some(1_786_315_623_640),
+        }];
+        let lines = picker_lines(&roots, 0);
+        let rendered = lines[0].to_string();
+        let title_at = rendered.find("A root session");
+        let time_at = rendered.find('T');
+
+        assert!(rendered.starts_with("▶ "), "line: {rendered}");
+        assert!(
+            title_at
+                .zip(time_at)
+                .is_some_and(|(title, time)| title > time),
+            "the date must come before the title: {rendered}"
+        );
+        assert!(
+            lines[1].to_string().contains(PICKER_HINT),
+            "line: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn picker_height_grows_with_the_row_count_when_the_terminal_allows() {
+        assert_eq!(picker_height(0, 24), 5);
+        assert_eq!(picker_height(3, 24), 7);
+        assert_eq!(picker_height(8, 24), 12);
+    }
+
+    #[test]
+    fn picker_height_clamps_to_the_terminal_height() {
+        assert_eq!(picker_height(8, 10), 9);
+        assert_eq!(picker_height(8, 4), 5);
     }
 }
