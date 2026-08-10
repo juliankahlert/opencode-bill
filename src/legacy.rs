@@ -15,7 +15,8 @@ use crate::parse::{
 use crate::report::BillHeader;
 use crate::store::{
     CalendarWindow, DAY_MILLIS, MESSAGE_BATCH_BYTES, MESSAGE_BATCH_LIMIT, RawLoad, RawMessage,
-    RawPart, RawSession, RawWindowMeta, SessionStore, StreamBatch, batch_full, unique_match,
+    RawPart, RawSession, RawWindowMeta, RecentRoot, SessionStore, StreamBatch, batch_full,
+    unique_match,
 };
 
 /// Sessions stored in OpenCode's legacy JSON directory layout.
@@ -188,6 +189,45 @@ impl SessionStore for LegacyStore {
         }
 
         Ok(())
+    }
+
+    fn recent_roots(&self, limit: usize) -> Result<Vec<RecentRoot>, BillError> {
+        let session_root = self.storage.join("session");
+        let mut roots = legacy_session_paths(&session_root)?
+            .into_iter()
+            .map(|path| {
+                let value = read_json(&path)?;
+                let location = path.display().to_string();
+
+                // A root session is a JSON without a parent; skip children.
+                if value
+                    .get("parentID")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+                let id = required_string(&value, "id", &location)?;
+                let title = required_string(&value, "title", &location)?;
+                let created_ms = value
+                    .get("time")
+                    .and_then(|time| time.get("created"))
+                    .and_then(serde_json::Value::as_i64);
+
+                Ok(Some(RecentRoot {
+                    id,
+                    title,
+                    created_ms,
+                }))
+            })
+            .collect::<Result<Vec<_>, BillError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        roots.sort_by(|left, right| right.created_ms.cmp(&left.created_ms));
+        roots.truncate(limit);
+        Ok(roots)
     }
 }
 

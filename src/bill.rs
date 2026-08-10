@@ -16,7 +16,9 @@ use crate::parse::{parse_message_batch, parse_metadata, parse_system};
 use crate::pricing;
 use crate::render::render_bill;
 use crate::report::{BarGraph, BillReport, build_report, month_graphs, week_graphs, year_graphs};
-use crate::store::{CalendarWindow, RawWindowMeta, SessionStore, StreamBatch, validate_reference};
+use crate::store::{
+    CalendarWindow, RawWindowMeta, RecentRoot, SessionStore, StreamBatch, validate_reference,
+};
 use crate::timing::{earliest, latest};
 
 /// Lockless progress counters of one bill pipeline run.
@@ -182,6 +184,21 @@ pub fn generate_weekly_bill(
     let report = load_week_report_with_progress(context, year, week, providers, |_| {})?;
 
     render_bill(&report)
+}
+
+/// Lists the most recent root sessions, newest first, up to a limit.
+///
+/// A root session is a session without a parent (in SQLite, `parent_id IS
+/// NULL`; in legacy JSON, a file without a `parentID`).  The interactive
+/// no-argument picker uses this list.  The query never counts rows into a
+/// progress handle, and the creation time is `None` when the store does not
+/// record one.
+pub fn recent_roots(context: &StorageContext, limit: usize) -> Result<Vec<RecentRoot>, BillError> {
+    let data_dir = context.data_dir.clone();
+
+    block_on(blocking_load(move || {
+        Store::select(&data_dir).recent_roots(limit)
+    }))?
 }
 
 /// Loads a session and builds the report data, reporting each work step.
@@ -1207,6 +1224,7 @@ mod tests {
     use super::*;
     use crate::context::DATABASE_FILE;
     use crate::database::SqliteStore;
+    use crate::legacy::LegacyStore;
     use crate::store::MESSAGE_BATCH_LIMIT;
     use rusqlite::{Connection, params};
     use std::fs;
@@ -1330,6 +1348,147 @@ mod tests {
         assert_eq!(counters.loaded_rows(), 2);
         assert_eq!(counters.parsed_rows(), 2);
         assert_eq!(counters.folded_rows(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn database_recent_roots_list_newest_first_without_children()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let database = temporary.path().join(DATABASE_FILE);
+        let connection = Connection::open(&database)?;
+
+        connection.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT,\
+             time_created INTEGER);",
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_old", "Old root", None::<String>, 1000_i64],
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_new", "New root", None::<String>, 3000_i64],
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_child", "Child", "ses_new", 2000_i64],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(database);
+        let roots = store.recent_roots(8)?;
+
+        assert_eq!(roots.len(), 2, "children are not roots");
+        assert_eq!(roots[0].id, "ses_new");
+        assert_eq!(roots[0].title, "New root");
+        assert_eq!(roots[0].created_ms, Some(3000));
+        assert_eq!(roots[1].id, "ses_old");
+        assert_eq!(roots[1].created_ms, Some(1000));
+        Ok(())
+    }
+
+    #[test]
+    fn database_recent_roots_respect_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let database = temporary.path().join(DATABASE_FILE);
+        let connection = Connection::open(&database)?;
+
+        connection.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT,\
+             time_created INTEGER);",
+        )?;
+        for (index, id) in ["ses_a", "ses_b", "ses_c"].into_iter().enumerate() {
+            connection.execute(
+                "INSERT INTO session (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+                params![id, id, None::<String>, index as i64],
+            )?;
+        }
+        drop(connection);
+
+        let store = SqliteStore::new(database);
+        let roots = store.recent_roots(2)?;
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].id, "ses_c", "newest first");
+        assert_eq!(roots[1].id, "ses_b");
+        Ok(())
+    }
+
+    #[test]
+    fn database_recent_roots_without_created_column_report_unknown_times()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        connection.execute(
+            "INSERT INTO session (id, title) VALUES (?1, ?2)",
+            params!["ses_aaa", "Older by id"],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(context.data_dir.join(DATABASE_FILE));
+        let roots = store.recent_roots(8)?;
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].id, "ses_aaa", "fallback orders by id");
+        assert!(roots.iter().all(|root| root.created_ms.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_recent_roots_skip_children_and_sort_newest_first()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let session_root = temporary.path().join("storage/session/project");
+
+        fs::create_dir_all(&session_root)?;
+        fs::write(
+            session_root.join("ses_old.json"),
+            r#"{"id":"ses_old","title":"Old root","time":{"created":1000}}"#,
+        )?;
+        fs::write(
+            session_root.join("ses_child.json"),
+            r#"{"id":"ses_child","title":"Child","parentID":"ses_new","time":{"created":2000}}"#,
+        )?;
+        fs::write(
+            session_root.join("ses_new.json"),
+            r#"{"id":"ses_new","title":"New root","time":{"created":3000}}"#,
+        )?;
+        fs::write(
+            session_root.join("ses_unknown.json"),
+            r#"{"id":"ses_unknown","title":"No time"}"#,
+        )?;
+
+        let store = LegacyStore::new(temporary.path().join("storage"));
+        let roots = store.recent_roots(8)?;
+
+        assert_eq!(roots.len(), 3, "the child is not a root");
+        assert_eq!(roots[0].id, "ses_new");
+        assert_eq!(roots[1].id, "ses_old");
+        assert_eq!(roots[2].id, "ses_unknown", "unknown times sort last");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_recent_roots_respect_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let session_root = temporary.path().join("storage/session/project");
+
+        fs::create_dir_all(&session_root)?;
+        for (index, id) in ["ses_a", "ses_b", "ses_c"].into_iter().enumerate() {
+            fs::write(
+                session_root.join(format!("{id}.json")),
+                format!(r#"{{"id":"{id}","title":"{id}","time":{{"created":{index}}}}}"#),
+            )?;
+        }
+
+        let store = LegacyStore::new(temporary.path().join("storage"));
+        let roots = store.recent_roots(2)?;
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].id, "ses_c", "newest first");
+        assert_eq!(roots[1].id, "ses_b");
         Ok(())
     }
 

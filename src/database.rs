@@ -11,7 +11,7 @@ use crate::error::BillError;
 use crate::report::BillHeader;
 use crate::store::{
     CalendarWindow, DATA_SLICE, DAY_MILLIS, MESSAGE_BATCH_LIMIT, RawLoad, RawMessage, RawPart,
-    RawSession, RawWindowMeta, SessionStore, StreamBatch, batch_full, unique_match,
+    RawSession, RawWindowMeta, RecentRoot, SessionStore, StreamBatch, batch_full, unique_match,
 };
 
 /// Sessions stored in OpenCode's SQLite database.
@@ -234,6 +234,47 @@ impl SessionStore for SqliteStore {
             window.label
         );
         Ok(())
+    }
+
+    fn recent_roots(&self, limit: usize) -> Result<Vec<RecentRoot>, BillError> {
+        let connection = open_database(&self.path)?;
+        let has_created = database_has_column(&connection, &self.path, "session", "time_created")?;
+        let (created_column, order) = if has_created {
+            (", time_created", "time_created DESC, id")
+        } else {
+            // Test fixture schemas predate the column; order by id and leave
+            // the creation time unknown instead of failing the query.
+            (", NULL", "id")
+        };
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT id, title{created_column} FROM session \
+                 WHERE parent_id IS NULL ORDER BY {order} LIMIT ?1"
+            ))
+            .map_err(|source| database_error(&self.path, source))?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|source| database_error(&self.path, source))?;
+        let mut roots = Vec::new();
+
+        for row in rows {
+            let (id, title, created_ms) =
+                row.map_err(|source| database_error(&self.path, source))?;
+
+            roots.push(RecentRoot {
+                id,
+                title,
+                created_ms,
+            });
+        }
+
+        Ok(roots)
     }
 }
 

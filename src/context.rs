@@ -9,7 +9,7 @@ use crate::data::BillProgress;
 use crate::database::SqliteStore;
 use crate::error::BillError;
 use crate::legacy::LegacyStore;
-use crate::store::{CalendarWindow, RawLoad, RawWindowMeta, SessionStore, StreamBatch};
+use crate::store::{CalendarWindow, RawLoad, RawWindowMeta, RecentRoot, SessionStore, StreamBatch};
 
 /// Name of OpenCode's SQLite session database.
 pub(crate) const DATABASE_FILE: &str = "opencode.db";
@@ -87,6 +87,13 @@ impl SessionStore for Store {
         match self {
             Store::Database(store) => store.stream_window_messages(window, progress, on_batch),
             Store::Legacy(store) => store.stream_window_messages(window, progress, on_batch),
+        }
+    }
+
+    fn recent_roots(&self, limit: usize) -> Result<Vec<RecentRoot>, BillError> {
+        match self {
+            Store::Database(store) => store.recent_roots(limit),
+            Store::Legacy(store) => store.recent_roots(limit),
         }
     }
 }

@@ -32,10 +32,11 @@ pub use bill::{
     load_month_report_with_progress, load_month_report_with_progress_counted,
     load_report_with_progress, load_report_with_progress_counted, load_week_report_with_progress,
     load_week_report_with_progress_counted, load_year_report_with_progress,
-    load_year_report_with_progress_counted,
+    load_year_report_with_progress_counted, recent_roots,
 };
 pub use context::{DataDirectorySet, MissingDataDirectory, StorageContext, StorageContextBuilder};
 pub use data::BillProgress;
 pub use error::BillError;
 pub use render::{graph_lines, render_bill};
 pub use report::{BarGraph, BillHeader, BillReport, MetricKind};
+pub use store::RecentRoot;

@@ -187,7 +187,6 @@ pub(crate) trait SessionStore {
     /// Streams one window's raw messages and tool parts in per-day batches,
     /// in window order, invoking `on_batch` once per day (or once per split
     /// batch when a day exceeds the limits).
-    ///
     /// Only one day's rows are materialized at a time — tool parts can be
     /// as large as the messages, so they stream alongside instead of
     /// loading whole-window — and a callback error stops the stream and
@@ -207,6 +206,13 @@ pub(crate) trait SessionStore {
         progress: &BillProgress,
         on_batch: &mut impl FnMut(StreamBatch) -> Result<StreamBatch, BillError>,
     ) -> Result<(), BillError>;
+    /// Lists the most recent root sessions, newest first, up to `limit`.
+    ///
+    /// A root session is a session without a parent.  This query powers the
+    /// no-argument interactive picker, so it never counts rows into a
+    /// [`BillProgress`] handle: it is separate from the
+    /// loaded == parsed invariant of the billing pipeline.
+    fn recent_roots(&self, limit: usize) -> Result<Vec<RecentRoot>, BillError>;
 }
 
 /// One day's raw window rows: the messages and their tool parts.
@@ -230,6 +236,20 @@ pub(crate) struct RawWindowMeta {
     pub(crate) header: BillHeader,
     pub(crate) session_count: usize,
     pub(crate) sessions: Vec<RawSession>,
+}
+
+/// One root session's identity for the interactive picker.
+///
+/// A root session is a session without a parent; the picker offers the most
+/// recent roots by creation time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentRoot {
+    /// Root session ID.
+    pub id: String,
+    /// Root session title.
+    pub title: String,
+    /// Root session creation time (Unix milliseconds), when the store knows it.
+    pub created_ms: Option<i64>,
 }
 
 /// Raw storage rows of one load: unparsed messages plus session components.
