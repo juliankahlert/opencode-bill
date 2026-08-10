@@ -18,6 +18,14 @@ billed at the best known rate for its provider/model pair, so subscription
 usage shows an estimated cost instead of a zero row. Provider corrections
 with negative costs are clamped to zero and never re-priced.
 
+Estimated figures are marked so they can be told apart from historic
+recorded prices: in plain-text bills every cost that includes any estimated
+amount (the COST column and the Amount due total) carries an asterisk, and
+every MODEL PRICING row carries one, because model rates always come from
+external sources rather than from the bill data. A footnote under the
+pricing table explains the marker. In the TUI the same figures render in
+italic.
+
 Sections in the bill include:
 
   * Session ID, title, creation time, and message count
