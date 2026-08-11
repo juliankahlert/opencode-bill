@@ -111,19 +111,19 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
 
     if report.graphs.is_empty() {
         output.push_str("\nTOTAL\n");
-        for (label, value) in &report.totals {
+        report.totals.iter().for_each(|(label, value)| {
             // Labels are left-padded to 13 columns; keep every label short enough.
             debug_assert!(label.len() <= 13, "total label too wide: {label}");
             output.push_str(&format!("{label:<13}{value}\n"));
-        }
+        });
         return Ok(output);
     }
 
-    for graph in &report.graphs {
+    report.graphs.iter().for_each(|graph| {
         output.push('\n');
         output.push_str(&graph_lines(graph).join("\n"));
         output.push('\n');
-    }
+    });
     Ok(output)
 }
 
@@ -148,14 +148,14 @@ pub fn graph_lines(graph: &BarGraph) -> Vec<String> {
             .map(|value| bar_height(*value, max))
             .collect::<Vec<_>>();
 
-        for row in (0..GRAPH_HEIGHT).rev() {
+        (0..GRAPH_HEIGHT).rev().for_each(|row| {
             lines.push(
                 heights
                     .iter()
                     .map(|height| if *height > row { GRAPH_BAR } else { GRAPH_GAP })
                     .collect(),
             );
-        }
+        });
         lines.push(
             graph
                 .labels
@@ -206,11 +206,12 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> Result<String, BillEr
         .map(|header| header.len())
         .collect::<Vec<_>>();
 
-    for row in rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.len());
-        }
-    }
+    rows.iter().for_each(|row| {
+        widths
+            .iter_mut()
+            .zip(row)
+            .for_each(|(width, cell)| *width = (*width).max(cell.len()));
+    });
 
     let mut output = String::new();
     let header_cells = headers
@@ -228,9 +229,8 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> Result<String, BillEr
     );
     output.push('\n');
 
-    for row in rows {
-        push_table_row(&mut output, row, &widths);
-    }
+    rows.iter()
+        .for_each(|row| push_table_row(&mut output, row, &widths));
 
     Ok(output)
 }
