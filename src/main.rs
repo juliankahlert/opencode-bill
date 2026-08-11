@@ -200,9 +200,10 @@ fn resolve_request(
             today_date.month(),
             today_date.day(),
         ),
-        (None, None, false, Some(0), _) => {
-            Request::Week(today_date.year() as u32, today_date.iso_week().week())
-        }
+        (None, None, false, Some(0), _) => Request::Week(
+            today_date.iso_week().year() as u32,
+            today_date.iso_week().week(),
+        ),
         (None, None, false, Some(week), _) => Request::Week(today_date.year() as u32, week as u32),
         (None, None, false, None, Some(session)) => Request::Session(session),
     }
@@ -318,6 +319,17 @@ mod tests {
         assert_eq!(
             resolve_request(None, None, false, Some(0), None, today),
             Request::Week(2026, 32)
+        );
+    }
+
+    #[test]
+    fn week_without_value_uses_the_iso_week_year() {
+        let today = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+
+        // 2027-01-01 is a Friday in ISO week 53 of 2026, not week 53 of 2027.
+        assert_eq!(
+            resolve_request(None, None, false, Some(0), None, today),
+            Request::Week(2026, 53)
         );
     }
 
