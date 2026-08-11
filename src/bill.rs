@@ -772,19 +772,14 @@ async fn load_streaming_system(
                 &pipeline,
             )?;
 
-            for row in rows.drain(..) {
-                // Pre-filter: rows outside the requested providers die here,
-                // before pricing and folding.
-                if !wanted.is_empty() && !wanted.contains(&row.provider) {
-                    continue;
-                }
-
+            // Pre-filter: rows outside the requested providers die here,
+            // before pricing and folding.
+            rows.drain(..)
+                .filter(|row| wanted.is_empty() || wanted.contains(&row.provider))
                 // Zero-cost estimation folds in the estimated cost when a
                 // rate is known; otherwise the recorded (zero) cost stays.
-                let row = estimate_streamed_cost(row, &mut pricing, &catalog, &github, &world);
-
-                aggregates.fold(&row, &pipeline);
-            }
+                .map(|row| estimate_streamed_cost(row, &mut pricing, &catalog, &github, &world))
+                .for_each(|row| aggregates.fold(&row, &pipeline));
 
             // The bundle is drained; hand its buffers back to the pump.
             batch.messages.clear();
@@ -794,13 +789,22 @@ async fn load_streaming_system(
         // The pricing map must cover every key of the bill, not only the
         // rows whose cost needed estimation: resolve the remaining model
         // keys so the MODEL PRICING table matches a whole-store bill.
-        for key in aggregates.by_model.keys() {
-            if !pricing.contains_key(key)
-                && let Some(rates) = pricing::rates_for_key(key, &world.interner, &catalog, &github)
-            {
-                pricing.insert(*key, rates);
-            }
-        }
+        let missing = aggregates
+            .by_model
+            .keys()
+            .filter(|key| !pricing.contains_key(key))
+            .copied()
+            .collect::<Vec<_>>();
+
+        missing
+            .into_iter()
+            .filter_map(|key| {
+                pricing::rates_for_key(&key, &world.interner, &catalog, &github)
+                    .map(|rates| (key, rates))
+            })
+            .for_each(|(key, rates)| {
+                pricing.insert(key, rates);
+            });
 
         Ok(StreamedBill {
             world,
@@ -1137,11 +1141,11 @@ fn estimate_zero_costs(store: &mut UsageStore, pricing: &BTreeMap<ModelKey, Mode
         })
         .collect::<Vec<_>>();
 
-    for (entity, micros) in writes {
+    writes.into_iter().for_each(|(entity, micros)| {
         // The entity came from this store's own lanes, so the checked
         // write cannot miss; ignore the defensive `false`.
         let _ = store.set_cost_micros(entity, micros);
-    }
+    });
 }
 
 /// Restricts the bill to the given providers, keeping the full period when
@@ -1398,12 +1402,16 @@ mod tests {
             "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT,\
              time_created INTEGER);",
         )?;
-        for (index, id) in ["ses_a", "ses_b", "ses_c"].into_iter().enumerate() {
-            connection.execute(
-                "INSERT INTO session (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
-                params![id, id, None::<String>, index as i64],
-            )?;
-        }
+        ["ses_a", "ses_b", "ses_c"]
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(index, id)| -> Result<(), rusqlite::Error> {
+                connection.execute(
+                    "INSERT INTO session (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, id, None::<String>, index as i64],
+                )?;
+                Ok(())
+            })?;
         drop(connection);
 
         let store = SqliteStore::new(database);
@@ -1476,12 +1484,16 @@ mod tests {
         let session_root = temporary.path().join("storage/session/project");
 
         fs::create_dir_all(&session_root)?;
-        for (index, id) in ["ses_a", "ses_b", "ses_c"].into_iter().enumerate() {
-            fs::write(
-                session_root.join(format!("{id}.json")),
-                format!(r#"{{"id":"{id}","title":"{id}","time":{{"created":{index}}}}}"#),
-            )?;
-        }
+        ["ses_a", "ses_b", "ses_c"]
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(index, id)| -> Result<(), std::io::Error> {
+                fs::write(
+                    session_root.join(format!("{id}.json")),
+                    format!(r#"{{"id":"{id}","title":"{id}","time":{{"created":{index}}}}}"#),
+                )?;
+                Ok(())
+            })?;
 
         let store = LegacyStore::new(temporary.path().join("storage"));
         let roots = store.recent_roots(2)?;
@@ -1690,7 +1702,7 @@ Amount due:  $0.125000 USD
 
         // Two overlapping tool calls spanning 2000..6000 plus one from 8000..9000
         // leave 10s - 5s = 5s of API time.
-        for (id, data) in [
+        [
             (
                 "prt_1",
                 r#"{"type":"tool","state":{"status":"completed","time":{"start":2000,"end":5000}}}"#,
@@ -1704,12 +1716,15 @@ Amount due:  $0.125000 USD
                 r#"{"type":"tool","state":{"status":"completed","time":{"start":8000,"end":9000}}}"#,
             ),
             ("prt_4", r#"{"type":"text","text":"not a tool call"}"#),
-        ] {
+        ]
+        .into_iter()
+        .try_for_each(|(id, data)| -> Result<(), rusqlite::Error> {
             connection.execute(
                 "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
                 params![id, "msg_1", "ses_abcdef123456", data],
             )?;
-        }
+            Ok(())
+        })?;
         drop(connection);
 
         let bill = generate_bill(&context, "ses_abcdef", &[])?;
@@ -2390,7 +2405,7 @@ Amount due:  $0.125000 USD
         // The fixture's day-0 message plus one batch's worth plus one more:
         // the day must be split into a full batch and the remainder, both
         // at or below the pipeline's message limit.
-        for index in 0..MESSAGE_BATCH_LIMIT + 1 {
+        (0..MESSAGE_BATCH_LIMIT + 1).try_for_each(|index| -> Result<(), rusqlite::Error> {
             connection.execute(
                 "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -2400,7 +2415,8 @@ Amount due:  $0.125000 USD
                     r#"{"role":"user","time":{"created":1000}}"#
                 ],
             )?;
-        }
+            Ok(())
+        })?;
         drop(connection);
 
         let store = SqliteStore::new(context.data_dir.join(DATABASE_FILE));
@@ -3405,7 +3421,7 @@ Amount due:  $0.125000 USD
             "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
-        for index in 0..message_count {
+        (0..message_count).try_for_each(|index| -> Result<(), rusqlite::Error> {
             let provider = index % PROFILE_PROVIDERS;
             let model = index % PROFILE_MODELS;
             let created = 1_000 + u64::from(index) * 10;
@@ -3427,7 +3443,8 @@ Amount due:  $0.125000 USD
                     r#"{{"type":"tool","state":{{"status":"completed","time":{{"start":{created},"end":{completed}}}}}}}"#
                 ),
             ])?;
-        }
+            Ok(())
+        })?;
         drop(insert_message);
         drop(insert_part);
         drop(connection);
@@ -3446,10 +3463,10 @@ Amount due:  $0.125000 USD
     fn profile_catalog() -> String {
         let mut catalog = String::from("{");
 
-        for provider in 0..PROFILE_PROVIDERS {
+        (0..PROFILE_PROVIDERS).for_each(|provider| {
             catalog.push_str(&format!(r#""prov{provider}":{{"models":{{"#));
 
-            for model in 0..PROFILE_MODELS {
+            (0..PROFILE_MODELS).for_each(|model| {
                 catalog.push_str(&format!(
                     r#""model{model}":{{"cost":{{"input":1.25,"output":5,"cache_read":0.125,"cache_write":1}}}}"#
                 ));
@@ -3457,14 +3474,14 @@ Amount due:  $0.125000 USD
                 if model + 1 < PROFILE_MODELS {
                     catalog.push(',');
                 }
-            }
+            });
 
             catalog.push_str("}}");
 
             if provider + 1 < PROFILE_PROVIDERS {
                 catalog.push(',');
             }
-        }
+        });
 
         catalog.push('}');
         catalog
@@ -3540,11 +3557,11 @@ Amount due:  $0.125000 USD
             .sum::<f64>();
 
         println!("profile: {MESSAGES} messages");
-        for (name, duration) in shares {
+        shares.into_iter().for_each(|(name, duration)| {
             let share = duration.as_secs_f64() / total * 100.0;
 
             println!("  {name:<9} {duration:>8?}  {share:5.1}%");
-        }
+        });
         println!("  total     {total:>8.1?}");
 
         // The lockless counters counted every row as the store read it and
