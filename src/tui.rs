@@ -287,9 +287,9 @@ pub async fn run(
         {
             let mut stdout = io::stdout().lock();
 
-            for row in viewport.y + 1..=viewport.y + viewport.height {
-                write!(stdout, "\x1b[{row};1H\x1b[K").map_err(|failure| failure.to_string())?;
-            }
+            (viewport.y + 1..=viewport.y + viewport.height).try_for_each(|row| {
+                write!(stdout, "\x1b[{row};1H\x1b[K").map_err(|failure| failure.to_string())
+            })?;
             stdout.flush().map_err(|failure| failure.to_string())?;
         }
         // The guard parks the cursor on the viewport's top row and restores the
@@ -315,11 +315,11 @@ pub async fn run(
 
         // Print the table; the visible width is the natural width (the table
         // is wider than most terminals, so the terminal wraps it).
-        for y in 0..row_count {
+        (0..row_count).try_for_each(|y| {
             stdout
                 .write_all(render_row(&table_buffer, y, natural_width).as_bytes())
-                .map_err(|failure| failure.to_string())?;
-        }
+                .map_err(|failure| failure.to_string())
+        })?;
 
         // Bar graphs (year: one per month; month: one per calendar week)
         // render as bordered blocks in a grid that fits the terminal width;
@@ -330,11 +330,13 @@ pub async fn run(
                 .write_all(b"\n")
                 .map_err(|failure| failure.to_string())?;
 
-            for line in render_graph_grid(&report.graphs, terminal_width) {
-                stdout
-                    .write_all(line.as_bytes())
-                    .map_err(|failure| failure.to_string())?;
-            }
+            render_graph_grid(&report.graphs, terminal_width)
+                .into_iter()
+                .try_for_each(|line| {
+                    stdout
+                        .write_all(line.as_bytes())
+                        .map_err(|failure| failure.to_string())
+                })?;
         }
         stdout.flush().map_err(|failure| failure.to_string())?;
         return Ok(TuiOutcome::Success);
@@ -788,13 +790,13 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
     // printed after the table rows.
     if report.graphs.is_empty() {
         rows.push(title_row("TOTAL"));
-        for (label, value) in &report.totals {
+        report.totals.iter().for_each(|(label, value)| {
             rows.push(totals_row(
                 label,
                 value,
                 report.amount_due_estimated && label == "Amount due:",
             ));
-        }
+        });
     }
 
     rows
@@ -849,23 +851,27 @@ fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
     ));
     let mut y_offset = 0u16;
 
-    for (row_index, chunk) in blocks.chunks(columns).enumerate() {
-        let row_height = row_heights[row_index] as u16;
+    blocks
+        .chunks(columns)
+        .enumerate()
+        .for_each(|(row_index, chunk)| {
+            let row_height = row_heights[row_index] as u16;
 
-        for (column, lines) in chunk.iter().enumerate() {
-            let x = column as u16 * (block_width as u16 + GRAPH_SPACING);
-            let block_area = Rect::new(x, y_offset, block_width as u16, row_height + 2);
-            let content_area = Rect::new(x + 1, y_offset + 1, block_width as u16 - 2, row_height);
+            chunk.iter().enumerate().for_each(|(column, lines)| {
+                let x = column as u16 * (block_width as u16 + GRAPH_SPACING);
+                let block_area = Rect::new(x, y_offset, block_width as u16, row_height + 2);
+                let content_area =
+                    Rect::new(x + 1, y_offset + 1, block_width as u16 - 2, row_height);
 
-            ratatui::widgets::Widget::render(Block::bordered(), block_area, &mut buffer);
-            ratatui::widgets::Widget::render(
-                Paragraph::new(styled_graph_lines(lines, row_height)),
-                content_area,
-                &mut buffer,
-            );
-        }
-        y_offset = y_offset.saturating_add(row_height + 2);
-    }
+                ratatui::widgets::Widget::render(Block::bordered(), block_area, &mut buffer);
+                ratatui::widgets::Widget::render(
+                    Paragraph::new(styled_graph_lines(lines, row_height)),
+                    content_area,
+                    &mut buffer,
+                );
+            });
+            y_offset = y_offset.saturating_add(row_height + 2);
+        });
 
     (0..buffer_height)
         .map(|y| render_row(&buffer, y as u16, buffer_width as u16))
@@ -1050,7 +1056,7 @@ fn render_row(buffer: &Buffer, y: u16, width: u16) -> String {
     let mut output = String::new();
     let mut active_style = Style::default();
 
-    for x in 0..width {
+    (0..width).for_each(|x| {
         let cell = &buffer[(x, y)];
 
         if cell.style() != active_style {
@@ -1062,7 +1068,7 @@ fn render_row(buffer: &Buffer, y: u16, width: u16) -> String {
             active_style = cell.style();
         }
         output.push_str(cell.symbol());
-    }
+    });
     output.push_str("\x1b[0m\n");
     output
 }
@@ -1418,12 +1424,12 @@ mod tests {
 
         let mut text = String::new();
 
-        for y in 0..12 {
-            for x in 0..table_natural_width() {
+        (0..12).for_each(|y| {
+            (0..table_natural_width()).for_each(|x| {
                 text.push_str(table_buffer[(x, y)].symbol());
-            }
+            });
             text.push('\n');
-        }
+        });
 
         assert!(text.contains("2026"), "text: {text}");
         assert!(
@@ -1587,9 +1593,9 @@ mod tests {
 
         let mut header = String::new();
 
-        for x in 0..table_natural_width() {
+        (0..table_natural_width()).for_each(|x| {
             header.push_str(table_buffer[(x, 2)].symbol());
-        }
+        });
 
         assert!(header.contains("PROVIDER / MODEL"), "header: {header}");
         assert!(header.contains("REQUESTS"), "header: {header}");
