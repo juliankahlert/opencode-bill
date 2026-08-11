@@ -141,46 +141,53 @@ impl SessionStore for SqliteStore {
                 let data = database_batch_message_fields(&transaction, &self.path, slice)?;
                 let mut by_id = data.into_iter().collect::<HashMap<_, _>>();
 
-                for (created, message_id, session_id) in slice {
-                    let next_day = ((*created as u64 - window.start_ms) / DAY_MILLIS) as usize;
+                slice
+                    .iter()
+                    .try_for_each(|(created, message_id, session_id)| {
+                        let next_day = ((*created as u64 - window.start_ms) / DAY_MILLIS) as usize;
 
-                    if batch_day.is_none() {
-                        batch_day = Some(next_day);
-                    } else if batch_day.is_some_and(|day| day != next_day) {
-                        flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
-                        batch_day = Some(next_day);
-                    }
+                        if batch_day.is_none() {
+                            batch_day = Some(next_day);
+                        } else if batch_day.is_some_and(|day| day != next_day) {
+                            flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
+                            batch_day = Some(next_day);
+                        }
 
-                    last_created = *created;
-                    last_id = message_id.clone();
-                    let json = by_id
-                        .remove(message_id)
-                        .ok_or_else(|| BillError::Database {
-                            path: self.path.clone(),
-                            source: rusqlite::Error::QueryReturnedNoRows,
-                        })?;
+                        last_created = *created;
+                        last_id = message_id.clone();
+                        let json = by_id
+                            .remove(message_id)
+                            .ok_or_else(|| BillError::Database {
+                                path: self.path.clone(),
+                                source: rusqlite::Error::QueryReturnedNoRows,
+                            })?;
 
-                    // A giant payload (a tool result embedded in the
-                    // message) can dwarf the byte budget on its own: flush
-                    // before it joins, so no batch ever stacks more than one
-                    // such row at a time.
-                    if !batch.is_empty()
-                        && batch_full(batch.len(), batch_bytes.saturating_add(json.len()), false)
-                    {
-                        flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
-                        batch_day = Some(next_day);
-                    }
+                        // A giant payload (a tool result embedded in the
+                        // message) can dwarf the byte budget on its own: flush
+                        // before it joins, so no batch ever stacks more than one
+                        // such row at a time.
+                        if !batch.is_empty()
+                            && batch_full(
+                                batch.len(),
+                                batch_bytes.saturating_add(json.len()),
+                                false,
+                            )
+                        {
+                            flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
+                            batch_day = Some(next_day);
+                        }
 
-                    batch_bytes += json.len();
-                    streamed_bytes += json.len();
-                    streamed_messages += 1;
-                    batch.push(RawMessage {
-                        id: message_id.clone(),
-                        session_id: session_id.clone(),
-                        location: location.clone(),
-                        json,
-                    });
-                }
+                        batch_bytes += json.len();
+                        streamed_bytes += json.len();
+                        streamed_messages += 1;
+                        batch.push(RawMessage {
+                            id: message_id.clone(),
+                            session_id: session_id.clone(),
+                            location: location.clone(),
+                            json,
+                        });
+                        Ok(())
+                    })?;
 
                 if has_parts {
                     let ids = slice
@@ -266,18 +273,18 @@ impl SessionStore for SqliteStore {
                 ))
             })
             .map_err(|source| database_error(&self.path, source))?;
-        let mut roots = Vec::new();
+        let roots = rows
+            .map(|row| {
+                let (id, title, created_ms) =
+                    row.map_err(|source| database_error(&self.path, source))?;
 
-        for row in rows {
-            let (id, title, created_ms) =
-                row.map_err(|source| database_error(&self.path, source))?;
-
-            roots.push(RecentRoot {
-                id,
-                title,
-                created_ms,
-            });
-        }
+                Ok(RecentRoot {
+                    id,
+                    title,
+                    created_ms,
+                })
+            })
+            .collect::<Result<Vec<_>, BillError>>()?;
 
         Ok(roots)
     }
@@ -308,11 +315,9 @@ fn database_matches(
     let rows = statement
         .query_map(params![reference], |row| row.get::<_, String>(0))
         .map_err(|source| database_error(path, source))?;
-    let mut matches = Vec::new();
-
-    for row in rows {
-        matches.push(row.map_err(|source| database_error(path, source))?);
-    }
+    let matches = rows
+        .map(|row| row.map_err(|source| database_error(path, source)))
+        .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(matches)
 }
@@ -389,17 +394,17 @@ fn database_session_rows(
             Ok((session_id, agent))
         })
         .map_err(|source| database_error(path, source))?;
-    let mut sessions = Vec::new();
+    let sessions = rows
+        .map(|row| {
+            let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
 
-    for row in rows {
-        let (session_id, agent) = row.map_err(|source| database_error(path, source))?;
-
-        progress.loaded_row();
-        sessions.push(RawSession {
-            id: session_id,
-            agent,
-        });
-    }
+            progress.loaded_row();
+            Ok(RawSession {
+                id: session_id,
+                agent,
+            })
+        })
+        .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(sessions)
 }
@@ -486,19 +491,20 @@ fn database_messages(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let mut messages = Vec::new();
+    let messages = rows
+        .map(|row| {
+            let (message_id, session_id, json) =
+                row.map_err(|source| database_error(path, source))?;
 
-    for row in rows {
-        let (message_id, session_id, json) = row.map_err(|source| database_error(path, source))?;
-
-        progress.loaded_row();
-        messages.push(RawMessage {
-            id: message_id,
-            session_id,
-            location: location.clone(),
-            json,
-        });
-    }
+            progress.loaded_row();
+            Ok(RawMessage {
+                id: message_id,
+                session_id,
+                location: location.clone(),
+                json,
+            })
+        })
+        .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(messages)
 }
@@ -550,14 +556,14 @@ fn database_window_message_keys(
             },
         )
         .map_err(|source| database_error(path, source))?;
-    let mut chunk = Vec::new();
+    let chunk = rows
+        .map(|row| {
+            let (id, session_id, created) = row.map_err(|source| database_error(path, source))?;
 
-    for row in rows {
-        let (id, session_id, created) = row.map_err(|source| database_error(path, source))?;
-
-        progress.loaded_row();
-        chunk.push((created, id, session_id));
-    }
+            progress.loaded_row();
+            Ok((created, id, session_id))
+        })
+        .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(chunk)
 }
@@ -601,26 +607,26 @@ fn database_batch_message_fields(
         )
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let mut data = Vec::new();
+    let data = rows
+        .map(|row| {
+            let (id, fields, raw) = row.map_err(|source| database_error(path, source))?;
+            // Small payloads arrive already extracted; oversized ones are
+            // stream-parsed here (serde skips the unknown fields, so no tree
+            // is built for the giant tool result).
+            let fields = match (fields, raw) {
+                (Some(fields), _) => fields,
+                (None, Some(raw)) => crate::parse::extract_giant_message_fields(&raw, &location)?,
+                (None, None) => {
+                    return Err(BillError::InvalidData {
+                        location: location.clone(),
+                        detail: "unparseable message payload".to_owned(),
+                    });
+                }
+            };
 
-    for row in rows {
-        let (id, fields, raw) = row.map_err(|source| database_error(path, source))?;
-        // Small payloads arrive already extracted; oversized ones are
-        // stream-parsed here (serde skips the unknown fields, so no tree is
-        // built for the giant tool result).
-        let fields = match (fields, raw) {
-            (Some(fields), _) => fields,
-            (None, Some(raw)) => crate::parse::extract_giant_message_fields(&raw, &location)?,
-            (None, None) => {
-                return Err(BillError::InvalidData {
-                    location,
-                    detail: "unparseable message payload".to_owned(),
-                });
-            }
-        };
-
-        data.push((id, fields));
-    }
+            Ok((id, fields))
+        })
+        .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(data)
 }
@@ -654,16 +660,19 @@ fn database_batch_parts(
         })
         .map_err(|source| database_error(path, source))?;
 
-    for row in rows {
-        let (message_id, json) = row.map_err(|source| database_error(path, source))?;
+    parts.extend(
+        rows.map(|row| {
+            let (message_id, json) = row.map_err(|source| database_error(path, source))?;
 
-        progress.loaded_row();
-        parts.push(RawPart {
-            message_id,
-            location: location.to_owned(),
-            json,
-        });
-    }
+            progress.loaded_row();
+            Ok(RawPart {
+                message_id,
+                location: location.to_owned(),
+                json,
+            })
+        })
+        .collect::<Result<Vec<_>, BillError>>()?,
+    );
 
     Ok(())
 }
@@ -715,18 +724,18 @@ fn database_tool_parts(
         })
         .map_err(|source| database_error(path, source))?;
     let location = path.display().to_string();
-    let mut parts = Vec::new();
+    let parts = rows
+        .map(|row| {
+            let (message_id, json) = row.map_err(|source| database_error(path, source))?;
 
-    for row in rows {
-        let (message_id, json) = row.map_err(|source| database_error(path, source))?;
-
-        progress.loaded_row();
-        parts.push(RawPart {
-            message_id,
-            location: location.clone(),
-            json,
-        });
-    }
+            progress.loaded_row();
+            Ok(RawPart {
+                message_id,
+                location: location.clone(),
+                json,
+            })
+        })
+        .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(parts)
 }
@@ -762,13 +771,13 @@ fn database_has_column(
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|source| database_error(path, source))?;
 
-    for name in names {
-        if name.map_err(|source| database_error(path, source))? == column {
-            return Ok(true);
-        }
-    }
+    let found = names
+        .map(|name| name.map_err(|source| database_error(path, source)))
+        .collect::<Result<Vec<_>, BillError>>()?
+        .iter()
+        .any(|name| name == column);
 
-    Ok(false)
+    Ok(found)
 }
 
 /// Maps a SQLite failure onto the bill error type.
