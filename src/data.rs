@@ -554,10 +554,7 @@ impl FromIterator<UsageRow> for UsageStore {
     fn from_iter<T: IntoIterator<Item = UsageRow>>(iter: T) -> Self {
         let mut store = UsageStore::default();
 
-        for row in iter {
-            store.push(row);
-        }
-
+        iter.into_iter().for_each(|row| store.push(row));
         store
     }
 }
