@@ -159,13 +159,10 @@ pub(crate) fn load_pricing<'a>(
 ) -> Result<BTreeMap<ModelKey, ModelRates>, BillError> {
     let catalog = CatalogSource::new(models_file)?;
     let keys = keys.collect::<Vec<_>>();
-    let mut pricing = BTreeMap::new();
-
-    for key in keys {
-        if let Some(rates) = rates_for_key(key, interner, &catalog, github) {
-            pricing.insert(*key, rates);
-        }
-    }
+    let pricing = keys
+        .into_iter()
+        .filter_map(|key| rates_for_key(key, interner, &catalog, github).map(|rates| (*key, rates)))
+        .collect();
 
     Ok(pricing)
 }
@@ -288,16 +285,17 @@ fn github_model_pricing(markdown: &str, model: &str) -> Option<ModelRates> {
     let wanted = normalized_model_id(model);
     let mut headers = Vec::new();
 
-    for line in markdown.lines() {
+    markdown.lines().find_map(|line| {
         let cells = markdown_cells(line);
 
         if cells.iter().any(|cell| cell == "Model") && cells.iter().any(|cell| cell == "Input") {
             headers = cells;
-            continue;
+
+            return None;
         }
 
         if headers.is_empty() || cells.len() != headers.len() {
-            continue;
+            return None;
         }
 
         let fields = headers
@@ -308,7 +306,7 @@ fn github_model_pricing(markdown: &str, model: &str) -> Option<ModelRates> {
         let name = fields.get("Model")?;
 
         if normalize_model_name(name) != wanted || !is_default_tier(&fields) {
-            continue;
+            return None;
         }
 
         let input = markdown_rate(&fields, "Input");
@@ -317,16 +315,16 @@ fn github_model_pricing(markdown: &str, model: &str) -> Option<ModelRates> {
         let cache_write = markdown_rate(&fields, "Cache write");
 
         if input.is_some() && output.is_some() {
-            return Some(ModelRates {
+            Some(ModelRates {
                 input,
                 cache_read,
                 cache_write,
                 output,
-            });
+            })
+        } else {
+            None
         }
-    }
-
-    None
+    })
 }
 
 /// Splits one markdown table row into trimmed cells.
@@ -371,18 +369,18 @@ fn normalized_model_id(model: &str) -> String {
 
 /// Collapses a model name to lowercase alphanumerics separated by `-`.
 fn normalize_model_name(name: &str) -> String {
-    let mut normalized = String::new();
-    let mut separator = false;
+    let normalized = name.chars().flat_map(char::to_lowercase).fold(
+        String::new(),
+        |mut normalized, character| {
+            if character.is_ascii_alphanumeric() {
+                normalized.push(character);
+            } else if !normalized.ends_with('-') && !normalized.is_empty() {
+                normalized.push('-');
+            }
 
-    for character in name.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() {
-            normalized.push(character);
-            separator = false;
-        } else if !separator && !normalized.is_empty() {
-            normalized.push('-');
-            separator = true;
-        }
-    }
+            normalized
+        },
+    );
 
     normalized.trim_end_matches('-').to_owned()
 }
