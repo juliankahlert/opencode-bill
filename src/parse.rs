@@ -548,9 +548,7 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
         progress,
     )?;
 
-    for row in rows.drain(..) {
-        world.entities.push(row);
-    }
+    rows.drain(..).for_each(|row| world.entities.push(row));
 
     Ok(world)
 }
@@ -579,7 +577,7 @@ pub(crate) fn parse_metadata(
     let mut sessions = SessionTree::new();
     let mut session_agents = BTreeMap::new();
 
-    for session in meta.sessions {
+    meta.sessions.into_iter().for_each(|session| {
         progress.parsed_row();
         let id = interner.intern_session(&session.id);
         let agent = session
@@ -589,7 +587,7 @@ pub(crate) fn parse_metadata(
 
         sessions.insert(id, SessionNode { agent });
         session_agents.entry(session.id).or_insert(agent);
-    }
+    });
 
     Ok((
         World {
@@ -643,7 +641,7 @@ pub(crate) fn parse_message_batch(
         .collect_into_vec(results);
 
     rows.clear();
-    for result in results.drain(..) {
+    results.drain(..).try_for_each(|result| {
         let message = result?;
         let session_handle = world.interner.intern_session(&message.session_id);
 
@@ -651,7 +649,7 @@ pub(crate) fn parse_message_batch(
         world.wall_end = latest(world.wall_end, message.completed.or(message.created));
 
         let Some(row) = message.row else {
-            continue;
+            return Ok(());
         };
         let agent = match row.session_agent {
             Some(agent) => agent,
@@ -672,7 +670,8 @@ pub(crate) fn parse_message_batch(
             created: row.created,
             completed: row.completed,
         });
-    }
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -684,14 +683,16 @@ fn parse_tool_spans(
 ) -> Result<ToolSpans, BillError> {
     let mut spans = ToolSpans::new();
 
-    for part in parts {
+    parts.into_iter().try_for_each(|part| {
         progress.parsed_row();
         let fields = parse_part_fields(&part.json, &part.location)?;
 
         if let Some(span) = part_span(&fields) {
             spans.entry(part.message_id).or_default().push(span);
         }
-    }
+
+        Ok(())
+    })?;
 
     Ok(spans)
 }
@@ -795,9 +796,7 @@ mod tests {
             &mut rows,
             &PipelineProgress::default(),
         )?;
-        for row in rows.drain(..) {
-            world.entities.push(row);
-        }
+        rows.drain(..).for_each(|row| world.entities.push(row));
 
         let mut second_parts = Vec::new();
         let mut second = messages.collect::<Vec<_>>();
@@ -810,33 +809,35 @@ mod tests {
             &mut rows,
             &PipelineProgress::default(),
         )?;
-        for row in rows.drain(..) {
-            world.entities.push(row);
-        }
+        rows.drain(..).for_each(|row| world.entities.push(row));
 
         assert_eq!(world.session_count, single.session_count);
         assert_eq!(world.entities.len(), single.entities.len());
         assert_eq!(world.wall_start, single.wall_start);
         assert_eq!(world.wall_end, single.wall_end);
 
-        for (batched, whole) in world.entities.rows().zip(single.entities.rows()) {
-            // Handles are equal only when interning happened in the same
-            // order: the batch stream must assign identical ids.
-            assert_eq!(batched.session_id, whole.session_id);
-            assert_eq!(batched.agent, whole.agent);
-            assert_eq!(batched.provider, whole.provider);
-            assert_eq!(batched.model, whole.model);
-            assert_eq!(batched.tokens.input, whole.tokens.input);
-            assert_eq!(batched.tokens.output, whole.tokens.output);
-            assert_eq!(batched.tokens.reasoning, whole.tokens.reasoning);
-            assert_eq!(batched.tokens.cache_read, whole.tokens.cache_read);
-            assert_eq!(batched.tokens.cache_write, whole.tokens.cache_write);
-            assert_eq!(batched.cost_micros, whole.cost_micros);
-            assert_eq!(batched.cost_unknown, whole.cost_unknown);
-            assert_eq!(batched.api_ms, whole.api_ms);
-            assert_eq!(batched.created, whole.created);
-            assert_eq!(batched.completed, whole.completed);
-        }
+        world
+            .entities
+            .rows()
+            .zip(single.entities.rows())
+            .for_each(|(batched, whole)| {
+                // Handles are equal only when interning happened in the same
+                // order: the batch stream must assign identical ids.
+                assert_eq!(batched.session_id, whole.session_id);
+                assert_eq!(batched.agent, whole.agent);
+                assert_eq!(batched.provider, whole.provider);
+                assert_eq!(batched.model, whole.model);
+                assert_eq!(batched.tokens.input, whole.tokens.input);
+                assert_eq!(batched.tokens.output, whole.tokens.output);
+                assert_eq!(batched.tokens.reasoning, whole.tokens.reasoning);
+                assert_eq!(batched.tokens.cache_read, whole.tokens.cache_read);
+                assert_eq!(batched.tokens.cache_write, whole.tokens.cache_write);
+                assert_eq!(batched.cost_micros, whole.cost_micros);
+                assert_eq!(batched.cost_unknown, whole.cost_unknown);
+                assert_eq!(batched.api_ms, whole.api_ms);
+                assert_eq!(batched.created, whole.created);
+                assert_eq!(batched.completed, whole.completed);
+            });
 
         Ok(())
     }
