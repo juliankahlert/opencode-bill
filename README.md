@@ -90,9 +90,9 @@ Usage
   session-id-or-prefix   Full OpenCode session ID or a unique prefix
                          (minimum 6 characters). With no session argument,
                          no --month, no --year, no --week, and no --today,
-                         a terminal shows an interactive picker of the most
-                         recent root sessions; without a terminal the
-                         current month is billed.
+                         a terminal shows an interactive picker with
+                         session, week, month, and year tabs; without a
+                         terminal the current month is billed.
 
   --month [MONTH]        Bill the calendar month (1-12) of the current
                          year instead of one session and its sub-agents.
@@ -195,15 +195,22 @@ refreshes in place while it runs. Press `q` or Ctrl-C to cancel while it
 is loading. When stdout is piped or redirected the plain-text bill is
 printed as before.
 
-A bare `opencode-bill` on a terminal opens an interactive picker listing
-the eight most recent root sessions (sessions without a parent), one per
-row with the session creation time first and the title after; the
-selected row is highlighted. Press `↑`/`↓` or `j`/`k` to move, `Enter`
-or a digit `1`-`8` to bill that session, and `q`, `Q`, `Esc`, or Ctrl-C
-to quit without billing anything. After the pick, the loading box and
-the report replace the menu in place, and the report table gains a
-session title row plus an id/creation-time row at the top. Quitting the
-picker prints nothing and exits cleanly.
+A bare `opencode-bill` on a terminal opens an interactive picker with four
+tabs — session, week, month, and year — and the session tab active. Each
+tab lists its eight most recent options, one per row: the session tab the
+eight most recent root sessions (sessions without a parent) with the
+creation time first and the title after, the week tab the last eight ISO
+calendar weeks, the month tab the last eight calendar months, and the year
+tab the last eight calendar years, each labeled like the bill it starts
+(e.g. `Week 33, 2026`, `August 2026`, `2026`). The selected row is
+highlighted. Press `↑`/`↓` or `j`/`k` to move within a tab, `←`/`→`, `h`/`l`,
+or Tab/Shift-Tab to switch tabs, `Enter` or a digit `1`-`8` to bill the
+selected option, and `q`, `Q`, `Esc`, or Ctrl-C to quit without billing
+anything. After the pick, the loading box and the report replace the menu
+in place, and the report table gains a session title row plus an
+id/creation-time row at the top when a session was picked, or the window
+label when a week, month, or year was picked. Quitting the picker prints
+nothing and exits cleanly.
 
 Build from source
 -----------------

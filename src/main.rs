@@ -17,13 +17,14 @@ mod tui;
 #[command(
     name = "opencode-bill",
     version,
-    about = "Generate a bill for an OpenCode session, calendar month, calendar week, calendar year, or calendar day; with no arguments and a terminal, pick one of the most recent root sessions interactively"
+    about = "Generate a bill for an OpenCode session, calendar month, calendar week, calendar year, or calendar day; with no arguments and a terminal, pick one of the most recent root sessions, ISO weeks, months, or years interactively"
 )]
 struct Arguments {
     /// Full OpenCode session ID or a unique prefix. With no session, no
     /// --month, no --year, no --week, and no --today, a terminal shows an
-    /// interactive picker of the most recent root sessions; without a
-    /// terminal the current month is billed.
+    /// interactive picker with session, week, month, and year tabs, each
+    /// listing its eight most recent options; without a terminal the current
+    /// month is billed.
     #[arg(conflicts_with = "month")]
     session: Option<String>,
 
@@ -89,7 +90,7 @@ enum Request {
     /// One ISO calendar week of the current year.
     Week(u32, u32),
     /// No window was requested: on a terminal, pick one of the most recent
-    /// root sessions interactively.
+    /// root sessions, ISO weeks, months, or years interactively.
     Pick,
 }
 
