@@ -88,18 +88,19 @@ impl SessionStore for LegacyStore {
         let mut sessions = Vec::new();
 
         if message_root.is_dir() {
-            for session_path in session_directories(&message_root)? {
-                let session_id = session_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default();
+            let meta = session_directories(&message_root)?
+                .into_iter()
+                .filter_map(|session_path| {
+                    let session_id = session_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
 
-                if let Some(session) =
-                    window_session_meta(&session_path, session_id, window, progress)?
-                {
-                    sessions.push(session);
-                }
-            }
+                    window_session_meta(&session_path, session_id, window, progress).transpose()
+                })
+                .collect::<Result<Vec<_>, BillError>>()?;
+
+            sessions.extend(meta);
         }
 
         debug!("loaded {} raw sessions in {}", sessions.len(), window.label);
@@ -128,73 +129,73 @@ impl SessionStore for LegacyStore {
         // without a creation time share one leading bucket.  Each message
         // keeps its own part rows, so a split can never separate a message
         // from its parts.
-        for session_path in session_directories(&message_root)? {
-            let session_id = session_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            let chunks = read_directory(&session_path)?
-                .map(|entry| entry.map_err(|source| read_error(&session_path, source)))
-                .collect::<Result<Vec<_>, BillError>>()?
-                .into_iter()
-                .map(|entry| entry.path())
-                .filter_map(|path| window_message(&path, session_id, window).transpose())
-                .collect::<Result<Vec<_>, BillError>>()?
-                .into_iter()
-                .fold(
-                    BTreeMap::<Option<usize>, Vec<(RawMessage, Vec<RawPart>)>>::new(),
-                    |mut chunks, (message, created)| {
-                        // Each kept message counts here, exactly once: the
-                        // metadata pass never counts messages, so loaded
-                        // stays equal to parsed.
-                        progress.loaded_row();
-                        let part_rows = legacy_part_rows(&self.storage, &message.id, progress)
-                            .unwrap_or_default();
-                        chunks
-                            .entry(day_bucket(created, window.start_ms))
-                            .or_default()
-                            .push((message, part_rows));
+        session_directories(&message_root)?
+            .into_iter()
+            .try_for_each(|session_path| {
+                let session_id = session_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let chunks = read_directory(&session_path)?
+                    .map(|entry| entry.map_err(|source| read_error(&session_path, source)))
+                    .collect::<Result<Vec<_>, BillError>>()?
+                    .into_iter()
+                    .map(|entry| entry.path())
+                    .filter_map(|path| window_message(&path, session_id, window).transpose())
+                    .collect::<Result<Vec<_>, BillError>>()?
+                    .into_iter()
+                    .fold(
+                        BTreeMap::<Option<usize>, Vec<(RawMessage, Vec<RawPart>)>>::new(),
+                        |mut chunks, (message, created)| {
+                            // Each kept message counts here, exactly once: the
+                            // metadata pass never counts messages, so loaded
+                            // stays equal to parsed.
+                            progress.loaded_row();
+                            let part_rows = legacy_part_rows(&self.storage, &message.id, progress)
+                                .unwrap_or_default();
+                            chunks
+                                .entry(day_bucket(created, window.start_ms))
+                                .or_default()
+                                .push((message, part_rows));
 
-                        chunks
-                    },
-                );
+                            chunks
+                        },
+                    );
 
-            for (_, rows) in chunks {
-                let mut rows = rows;
+                chunks.into_iter().try_for_each(|(_, rows)| {
+                    let mut rows = rows;
 
-                // No pipeline batch may exceed the message limit or the
-                // payload budget; a session day larger than one batch is
-                // split in row order, message and parts together.
-                let mut bytes = rows.iter().map(row_bytes).sum::<usize>();
+                    // No pipeline batch may exceed the message limit or the
+                    // payload budget; a session day larger than one batch is
+                    // split in row order, message and parts together.
+                    let mut bytes = rows.iter().map(row_bytes).sum::<usize>();
 
-                while batch_full(rows.len(), bytes, false) {
-                    let cut = if rows.len() > MESSAGE_BATCH_LIMIT {
-                        MESSAGE_BATCH_LIMIT
-                    } else {
-                        let mut budget = 0usize;
-                        let mut cut = 1;
+                    while batch_full(rows.len(), bytes, false) {
+                        let cut = if rows.len() > MESSAGE_BATCH_LIMIT {
+                            MESSAGE_BATCH_LIMIT
+                        } else {
+                            // The first cut that fits the payload budget.
+                            rows.iter()
+                                .scan(0usize, |budget, row| {
+                                    *budget += row_bytes(row);
+                                    Some(*budget)
+                                })
+                                .position(|budget| budget > MESSAGE_BATCH_BYTES)
+                                .map_or(1, |index| index + 1)
+                        };
+                        let remainder = rows.split_off(cut);
+                        let (messages, parts) = unzip_rows(rows);
 
-                        for (index, row) in rows.iter().enumerate() {
-                            budget += row_bytes(row);
-                            if budget > MESSAGE_BATCH_BYTES {
-                                cut = index + 1;
-                                break;
-                            }
-                        }
-                        cut
-                    };
-                    let remainder = rows.split_off(cut);
+                        let _ = on_batch(StreamBatch { messages, parts })?;
+                        rows = remainder;
+                        bytes = rows.iter().map(row_bytes).sum::<usize>();
+                    }
+
                     let (messages, parts) = unzip_rows(rows);
-
                     let _ = on_batch(StreamBatch { messages, parts })?;
-                    rows = remainder;
-                    bytes = rows.iter().map(row_bytes).sum::<usize>();
-                }
-
-                let (messages, parts) = unzip_rows(rows);
-                let _ = on_batch(StreamBatch { messages, parts })?;
-            }
-        }
+                    Ok(())
+                })
+            })?;
 
         Ok(())
     }
@@ -249,8 +250,10 @@ fn row_bytes(row: &(RawMessage, Vec<RawPart>)) -> usize {
 
 /// Splits one session day into the message and part lanes of a batch.
 fn unzip_rows(rows: Vec<(RawMessage, Vec<RawPart>)>) -> (Vec<RawMessage>, Vec<RawPart>) {
+    let message_capacity = rows.len();
+
     rows.into_iter().fold(
-        (Vec::new(), Vec::new()),
+        (Vec::with_capacity(message_capacity), Vec::new()),
         |(mut messages, mut parts), (message, message_parts)| {
             messages.push(message);
             parts.extend(message_parts);
@@ -392,27 +395,27 @@ fn json_file_paths(dir: &Path) -> Result<Vec<PathBuf>, BillError> {
 /// String-keyed so callers can intern and process sessions in deterministic
 /// string order.  Legacy session JSON carries no agent component.
 fn legacy_session_tree(root: &Path, root_id: &str) -> Result<BTreeSet<String>, BillError> {
-    let mut parents = BTreeMap::new();
+    let parents = legacy_session_paths(root)?.into_iter().try_fold(
+        BTreeMap::new(),
+        |mut parents, path| {
+            let value = read_json(&path)?;
+            let location = path.display().to_string();
+            let id = required_string(&value, "id", &location)?;
+            let parent = value
+                .get("parentID")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
 
-    for path in legacy_session_paths(root)? {
-        let value = read_json(&path)?;
-        let location = path.display().to_string();
-        let id = required_string(&value, "id", &location)?;
-        let parent = value
-            .get("parentID")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-
-        parents.insert(id, parent);
-    }
+            parents.insert(id, parent);
+            Ok(parents)
+        },
+    )?;
 
     let mut descendants = BTreeSet::from([root_id.to_owned()]);
     let mut changed = true;
 
     while changed {
-        changed = false;
-
-        for (id, parent) in &parents {
+        changed = parents.iter().fold(false, |mut changed, (id, parent)| {
             if parent
                 .as_ref()
                 .is_some_and(|value| descendants.contains(value))
@@ -420,7 +423,9 @@ fn legacy_session_tree(root: &Path, root_id: &str) -> Result<BTreeSet<String>, B
             {
                 changed = true;
             }
-        }
+
+            changed
+        });
     }
 
     Ok(descendants)
@@ -462,13 +467,7 @@ fn legacy_messages(
         })
         .collect::<Result<Vec<_>, BillError>>()?;
 
-    let mut messages = Vec::with_capacity(rows.len());
-    let mut parts = Vec::new();
-
-    for (message, message_parts) in rows {
-        messages.push(message);
-        parts.extend(message_parts);
-    }
+    let (messages, parts) = unzip_rows(rows);
 
     Ok((messages, parts))
 }
