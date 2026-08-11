@@ -170,15 +170,16 @@ impl StreamedAggregates {
     /// Seeds the agent summary from the billed session tree, so sessions
     /// without usage still appear as zero-usage agent classes.
     pub(crate) fn seed_agents(&mut self, sessions: &SessionTree) {
-        for (session_id, node) in sessions {
-            if let Some(agent) = node.agent {
+        sessions
+            .iter()
+            .filter_map(|(session_id, node)| node.agent.map(|agent| (*session_id, agent)))
+            .for_each(|(session_id, agent)| {
                 self.by_agent
                     .entry(agent)
                     .or_default()
                     .sessions
-                    .insert(*session_id);
-            }
-        }
+                    .insert(session_id);
+            });
     }
 
     /// Sets the billed month's calendar weeks; the fold then buckets rows
@@ -332,9 +333,7 @@ mod tests {
         // A store far larger than the old chunk size: every row saturates
         // its token lanes, and the sequential fold must keep them saturated
         // instead of wrapping.
-        for _ in 0..8192 {
-            store.push(extreme_row(&mut interner, 0, true));
-        }
+        (0..8192).for_each(|_| store.push(extreme_row(&mut interner, 0, true)));
 
         let usage = aggregate(&store, &PipelineProgress::default());
         let total = usage.values().fold(Totals::default(), |mut sum, row| {
@@ -380,9 +379,9 @@ mod tests {
         let mut aggregates = StreamedAggregates::default();
         let progress = PipelineProgress::default();
 
-        for row in store.rows() {
-            aggregates.fold(&row, &progress);
-        }
+        store
+            .rows()
+            .for_each(|row| aggregates.fold(&row, &progress));
 
         let months = &aggregates.months;
 
@@ -444,9 +443,9 @@ mod tests {
         aggregates.set_weeks(vec![31, 32, 33, 34, 35, 36]);
         let progress = PipelineProgress::default();
 
-        for row in store.rows() {
-            aggregates.fold(&row, &progress);
-        }
+        store
+            .rows()
+            .for_each(|row| aggregates.fold(&row, &progress));
 
         assert_eq!(aggregates.weeks, [31, 32, 33, 34, 35, 36]);
         assert_eq!(
@@ -517,9 +516,9 @@ mod tests {
         aggregates.set_weekday_fold();
         let progress = PipelineProgress::default();
 
-        for row in store.rows() {
-            aggregates.fold(&row, &progress);
-        }
+        store
+            .rows()
+            .for_each(|row| aggregates.fold(&row, &progress));
 
         assert_eq!(
             aggregates
