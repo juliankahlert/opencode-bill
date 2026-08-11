@@ -12,6 +12,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -42,12 +43,12 @@ const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Height of the inline viewport: exactly the spinner box, so no empty rows
 /// pad it above or below while the report is generated.
 const VIEWPORT_HEIGHT: u16 = 6;
-/// How many recent root sessions the no-argument picker lists.
+/// How many options each picker tab lists.
 const PICKER_LIMIT: usize = 8;
 /// Title of the picker block.
-const PICKER_TITLE: &str = "Select a session";
+const PICKER_TITLE: &str = "Select a bill";
 /// Key hint shown at the bottom of the picker.
-const PICKER_HINT: &str = "↑/↓ or j/k move · Enter or 1-8 select · q quit";
+const PICKER_HINT: &str = "↑/↓ or j/k move · ←/→ or h/l tab · Enter or 1-8 select · q quit";
 /// Unified column count shared by every report table.
 const COLUMNS: usize = 11;
 /// Natural width of every report table column.
@@ -187,17 +188,19 @@ pub async fn run(
     // Start on a fresh row so the viewport does not overwrite the shell prompt line.
     execute!(io::stdout(), Print("\n")).map_err(|failure| failure.to_string())?;
 
-    // Optional phase: the no-argument root-session picker.  The picker owns
-    // the terminal when a session is chosen, so the loading box and the bill
-    // replace its menu in the same viewport instead of leaving a second box
-    // in the scrollback.
+    // Optional phase: the no-argument picker.  The picker owns the terminal
+    // when an option is chosen, so the loading box and the bill replace its
+    // menu in the same viewport instead of leaving a second box in the
+    // scrollback.
     let mut terminal;
     let request = match request {
         crate::Request::Pick => {
             let roots =
                 recent_roots(&context, PICKER_LIMIT).map_err(|failure| failure.to_string())?;
+            let tabs = build_tabs(roots, chrono::Local::now().date_naive());
+            let option_count = tabs.iter().map(|tab| tab.options.len()).max().unwrap_or(0);
             let (_, terminal_height) = size().unwrap_or((0, 24));
-            let height = picker_height(roots.len(), terminal_height);
+            let height = picker_height(option_count, terminal_height);
             let mut picker = Terminal::with_options(
                 CrosstermBackend::new(io::stdout()),
                 TerminalOptions {
@@ -211,10 +214,10 @@ pub async fn run(
 
                 guard.park_below(frame.area().bottom().saturating_sub(1));
             }
-            match run_picker(&mut picker, &roots)? {
-                Some(index) => {
+            match run_picker(&mut picker, &tabs)? {
+                Some(request) => {
                     terminal = picker;
-                    crate::Request::Session(roots[index].id.clone())
+                    request
                 }
                 None => return Ok(TuiOutcome::Success),
             }
@@ -595,22 +598,150 @@ fn draw_failure(frame: &mut Frame, failure: &str) {
     );
 }
 
-/// Height of the picker viewport: the block borders, the root rows, and the
-/// hint line, clamped to the terminal height so inline rows never wrap.
+/// Height of the picker viewport: the block borders, the tab line, the
+/// option rows, and the hint line, clamped to the terminal height so inline
+/// rows never wrap.
 fn picker_height(count: usize, terminal_height: u16) -> u16 {
-    let needed = (4 + count as u16).max(5);
+    let needed = (5 + count as u16).max(6);
 
     needed.min(terminal_height.saturating_sub(1).max(5))
 }
 
-/// Runs the picker loop until the user selects a root or quits.
+/// One selectable picker option, resolved into a bill request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Pick {
+    /// One root session.
+    Session(RecentRoot),
+    /// One ISO calendar week of a year.
+    Week { year: u32, week: u32 },
+    /// One calendar month of a year.
+    Month { year: u32, month: u32 },
+    /// One calendar year.
+    Year { year: u32 },
+}
+
+impl Pick {
+    /// The row text of the option, without the selection marker.
+    fn label(&self) -> String {
+        match self {
+            Pick::Session(root) => {
+                let created = root
+                    .created_ms
+                    .map_or_else(|| "-".to_owned(), format_local_iso);
+
+                format!("{created}  {}", root.title)
+            }
+            Pick::Week { year, week } => format!("Week {week}, {year}"),
+            Pick::Month { year, month } => {
+                let date = NaiveDate::from_ymd_opt(*year as i32, *month, 1);
+
+                date.map_or_else(
+                    || format!("{year}-{month:02}"),
+                    |first| first.format("%B %Y").to_string(),
+                )
+            }
+            Pick::Year { year } => format!("{year}"),
+        }
+    }
+}
+
+/// One picker tab: its title and the options it lists.
+struct Tab {
+    /// Tab label, e.g. "session".
+    title: &'static str,
+    /// The tab's options, newest first.
+    options: Vec<Pick>,
+}
+
+/// Builds the four picker tabs: session, week, month, and year.
 ///
-/// Returns the chosen root index, or `None` when the user quit the picker
-/// without choosing.
+/// The session tab lists the most recent root sessions; the week, month, and
+/// year tabs list the last [`PICKER_LIMIT`] windows counting back from
+/// `today`.  The session tab opens first.
+fn build_tabs(roots: Vec<RecentRoot>, today: NaiveDate) -> Vec<Tab> {
+    vec![
+        Tab {
+            title: "session",
+            options: roots.into_iter().map(Pick::Session).collect(),
+        },
+        Tab {
+            title: "week",
+            options: last_weeks(today),
+        },
+        Tab {
+            title: "month",
+            options: last_months(today),
+        },
+        Tab {
+            title: "year",
+            options: last_years(today),
+        },
+    ]
+}
+
+/// The last [`PICKER_LIMIT`] ISO weeks, newest first, counting back from
+/// `today`.  Each window is its ISO week number and ISO year, so a window
+/// near a year boundary carries the previous ISO year.
+fn last_weeks(today: NaiveDate) -> Vec<Pick> {
+    (0..PICKER_LIMIT)
+        .map(|index| {
+            let date = today - ChronoDuration::days(7 * index as i64);
+            let iso = date.iso_week();
+
+            Pick::Week {
+                year: iso.year() as u32,
+                week: iso.week(),
+            }
+        })
+        .collect()
+}
+
+/// The last [`PICKER_LIMIT`] calendar months, newest first, counting back
+/// from `today`.  Each window is a month number of its year, so months
+/// before January carry the previous year.
+fn last_months(today: NaiveDate) -> Vec<Pick> {
+    (0..PICKER_LIMIT)
+        .map(|index| {
+            let offset = today.month() as i32 - index as i32 - 1;
+
+            Pick::Month {
+                year: (today.year() + offset.div_euclid(12)) as u32,
+                month: offset.rem_euclid(12) as u32 + 1,
+            }
+        })
+        .collect()
+}
+
+/// The last [`PICKER_LIMIT`] calendar years, newest first, counting back
+/// from `today`.
+fn last_years(today: NaiveDate) -> Vec<Pick> {
+    (0..PICKER_LIMIT)
+        .map(|index| Pick::Year {
+            year: (today.year() - index as i32) as u32,
+        })
+        .collect()
+}
+
+/// Resolves one picker option into the bill request it bills.
+fn request_for(option: &Pick) -> crate::Request {
+    match option {
+        Pick::Session(root) => crate::Request::Session(root.id.clone()),
+        Pick::Week { year, week } => crate::Request::Week(*year, *week),
+        Pick::Month { year, month } => crate::Request::Month(*year, *month),
+        Pick::Year { year } => crate::Request::Year(*year),
+    }
+}
+
+/// Runs the picker loop until the user selects an option or quits.
+///
+/// Returns the resolved bill request, or `None` when the user quit the
+/// picker without choosing.
 fn run_picker(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    roots: &[RecentRoot],
-) -> Result<Option<usize>, String> {
+    tabs: &[Tab],
+) -> Result<Option<crate::Request>, String> {
+    debug_assert!(!tabs.is_empty(), "the picker always has tabs");
+    let mut tab = 0usize;
     let mut selected = 0usize;
 
     loop {
@@ -620,19 +751,29 @@ fn run_picker(
             if let Event::Key(key) = event
                 && (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat)
             {
-                match pick_key(key, selected, roots.len()) {
+                match pick_key(key, selected, tabs[tab].options.len(), tabs.len()) {
                     PickAction::Quit => return Ok(None),
-                    PickAction::Select(index) => return Ok(Some(index)),
+                    PickAction::Select(index) => {
+                        return Ok(Some(request_for(&tabs[tab].options[index])));
+                    }
                     PickAction::MoveUp => selected = selected.saturating_sub(1),
                     PickAction::MoveDown => {
-                        selected = (selected + 1).min(roots.len().saturating_sub(1));
+                        selected = (selected + 1).min(tabs[tab].options.len().saturating_sub(1));
+                    }
+                    PickAction::NextTab => {
+                        tab = (tab + 1) % tabs.len();
+                        selected = 0;
+                    }
+                    PickAction::PrevTab => {
+                        tab = (tab + tabs.len() - 1) % tabs.len();
+                        selected = 0;
                     }
                     PickAction::Nothing => {}
                 }
             }
         }
         terminal
-            .draw(|frame| draw_picker(frame, roots, selected))
+            .draw(|frame| draw_picker(frame, tabs, tab, selected))
             .map_err(|failure| failure.to_string())?;
     }
 }
@@ -644,8 +785,12 @@ enum PickAction {
     MoveUp,
     /// Move the selection down one row.
     MoveDown,
-    /// Bill the root session at this index.
+    /// Bill the option at this index of the active tab.
     Select(usize),
+    /// Switch to the next tab.
+    NextTab,
+    /// Switch to the previous tab.
+    PrevTab,
     /// Quit without billing anything.
     Quit,
     /// The key did not map to an action.
@@ -656,7 +801,7 @@ enum PickAction {
 ///
 /// A pure function of the key and the selection state, so it is unit-testable
 /// without a terminal.
-fn pick_key(key: KeyEvent, selected: usize, count: usize) -> PickAction {
+fn pick_key(key: KeyEvent, selected: usize, count: usize, tab_count: usize) -> PickAction {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => PickAction::MoveUp,
         KeyCode::Down | KeyCode::Char('j') => PickAction::MoveDown,
@@ -672,6 +817,10 @@ fn pick_key(key: KeyEvent, selected: usize, count: usize) -> PickAction {
                 _ => PickAction::Nothing,
             }
         }
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if tab_count > 0 => PickAction::NextTab,
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if tab_count > 0 => {
+            PickAction::PrevTab
+        }
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => PickAction::Quit,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => PickAction::Quit,
         _ => PickAction::Nothing,
@@ -679,38 +828,52 @@ fn pick_key(key: KeyEvent, selected: usize, count: usize) -> PickAction {
 }
 
 /// Draws the picker menu in the current frame.
-fn draw_picker(frame: &mut Frame, roots: &[RecentRoot], selected: usize) {
+fn draw_picker(frame: &mut Frame, tabs: &[Tab], tab: usize, selected: usize) {
     let area = frame.area();
-    let paragraph =
-        Paragraph::new(picker_lines(roots, selected)).block(Block::bordered().title(PICKER_TITLE));
+    let paragraph = Paragraph::new(picker_lines(tabs, tab, selected))
+        .block(Block::bordered().title(PICKER_TITLE));
 
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);
 }
 
-/// One line per root plus the hint line.
-///
-/// The creation date comes first, the title after, and the selected row is
-/// highlighted.  Lines longer than the viewport are clipped, never wrapped.
-fn picker_lines(roots: &[RecentRoot], selected: usize) -> Vec<Line<'static>> {
-    let mut lines = roots
+/// One line of tab labels; the active tab is highlighted.
+fn tab_line(tabs: &[Tab], tab: usize) -> Line<'static> {
+    let spans = tabs
         .iter()
         .enumerate()
-        .map(|(index, root)| {
-            let created = root
-                .created_ms
-                .map_or_else(|| "-".to_owned(), format_local_iso);
-            let text = format!("▶ {created}  {}", root.title);
-            let style = if index == selected {
+        .map(|(index, item)| {
+            let style = if index == tab {
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::new().fg(Color::DarkGray)
             };
+            let prefix = if index == 0 { "" } else { "  " };
 
-            Line::from(Span::styled(text, style))
+            Span::styled(format!("{prefix}[ {} ]", item.title), style)
         })
         .collect::<Vec<_>>();
 
+    Line::from(spans)
+}
+
+/// One line per option of the active tab, plus the tab line and the hint.
+///
+/// Session rows put the creation date first, the title after; window rows
+/// carry the same label as their bill.  The selected row is highlighted.
+/// Lines longer than the viewport are clipped, never wrapped.
+fn picker_lines(tabs: &[Tab], tab: usize, selected: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![tab_line(tabs, tab)];
+
+    lines.extend(tabs[tab].options.iter().enumerate().map(|(index, option)| {
+        let style = if index == selected {
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        Line::from(Span::styled(format!("▶ {}", option.label()), style))
+    }));
     lines.push(Line::from(Span::styled(
         PICKER_HINT,
         Style::new().fg(Color::DarkGray),
@@ -1776,20 +1939,53 @@ mod tests {
     fn picker_selects_with_arrows_and_letters() {
         let key = |code| KeyEvent::new(code, KeyModifiers::empty());
 
-        assert_eq!(pick_key(key(KeyCode::Down), 0, 8), PickAction::MoveDown);
+        assert_eq!(pick_key(key(KeyCode::Down), 0, 8, 4), PickAction::MoveDown);
         assert_eq!(
-            pick_key(key(KeyCode::Char('j')), 0, 8),
+            pick_key(key(KeyCode::Char('j')), 0, 8, 4),
             PickAction::MoveDown
         );
-        assert_eq!(pick_key(key(KeyCode::Up), 1, 8), PickAction::MoveUp);
-        assert_eq!(pick_key(key(KeyCode::Char('k')), 1, 8), PickAction::MoveUp);
-        assert_eq!(pick_key(key(KeyCode::Enter), 3, 8), PickAction::Select(3));
+        assert_eq!(pick_key(key(KeyCode::Up), 1, 8, 4), PickAction::MoveUp);
         assert_eq!(
-            pick_key(key(KeyCode::Char('7')), 0, 8),
+            pick_key(key(KeyCode::Char('k')), 1, 8, 4),
+            PickAction::MoveUp
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::Enter), 3, 8, 4),
+            PickAction::Select(3)
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::Char('7')), 0, 8, 4),
             PickAction::Select(6)
         );
-        assert_eq!(pick_key(key(KeyCode::Char('9')), 0, 8), PickAction::Nothing);
-        assert_eq!(pick_key(key(KeyCode::Char('3')), 0, 2), PickAction::Nothing);
+        assert_eq!(
+            pick_key(key(KeyCode::Char('9')), 0, 8, 4),
+            PickAction::Nothing
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::Char('3')), 0, 2, 4),
+            PickAction::Nothing
+        );
+    }
+
+    #[test]
+    fn picker_switches_tabs_with_tab_arrows_and_letters() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::empty());
+
+        assert_eq!(pick_key(key(KeyCode::Tab), 0, 8, 4), PickAction::NextTab);
+        assert_eq!(pick_key(key(KeyCode::Right), 0, 8, 4), PickAction::NextTab);
+        assert_eq!(
+            pick_key(key(KeyCode::Char('l')), 0, 8, 4),
+            PickAction::NextTab
+        );
+        assert_eq!(
+            pick_key(key(KeyCode::BackTab), 0, 8, 4),
+            PickAction::PrevTab
+        );
+        assert_eq!(pick_key(key(KeyCode::Left), 0, 8, 4), PickAction::PrevTab);
+        assert_eq!(
+            pick_key(key(KeyCode::Char('h')), 0, 8, 4),
+            PickAction::PrevTab
+        );
     }
 
     #[test]
@@ -1797,19 +1993,19 @@ mod tests {
         let key = |code, modifiers| KeyEvent::new(code, modifiers);
 
         assert_eq!(
-            pick_key(key(KeyCode::Char('q'), KeyModifiers::empty()), 0, 8),
+            pick_key(key(KeyCode::Char('q'), KeyModifiers::empty()), 0, 8, 4),
             PickAction::Quit
         );
         assert_eq!(
-            pick_key(key(KeyCode::Char('Q'), KeyModifiers::empty()), 0, 8),
+            pick_key(key(KeyCode::Char('Q'), KeyModifiers::empty()), 0, 8, 4),
             PickAction::Quit
         );
         assert_eq!(
-            pick_key(key(KeyCode::Esc, KeyModifiers::empty()), 0, 8),
+            pick_key(key(KeyCode::Esc, KeyModifiers::empty()), 0, 8, 4),
             PickAction::Quit
         );
         assert_eq!(
-            pick_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), 0, 8),
+            pick_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), 0, 8, 4),
             PickAction::Quit
         );
     }
@@ -1818,33 +2014,40 @@ mod tests {
     fn picker_ignores_moves_and_selects_on_an_empty_list() {
         let key = |code| KeyEvent::new(code, KeyModifiers::empty());
 
-        assert_eq!(pick_key(key(KeyCode::Enter), 0, 0), PickAction::Nothing);
-        assert_eq!(pick_key(key(KeyCode::Down), 0, 0), PickAction::MoveDown);
+        assert_eq!(pick_key(key(KeyCode::Enter), 0, 0, 4), PickAction::Nothing);
+        assert_eq!(pick_key(key(KeyCode::Down), 0, 0, 4), PickAction::MoveDown);
     }
 
     #[test]
     fn picker_ignores_the_zero_key() {
         let key = |code| KeyEvent::new(code, KeyModifiers::empty());
 
-        assert_eq!(pick_key(key(KeyCode::Char('0')), 0, 8), PickAction::Nothing);
+        assert_eq!(
+            pick_key(key(KeyCode::Char('0')), 0, 8, 4),
+            PickAction::Nothing
+        );
     }
 
     #[test]
     fn picker_clamps_enter_to_the_last_row() {
         let key = |code| KeyEvent::new(code, KeyModifiers::empty());
 
-        assert_eq!(pick_key(key(KeyCode::Enter), 9, 3), PickAction::Select(2));
+        assert_eq!(
+            pick_key(key(KeyCode::Enter), 9, 3, 4),
+            PickAction::Select(2)
+        );
     }
 
     #[test]
     fn picker_rows_put_the_date_before_the_title() {
-        let roots = vec![RecentRoot {
+        let root = RecentRoot {
             id: "ses_a".to_owned(),
             title: "A root session".to_owned(),
             created_ms: Some(1_786_315_623_640),
-        }];
-        let lines = picker_lines(&roots, 0);
-        let rendered = lines[0].to_string();
+        };
+        let tabs = build_tabs(vec![root], NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+        let lines = picker_lines(&tabs, 0, 0);
+        let rendered = lines[1].to_string();
         let title_at = rendered.find("A root session");
         let time_at = rendered.find('T');
 
@@ -1856,17 +2059,167 @@ mod tests {
             "the date must come before the title: {rendered}"
         );
         assert!(
-            lines[1].to_string().contains(PICKER_HINT),
+            lines[2].to_string().contains(PICKER_HINT),
             "line: {}",
-            lines[1]
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn picker_opens_on_the_session_tab_first() {
+        let tabs = build_tabs(Vec::new(), NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+
+        assert_eq!(tabs.len(), 4);
+        assert_eq!(tabs[0].title, "session");
+        assert_eq!(tabs[1].title, "week");
+        assert_eq!(tabs[2].title, "month");
+        assert_eq!(tabs[3].title, "year");
+    }
+
+    #[test]
+    fn picker_draws_a_tab_line_above_the_options() {
+        let tabs = build_tabs(Vec::new(), NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+        let lines = picker_lines(&tabs, 1, 0);
+        let tab_line = lines[0].to_string();
+
+        assert!(tab_line.contains("[ session ]"), "line: {tab_line}");
+        assert!(tab_line.contains("[ week ]"), "line: {tab_line}");
+        assert!(tab_line.contains("[ month ]"), "line: {tab_line}");
+        assert!(tab_line.contains("[ year ]"), "line: {tab_line}");
+        assert!(lines[1].to_string().contains("Week "), "line: {}", lines[1]);
+    }
+
+    #[test]
+    fn picker_lists_the_last_eight_weeks_across_year_boundaries() {
+        let weeks = last_weeks(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
+
+        assert_eq!(weeks.len(), 8);
+        // 2027-01-01 is a Friday in ISO week 53 of 2026.
+        assert_eq!(
+            weeks[0],
+            Pick::Week {
+                year: 2026,
+                week: 53
+            }
+        );
+        assert_eq!(
+            weeks[7],
+            Pick::Week {
+                year: 2026,
+                week: 46
+            }
+        );
+    }
+
+    #[test]
+    fn picker_lists_the_last_eight_months() {
+        let months = last_months(NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+
+        assert_eq!(months.len(), 8);
+        assert_eq!(
+            months[0],
+            Pick::Month {
+                year: 2026,
+                month: 8
+            }
+        );
+        assert_eq!(
+            months[7],
+            Pick::Month {
+                year: 2026,
+                month: 1
+            }
+        );
+    }
+
+    #[test]
+    fn picker_months_cross_the_year_boundary() {
+        let months = last_months(NaiveDate::from_ymd_opt(2026, 3, 11).unwrap());
+
+        assert_eq!(months.len(), 8);
+        assert_eq!(
+            months[5],
+            Pick::Month {
+                year: 2025,
+                month: 10
+            }
+        );
+        assert_eq!(
+            months[7],
+            Pick::Month {
+                year: 2025,
+                month: 8
+            }
+        );
+    }
+
+    #[test]
+    fn picker_lists_the_last_eight_years() {
+        let years = last_years(NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
+
+        assert_eq!(years.len(), 8);
+        assert_eq!(years[0], Pick::Year { year: 2026 });
+        assert_eq!(years[7], Pick::Year { year: 2019 });
+    }
+
+    #[test]
+    fn window_options_carry_their_bill_labels() {
+        assert_eq!(
+            Pick::Week {
+                year: 2026,
+                week: 32
+            }
+            .label(),
+            "Week 32, 2026"
+        );
+        assert_eq!(
+            Pick::Month {
+                year: 2026,
+                month: 2
+            }
+            .label(),
+            "February 2026"
+        );
+        assert_eq!(Pick::Year { year: 2025 }.label(), "2025");
+    }
+
+    #[test]
+    fn picker_options_resolve_into_bill_requests() {
+        let root = RecentRoot {
+            id: "ses_a".to_owned(),
+            title: "A root session".to_owned(),
+            created_ms: None,
+        };
+
+        assert_eq!(
+            request_for(&Pick::Session(root.clone())),
+            crate::Request::Session("ses_a".to_owned())
+        );
+        assert_eq!(
+            request_for(&Pick::Week {
+                year: 2026,
+                week: 32
+            }),
+            crate::Request::Week(2026, 32)
+        );
+        assert_eq!(
+            request_for(&Pick::Month {
+                year: 2026,
+                month: 8
+            }),
+            crate::Request::Month(2026, 8)
+        );
+        assert_eq!(
+            request_for(&Pick::Year { year: 2025 }),
+            crate::Request::Year(2025)
         );
     }
 
     #[test]
     fn picker_height_grows_with_the_row_count_when_the_terminal_allows() {
-        assert_eq!(picker_height(0, 24), 5);
-        assert_eq!(picker_height(3, 24), 7);
-        assert_eq!(picker_height(8, 24), 12);
+        assert_eq!(picker_height(0, 24), 6);
+        assert_eq!(picker_height(3, 24), 8);
+        assert_eq!(picker_height(8, 24), 13);
     }
 
     #[test]
