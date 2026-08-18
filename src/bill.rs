@@ -2011,8 +2011,8 @@ Amount due:  $0.125000 USD
             ]
         ));
         // The bar graphs replace the TOTAL table.
-        assert!(bill.contains("REQUESTS BY WEEK     Month total: 1"));
-        assert!(bill.contains("AMOUNT DUE BY WEEK   Month total: $0.125000 USD"));
+        assert!(bill.contains("REQUESTS    Total: 1"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.125000 USD"));
         // Wall-clock bounds belong to session bills only.
         assert!(!bill.contains("WALL TIME"));
         assert!(!bill.contains("Started:"));
@@ -2059,18 +2059,18 @@ Amount due:  $0.125000 USD
                 "$0.125000"
             ]
         ));
-        assert!(january.contains("REQUESTS BY WEEK     Month total: 1"));
+        assert!(january.contains("REQUESTS    Total: 1"));
 
         let september = generate_monthly_bill(&context, 2001, 9, &[])?;
 
         assert!(september.contains("Sessions: 1"));
-        assert!(september.contains("REQUESTS BY WEEK     Month total: 1"));
-        assert!(september.contains("AMOUNT DUE BY WEEK   Month total: $0.500000 USD"));
+        assert!(september.contains("REQUESTS    Total: 1"));
+        assert!(september.contains("AMOUNT DUE  Total: $0.500000 USD"));
 
         let february = generate_monthly_bill(&context, 1970, 2, &[])?;
 
         assert!(february.contains("Sessions: 0"));
-        assert!(february.contains("REQUESTS BY WEEK     Month total: 0"));
+        assert!(february.contains("REQUESTS    Total: 0"));
         Ok(())
     }
 
@@ -2133,8 +2133,8 @@ Amount due:  $0.125000 USD
             ]
         ));
         // The bar graphs replace the TOTAL table.
-        assert!(bill.contains("REQUESTS BY MONTH    Year total: 2"));
-        assert!(bill.contains("AMOUNT DUE BY MONTH  Year total: $0.625000 USD"));
+        assert!(bill.contains("REQUESTS    Total: 2"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.625000 USD"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
         // The fixture message has no creation time, so only June gets a bar;
@@ -2188,8 +2188,8 @@ Amount due:  $0.125000 USD
         assert!(bill.contains("Month:   January 1970"));
         // The bar graphs replace the TOTAL table; the fixture's timestamp-less
         // message counts in the month total but belongs to no bar.
-        assert!(bill.contains("REQUESTS BY WEEK     Month total: 3"));
-        assert!(bill.contains("AMOUNT DUE BY WEEK   Month total: $0.625000 USD"));
+        assert!(bill.contains("REQUESTS    Total: 3"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.625000 USD"));
         assert!(bill.contains("1   2   3   4   5"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
@@ -2271,8 +2271,8 @@ Amount due:  $0.125000 USD
         ));
         // The bar graphs replace the TOTAL table; calls outside the window
         // (the fixture's week-1 message and the next-week message) are absent.
-        assert!(bill.contains("REQUESTS BY DAY      Week total: 2"));
-        assert!(bill.contains("AMOUNT DUE BY DAY    Week total: $0.500000 USD"));
+        assert!(bill.contains("REQUESTS    Total: 2"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.500000 USD"));
         assert!(bill.contains("Mon Tue Wed Thu Fri Sat Sun"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
@@ -2576,7 +2576,7 @@ Amount due:  $0.125000 USD
                 "$1.000000"
             ]
         ));
-        assert!(bill.contains("REQUESTS BY MONTH    Year total: 2"));
+        assert!(bill.contains("REQUESTS    Total: 2"));
 
         // Legacy counting: one kept session + two messages, no parts, in
         // both the load and the parse universe; the three aggregate passes
@@ -2653,7 +2653,7 @@ Amount due:  $0.125000 USD
                 "$0.250000"
             ]
         ));
-        assert!(bill.contains("AMOUNT DUE BY WEEK   Month total: $0.250000 USD"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.250000 USD"));
         Ok(())
     }
 
@@ -3060,8 +3060,8 @@ Amount due:  $0.125000 USD
             ]
         ));
         assert!(!openai_only.contains("anthropic / claude-test"));
-        assert!(openai_only.contains("REQUESTS BY WEEK     Month total: 1"));
-        assert!(openai_only.contains("AMOUNT DUE BY WEEK   Month total: $0.125000 USD"));
+        assert!(openai_only.contains("REQUESTS    Total: 1"));
+        assert!(openai_only.contains("AMOUNT DUE  Total: $0.125000 USD"));
         Ok(())
     }
 

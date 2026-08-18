@@ -14,7 +14,7 @@ const GRAPH_BAR: &str = "██  ";
 const GRAPH_GAP: &str = "    ";
 /// Title padding, one column wider than the longest graph title so the
 /// window total always starts with a space.
-const GRAPH_TITLE_WIDTH: usize = 21;
+const GRAPH_TITLE_WIDTH: usize = 12;
 
 /// Renders the full bill for one session, calendar month, or calendar day.
 pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
@@ -133,10 +133,9 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
 /// The overall total is a value in the title, never a bar.  A metric with no
 /// usage in the window renders only the title line.
 pub fn graph_lines(graph: &BarGraph) -> Vec<String> {
-    let title = format!("{} BY {}", graph.label, graph.unit);
     let mut lines = vec![format!(
-        "{title:<GRAPH_TITLE_WIDTH$}{}: {}",
-        graph.total_label,
+        "{:<GRAPH_TITLE_WIDTH$}Total: {}",
+        graph.label,
         graph_total(graph)
     )];
     let max = graph.bars.iter().copied().max().unwrap_or(0);
@@ -301,13 +300,11 @@ mod tests {
             .collect(),
             total: 16,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         };
         let lines = graph_lines(&graph);
 
         assert_eq!(lines.len(), 10);
-        assert_eq!(lines[0], "REQUESTS BY MONTH    Year total: 16");
+        assert_eq!(lines[0], "REQUESTS    Total: 16");
         // The tallest month fills the top row; the 1-row month stays at the
         // bottom, so the top row ends with an empty gap.
         assert!(lines[1].starts_with(GRAPH_BAR));
@@ -328,13 +325,11 @@ mod tests {
                 .collect(),
             total: 16,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         };
         let lines = graph_lines(&graph);
 
         assert_eq!(lines.len(), 10);
-        assert_eq!(lines[0], "REQUESTS BY WEEK     Month total: 16");
+        assert_eq!(lines[0], "REQUESTS    Total: 16");
         assert!(lines[9].starts_with("31  32  33"));
         assert!(lines[9].ends_with("36  "));
     }
@@ -347,13 +342,11 @@ mod tests {
             labels: vec!["Jan".to_owned()],
             total: 0,
             kind: MetricKind::Cost,
-            unit: "MONTH",
-            total_label: "Year total",
         };
 
         assert_eq!(
             graph_lines(&graph),
-            vec!["AMOUNT DUE BY MONTH  Year total: $0.000000 USD"]
+            vec!["AMOUNT DUE  Total: $0.000000 USD"]
         );
     }
 
@@ -365,13 +358,8 @@ mod tests {
             labels: vec!["Jan".to_owned()],
             total: 3_600_000,
             kind: MetricKind::Duration,
-            unit: "MONTH",
-            total_label: "Year total",
         };
 
-        assert_eq!(
-            graph_lines(&graph),
-            vec!["API TIME BY MONTH    Year total: 1h 0m"]
-        );
+        assert_eq!(graph_lines(&graph), vec!["API TIME    Total: 1h 0m"]);
     }
 }

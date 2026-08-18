@@ -1570,8 +1570,6 @@ mod tests {
             labels: month_labels(),
             total: 12,
             kind: opencode_bill::MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         });
 
         let rows = build_rows(&report);
@@ -1630,8 +1628,6 @@ mod tests {
             labels: month_labels(),
             total: 12,
             kind: opencode_bill::MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         })
         .collect()
     }
@@ -1659,8 +1655,6 @@ mod tests {
                 .collect(),
             total: 6,
             kind: opencode_bill::MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         })
         .collect()
     }
@@ -1674,7 +1668,7 @@ mod tests {
         // eight graphs need three rows of 12 lines.
         assert_eq!(grid.len(), 36);
         assert_eq!(first.matches('┌').count(), 3);
-        assert!(grid[1].contains("REQUESTS BY MONTH"), "row: {}", grid[1]);
+        assert!(grid[1].contains("REQUESTS"), "row: {}", grid[1]);
     }
 
     #[test]
@@ -1691,7 +1685,7 @@ mod tests {
 
         assert_eq!(grid.len(), 12);
         assert_eq!(grid[0].matches('┌').count(), 8);
-        assert!(grid[1].contains("AMOUNT DUE BY MONTH"), "row: {}", grid[1]);
+        assert!(grid[1].contains("AMOUNT DUE"), "row: {}", grid[1]);
     }
 
     #[test]
@@ -1712,11 +1706,11 @@ mod tests {
         let grid = render_graph_grid(&month_graphs(), 200);
 
         // The week graphs are narrower than the year graphs (their widest
-        // line is the title, not the labels), so five blocks fit per row:
+        // line is the title, not the labels), so seven blocks fit per row:
         // two rows of 12 lines.
         assert_eq!(grid.len(), 24);
-        assert_eq!(grid[0].matches('┌').count(), 5);
-        assert!(grid[1].contains("REQUESTS BY WEEK"), "row: {}", grid[1]);
+        assert_eq!(grid[0].matches('┌').count(), 7);
+        assert!(grid[1].contains("REQUESTS"), "row: {}", grid[1]);
         assert!(
             grid[10].contains("31  32  33  34  35  36"),
             "row: {}",

@@ -84,11 +84,6 @@ pub struct BarGraph {
     pub total: u64,
     /// How the total is formatted for display.
     pub kind: MetricKind,
-    /// What each bar stands for, e.g. "MONTH" or "WEEK"; the title is
-    /// `"{label} BY {unit}"`.
-    pub unit: &'static str,
-    /// What the total is, e.g. "Year total" or "Month total".
-    pub total_label: &'static str,
 }
 
 /// Everything a renderer needs to show one bill.
@@ -203,8 +198,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.requests,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "INPUT",
@@ -212,8 +205,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.tokens.input,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "CACHE READ",
@@ -221,8 +212,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.tokens.cache_read,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "CACHE WRITE",
@@ -230,8 +219,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.tokens.cache_write,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "OUTPUT",
@@ -239,8 +226,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.tokens.output,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "REASONING",
@@ -248,8 +233,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.tokens.reasoning,
             kind: MetricKind::Count,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "API TIME",
@@ -257,8 +240,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels: labels.clone(),
             total: total.api_ms,
             kind: MetricKind::Duration,
-            unit: "MONTH",
-            total_label: "Year total",
         },
         BarGraph {
             label: "AMOUNT DUE",
@@ -268,8 +249,6 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             labels,
             total: cost_to_micros(total.cost).max(0) as u64,
             kind: MetricKind::Cost,
-            unit: "MONTH",
-            total_label: "Year total",
         },
     ]
 }
@@ -302,8 +281,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.requests,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "INPUT",
@@ -311,8 +288,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.tokens.input,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "CACHE READ",
@@ -320,8 +295,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.tokens.cache_read,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "CACHE WRITE",
@@ -329,8 +302,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.tokens.cache_write,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "OUTPUT",
@@ -338,8 +309,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.tokens.output,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "REASONING",
@@ -347,8 +316,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.tokens.reasoning,
             kind: MetricKind::Count,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "API TIME",
@@ -356,8 +323,6 @@ pub(crate) fn month_graphs(
             labels: labels.clone(),
             total: total.api_ms,
             kind: MetricKind::Duration,
-            unit: "WEEK",
-            total_label: "Month total",
         },
         BarGraph {
             label: "AMOUNT DUE",
@@ -368,8 +333,6 @@ pub(crate) fn month_graphs(
             labels,
             total: cost_to_micros(total.cost).max(0) as u64,
             kind: MetricKind::Cost,
-            unit: "WEEK",
-            total_label: "Month total",
         },
     ]
 }
@@ -388,8 +351,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.requests,
             kind: MetricKind::Count,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "INPUT",
@@ -397,8 +358,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.tokens.input,
             kind: MetricKind::Count,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "CACHE READ",
@@ -406,8 +365,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.tokens.cache_read,
             kind: MetricKind::Count,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "CACHE WRITE",
@@ -415,8 +372,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.tokens.cache_write,
             kind: MetricKind::Count,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "OUTPUT",
@@ -424,8 +379,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.tokens.output,
             kind: MetricKind::Count,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "REASONING",
@@ -433,8 +386,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.tokens.reasoning,
             kind: MetricKind::Count,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "API TIME",
@@ -442,8 +393,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels: labels.clone(),
             total: total.api_ms,
             kind: MetricKind::Duration,
-            unit: "DAY",
-            total_label: "Week total",
         },
         BarGraph {
             label: "AMOUNT DUE",
@@ -453,8 +402,6 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             labels,
             total: cost_to_micros(total.cost).max(0) as u64,
             kind: MetricKind::Cost,
-            unit: "DAY",
-            total_label: "Week total",
         },
     ]
 }
@@ -803,8 +750,6 @@ mod tests {
         assert_eq!(graphs[0].total, 12);
         assert_eq!(graphs[0].labels[0], "Jan");
         assert_eq!(graphs[0].labels[11], "Dec");
-        assert_eq!(graphs[0].unit, "MONTH");
-        assert_eq!(graphs[0].total_label, "Year total");
         assert_eq!(graphs[6].label, "API TIME");
         assert_eq!(graphs[6].bars[1], 2);
         assert_eq!(graphs[7].label, "AMOUNT DUE");
@@ -840,8 +785,6 @@ mod tests {
         assert_eq!(graphs[0].bars, [5, 7, 0]);
         assert_eq!(graphs[0].labels, ["31", "32", "33"]);
         assert_eq!(graphs[0].total, 12);
-        assert_eq!(graphs[0].unit, "WEEK");
-        assert_eq!(graphs[0].total_label, "Month total");
         assert_eq!(graphs[6].label, "API TIME");
         assert_eq!(graphs[6].bars[1], 2);
         assert_eq!(graphs[7].label, "AMOUNT DUE");
@@ -885,8 +828,6 @@ mod tests {
             ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         );
         assert_eq!(graphs[0].total, 12);
-        assert_eq!(graphs[0].unit, "DAY");
-        assert_eq!(graphs[0].total_label, "Week total");
         assert_eq!(graphs[6].label, "API TIME");
         assert_eq!(graphs[6].bars[1], 2);
         assert_eq!(graphs[7].label, "AMOUNT DUE");
