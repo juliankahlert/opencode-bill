@@ -1289,6 +1289,7 @@ mod tests {
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -1559,9 +1560,9 @@ Session: ses_abcdef123456
 Title:   Test session
 Sessions: 1 (root + descendants)
 
-PROVIDER / MODEL  | REQUESTS | INPUT | CACHE READ | CACHE WRITE | OUTPUT | REASONING | API TIME | COST (USD)
-------------------+----------+-------+------------+-------------+--------+-----------+----------+-----------
-openai / gpt-test |        1 |    10 |          6 |           1 |      4 |         2 |      0ms |  $0.125000
+PROVIDER / MODEL  | REQUESTS | INPUT | CACHE READ | CACHE WRITE |    HIT | OUTPUT | REASONING | API TIME | COST (USD)
+------------------+----------+-------+------------+-------------+--------+--------+-----------+----------+-----------
+openai / gpt-test |        1 |    10 |          6 |           1 | 35.29% |      4 |         2 |      0ms |  $0.125000
 
 USAGE BY AGENT CLASS
 AGENT   | SESSIONS | REQUESTS | INPUT | CACHE READ | CACHE WRITE | OUTPUT | REASONING | API TIME | COST (USD)
@@ -1590,9 +1591,9 @@ Session: ses_abcdef123456
 Title:   Test session
 Sessions: 1 (root + descendants)
 
-PROVIDER / MODEL  | REQUESTS | INPUT | CACHE READ | CACHE WRITE | OUTPUT | REASONING | API TIME | COST (USD)
-------------------+----------+-------+------------+-------------+--------+-----------+----------+-----------
-openai / gpt-test |        1 |    10 |          6 |           1 |      4 |         2 |      0ms |  $0.125000
+PROVIDER / MODEL  | REQUESTS | INPUT | CACHE READ | CACHE WRITE |    HIT | OUTPUT | REASONING | API TIME | COST (USD)
+------------------+----------+-------+------------+-------------+--------+--------+-----------+----------+-----------
+openai / gpt-test |        1 |    10 |          6 |           1 | 35.29% |      4 |         2 |      0ms |  $0.125000
 
 USAGE BY AGENT CLASS
 AGENT   | SESSIONS | REQUESTS | INPUT | CACHE READ | CACHE WRITE | OUTPUT | REASONING | API TIME | COST (USD)
@@ -1661,6 +1662,7 @@ Amount due:  $0.125000 USD
                 "30",
                 "18",
                 "3",
+                "35.29%",
                 "12",
                 "6",
                 "7s",
@@ -1787,6 +1789,7 @@ Amount due:  $0.125000 USD
                 "30",
                 "18",
                 "3",
+                "35.29%",
                 "12",
                 "6",
                 "7s",
@@ -1829,6 +1832,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "3s",
@@ -1918,6 +1922,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "0ms",
@@ -1932,6 +1937,7 @@ Amount due:  $0.125000 USD
                 "40",
                 "13",
                 "1",
+                "24.07%",
                 "16",
                 "5",
                 "0ms",
@@ -2004,6 +2010,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -2053,6 +2060,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -2126,6 +2134,7 @@ Amount due:  $0.125000 USD
                 "40",
                 "13",
                 "3",
+                "23.21%",
                 "16",
                 "5",
                 "0ms",
@@ -2263,6 +2272,7 @@ Amount due:  $0.125000 USD
                 "40",
                 "4",
                 "0",
+                "9.09%",
                 "10",
                 "2",
                 "0ms",
@@ -2570,6 +2580,7 @@ Amount due:  $0.125000 USD
                 "70",
                 "12",
                 "3",
+                "14.11%",
                 "18",
                 "3",
                 "3s",
@@ -2647,6 +2658,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "3s",
@@ -2687,6 +2699,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -2770,6 +2783,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "3s",
@@ -2816,6 +2830,7 @@ Amount due:  $0.125000 USD
                 "0",
                 "0",
                 "0",
+                "-",
                 "1.9k",
                 "0",
                 "0ms",
@@ -2861,6 +2876,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -2906,6 +2922,7 @@ Amount due:  $0.125000 USD
                 "1.0k",
                 "0",
                 "0",
+                "0.00%",
                 "1.9k",
                 "0",
                 "0ms",
@@ -2941,6 +2958,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -2977,6 +2995,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "0ms",
@@ -3001,6 +3020,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -3015,6 +3035,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "0ms",
@@ -3053,6 +3074,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "0ms",
@@ -3098,6 +3120,7 @@ Amount due:  $0.125000 USD
                 "10",
                 "6",
                 "1",
+                "35.29%",
                 "4",
                 "2",
                 "3s",
@@ -3317,6 +3340,7 @@ Amount due:  $0.125000 USD
                 "20",
                 "4",
                 "2",
+                "15.38%",
                 "8",
                 "1",
                 "0ms",
@@ -3378,6 +3402,7 @@ Amount due:  $0.125000 USD
                 "50",
                 "8",
                 "1",
+                "13.55%",
                 "10",
                 "2",
                 "0ms",

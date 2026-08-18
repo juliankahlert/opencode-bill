@@ -57,6 +57,9 @@ const COLUMNS: usize = 11;
 /// width must fit the longest header that lands in that column: col2 carries
 /// "CACHE READ" in the pricing table, col3 carries "CACHE WRITE" in pricing,
 /// col5 carries "CACHE WRITE" in the agent table.
+///
+/// The agent table fills all 11 columns, so the grid has no spare slot left:
+/// another column means widening [`COLUMNS`] and re-checking every width.
 const COLUMN_WIDTHS: [u16; COLUMNS] = [40, 14, 10, 11, 11, 11, 10, 10, 12, 13, 11];
 /// Spaces between adjacent table columns.
 const COLUMN_SPACING: u16 = 2;
@@ -911,6 +914,7 @@ fn build_rows(report: &BillReport) -> Vec<Row<'static>> {
         "INPUT",
         "CACHE READ",
         "CACHE WRITE",
+        "HIT",
         "OUTPUT",
         "REASONING",
         "API TIME",
@@ -1852,6 +1856,11 @@ mod tests {
         assert!(line.contains("CACHE READ"), "line: {line}");
         assert!(line.contains("CACHE WRITE"), "line: {line}");
         assert!(line.contains("COST (USD)"), "line: {line}");
+
+        // Row 2 is the provider/model header; it carries the cache-hit rate.
+        let usage = render_row(&table_buffer, 2, table_natural_width());
+
+        assert!(usage.contains("HIT"), "line: {usage}");
     }
 
     #[test]

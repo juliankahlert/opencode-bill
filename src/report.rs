@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::data::{
-    AgentId, AgentUsage, Interner, MICRO_PER_DOLLAR, ModelKey, ModelRates, Totals, World,
+    AgentId, AgentUsage, Interner, MICRO_PER_DOLLAR, ModelKey, ModelRates, Tokens, Totals, World,
     cost_to_micros,
 };
 use crate::timing::{format_duration, format_timestamp, span_ms};
@@ -461,6 +461,7 @@ fn usage_row(entry: (&ModelKey, &Totals), interner: &Interner) -> Vec<String> {
         compact_count(totals.tokens.input),
         compact_count(totals.tokens.cache_read),
         compact_count(totals.tokens.cache_write),
+        hit_rate(&totals.tokens),
         compact_count(totals.tokens.output),
         compact_count(totals.tokens.reasoning),
         format_duration(totals.api_ms),
@@ -485,6 +486,28 @@ fn agent_row(entry: (&AgentId, &AgentUsage), interner: &Interner) -> Vec<String>
         format_duration(totals.api_ms),
         marked_cost(cost_to_micros(totals.cost), has_estimated_cost(totals)),
     ]
+}
+
+/// Cache-hit share of one provider/model's prompt tokens, as "xx.xx%".
+///
+/// Prompt tokens are the uncached input plus the cache reads plus the cache
+/// writes; only the reads were served from cache, so writes count as misses.
+/// The ratio is computed in basis points so the text is bit-identical on
+/// every platform, with no float rounding in the rendered bill.  A row
+/// with no prompt tokens has no rate to show and renders "-".
+fn hit_rate(tokens: &Tokens) -> String {
+    let prompt = tokens
+        .input
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write);
+
+    if prompt == 0 {
+        return "-".to_owned();
+    }
+
+    let basis = u128::from(tokens.cache_read) * 10_000 / u128::from(prompt);
+
+    format!("{}.{:02}%", basis / 100, basis % 100)
 }
 
 /// One model pricing row.
@@ -1003,7 +1026,7 @@ mod tests {
         );
 
         assert_eq!(report.usage_cost_estimated, [true]);
-        assert_eq!(report.usage_rows[0][8], "$5.000000*");
+        assert_eq!(report.usage_rows[0][9], "$5.000000*");
         assert_eq!(report.agent_cost_estimated, [false]);
         assert_eq!(report.agent_rows[0][9], "$3.000000");
         assert!(report.amount_due_estimated);
@@ -1110,7 +1133,7 @@ mod tests {
         let usage_cost = report
             .usage_rows
             .iter()
-            .map(|row| row[8].as_str())
+            .map(|row| row[9].as_str())
             .collect::<Vec<_>>();
         let agent_cost = report
             .agent_rows
@@ -1123,6 +1146,44 @@ mod tests {
         assert!(usage_cost.contains(&"$3.000000 "));
         assert!(agent_cost.contains(&"$5.000000*"));
         assert!(agent_cost.contains(&"$3.000000 "));
+    }
+
+    #[test]
+    fn hit_rate_divides_cache_reads_by_prompt_tokens() {
+        let tokens = Tokens {
+            input: 10,
+            cache_read: 6,
+            cache_write: 1,
+            ..Tokens::default()
+        };
+
+        // 6 of 17 prompt tokens came from cache; writes count as misses.
+        assert_eq!(hit_rate(&tokens), "35.29%");
+    }
+
+    #[test]
+    fn hit_rate_renders_a_dash_without_prompt_tokens() {
+        let tokens = Tokens {
+            output: 4,
+            ..Tokens::default()
+        };
+
+        assert_eq!(hit_rate(&tokens), "-");
+    }
+
+    #[test]
+    fn hit_rate_reports_the_full_and_the_empty_cache() {
+        let all = Tokens {
+            cache_read: 40,
+            ..Tokens::default()
+        };
+        let none = Tokens {
+            input: 40,
+            ..Tokens::default()
+        };
+
+        assert_eq!(hit_rate(&all), "100.00%");
+        assert_eq!(hit_rate(&none), "0.00%");
     }
 
     #[test]
@@ -1183,7 +1244,7 @@ mod tests {
         );
 
         assert_eq!(report.usage_cost_estimated, [false]);
-        assert_eq!(report.usage_rows[0][8], "$3.000000");
+        assert_eq!(report.usage_rows[0][9], "$3.000000");
         assert_eq!(report.agent_cost_estimated, [false]);
         assert!(!report.amount_due_estimated);
         let amount_due = &report.totals.last().expect("amount due row").1;

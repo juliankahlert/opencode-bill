@@ -68,6 +68,7 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
             "INPUT",
             "CACHE READ",
             "CACHE WRITE",
+            "HIT",
             "OUTPUT",
             "REASONING",
             "API TIME",
