@@ -37,7 +37,7 @@ pub use bill::{
 pub use context::{DataDirectorySet, MissingDataDirectory, StorageContext, StorageContextBuilder};
 pub use data::BillProgress;
 pub use error::BillError;
-pub use render::{graph_lines, render_bill};
+pub use render::{graph_body_lines, graph_lines, render_bill};
 pub use report::{BarGraph, BillHeader, BillReport, ESTIMATED_NOTE, MetricKind};
 pub use store::RecentRoot;
 pub use timing::format_local_iso;

@@ -134,11 +134,19 @@ pub fn render_bill(report: &BillReport) -> Result<String, BillError> {
 /// The overall total is a value in the title, never a bar.  A metric with no
 /// usage in the window renders only the title line.
 pub fn graph_lines(graph: &BarGraph) -> Vec<String> {
-    let mut lines = vec![format!(
-        "{:<GRAPH_TITLE_WIDTH$}Total: {}",
-        graph.label,
-        graph_total(graph)
-    )];
+    let mut lines = graph_body_lines(graph);
+
+    lines[0] = format!("{:<GRAPH_TITLE_WIDTH$}{}", graph.label, lines[0]);
+    lines
+}
+
+/// Lines of one bar graph without its label: the window total, the vertical
+/// bars, and the period labels.
+///
+/// Callers that show the label elsewhere -- the TUI puts it in the block's
+/// border -- use this instead of [`graph_lines`].
+pub fn graph_body_lines(graph: &BarGraph) -> Vec<String> {
+    let mut lines = vec![format!("Total: {}", graph_total(graph))];
     let max = graph.bars.iter().copied().max().unwrap_or(0);
 
     if max > 0 {
