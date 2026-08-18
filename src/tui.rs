@@ -20,7 +20,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use opencode_bill::{
     BarGraph, BillError, BillHeader, BillProgress, BillReport, ESTIMATED_NOTE, RecentRoot,
-    StorageContext, format_local_iso, graph_lines, load_day_report_with_progress_counted,
+    StorageContext, format_local_iso, graph_body_lines, load_day_report_with_progress_counted,
     load_month_report_with_progress_counted, load_report_with_progress_counted,
     load_week_report_with_progress_counted, load_year_report_with_progress_counted, recent_roots,
 };
@@ -987,15 +987,18 @@ fn table_natural_width() -> u16 {
 /// row share the row's tallest height; shorter graphs pad with blank lines.
 /// Each returned line is one styled terminal row of the finished grid.
 fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
-    let blocks = graphs.iter().map(graph_lines).collect::<Vec<_>>();
+    let blocks = graphs.iter().map(graph_body_lines).collect::<Vec<_>>();
 
     if blocks.is_empty() {
         return Vec::new();
     }
 
+    // The label sits in the block's top border, so it counts toward the
+    // width just like the graph's own lines.
     let content_width = blocks
         .iter()
         .flat_map(|lines| lines.iter().map(|line| line.chars().count()))
+        .chain(graphs.iter().map(|graph| graph.label.chars().count()))
         .max()
         .unwrap_or(1)
         .max(1)
@@ -1030,7 +1033,16 @@ fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
                 let content_area =
                     Rect::new(x + 1, y_offset + 1, block_width as u16 - 2, row_height);
 
-                ratatui::widgets::Widget::render(Block::bordered(), block_area, &mut buffer);
+                let title = Span::styled(
+                    graphs[row_index * columns + column].label,
+                    Style::new().add_modifier(Modifier::BOLD),
+                );
+
+                ratatui::widgets::Widget::render(
+                    Block::bordered().title(title),
+                    block_area,
+                    &mut buffer,
+                );
                 ratatui::widgets::Widget::render(
                     Paragraph::new(styled_graph_lines(lines, row_height)),
                     content_area,
@@ -1045,7 +1057,7 @@ fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
         .collect()
 }
 
-/// Pads a graph's lines to a row height and styles them: the title line
+/// Pads a graph's lines to a row height and styles them: the total line
 /// bold, the month labels dim.
 fn styled_graph_lines(lines: &[String], row_height: u16) -> Vec<Line<'static>> {
     let padded_len = usize::from(row_height);
@@ -1672,7 +1684,7 @@ mod tests {
         // eight graphs need three rows of 12 lines.
         assert_eq!(grid.len(), 36);
         assert_eq!(first.matches('┌').count(), 3);
-        assert!(grid[1].contains("REQUESTS"), "row: {}", grid[1]);
+        assert!(grid[0].contains("REQUESTS"), "row: {}", grid[0]);
     }
 
     #[test]
@@ -1689,7 +1701,7 @@ mod tests {
 
         assert_eq!(grid.len(), 12);
         assert_eq!(grid[0].matches('┌').count(), 8);
-        assert!(grid[1].contains("AMOUNT DUE"), "row: {}", grid[1]);
+        assert!(grid[0].contains("AMOUNT DUE"), "row: {}", grid[0]);
     }
 
     #[test]
@@ -1714,7 +1726,7 @@ mod tests {
         // two rows of 12 lines.
         assert_eq!(grid.len(), 24);
         assert_eq!(grid[0].matches('┌').count(), 7);
-        assert!(grid[1].contains("REQUESTS"), "row: {}", grid[1]);
+        assert!(grid[0].contains("REQUESTS"), "row: {}", grid[0]);
         assert!(
             grid[10].contains("31  32  33  34  35  36"),
             "row: {}",
