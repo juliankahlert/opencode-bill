@@ -2110,7 +2110,7 @@ Amount due:  $0.125000 USD
         ));
         // The bar graphs replace the TOTAL table.
         assert!(bill.contains("REQUESTS    Total: 1"));
-        assert!(bill.contains("AMOUNT DUE  Total: $0.125000 USD"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.125000"));
         // Wall-clock bounds belong to session bills only.
         assert!(!bill.contains("WALL TIME"));
         assert!(!bill.contains("Started:"));
@@ -2164,7 +2164,7 @@ Amount due:  $0.125000 USD
 
         assert!(september.contains("Sessions: 1"));
         assert!(september.contains("REQUESTS    Total: 1"));
-        assert!(september.contains("AMOUNT DUE  Total: $0.500000 USD"));
+        assert!(september.contains("AMOUNT DUE  Total: $0.500000"));
 
         let february = generate_monthly_bill(&context, 1970, 2, &[])?;
 
@@ -2234,7 +2234,7 @@ Amount due:  $0.125000 USD
         ));
         // The bar graphs replace the TOTAL table.
         assert!(bill.contains("REQUESTS    Total: 2"));
-        assert!(bill.contains("AMOUNT DUE  Total: $0.625000 USD"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.625000"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
         // The fixture message has no creation time, so only June gets a bar;
@@ -2289,7 +2289,7 @@ Amount due:  $0.125000 USD
         // The bar graphs replace the TOTAL table; the fixture's timestamp-less
         // message counts in the month total but belongs to no bar.
         assert!(bill.contains("REQUESTS    Total: 3"));
-        assert!(bill.contains("AMOUNT DUE  Total: $0.625000 USD"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.625000"));
         assert!(bill.contains("LIMIT       Remaining: $249.375000"));
         assert!(bill.contains("1   2   3   4   5"));
         assert!(!bill.contains("Amount due:"));
@@ -2386,7 +2386,7 @@ Amount due:  $0.125000 USD
         // The bar graphs replace the TOTAL table; calls outside the window
         // (the fixture's week-1 message and the next-week message) are absent.
         assert!(bill.contains("REQUESTS    Total: 2"));
-        assert!(bill.contains("AMOUNT DUE  Total: $0.500000 USD"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.500000"));
         assert!(bill.contains("Mon Tue Wed Thu Fri Sat Sun"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
@@ -2769,7 +2769,7 @@ Amount due:  $0.125000 USD
                 "$0.250000"
             ]
         ));
-        assert!(bill.contains("AMOUNT DUE  Total: $0.250000 USD"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.250000"));
         Ok(())
     }
 
@@ -3187,7 +3187,7 @@ Amount due:  $0.125000 USD
         ));
         assert!(!openai_only.contains("anthropic / claude-test"));
         assert!(openai_only.contains("REQUESTS    Total: 1"));
-        assert!(openai_only.contains("AMOUNT DUE  Total: $0.125000 USD"));
+        assert!(openai_only.contains("AMOUNT DUE  Total: $0.125000"));
         Ok(())
     }
 

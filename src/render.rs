@@ -256,7 +256,7 @@ fn graph_total(graph: &BarGraph) -> String {
     match graph.kind {
         MetricKind::Count => compact_count(graph.total),
         MetricKind::Duration => format_duration(graph.total),
-        MetricKind::Cost => format!("{} USD", format_cost(graph.total as i64)),
+        MetricKind::Cost => format_cost(graph.total as i64),
         MetricKind::Limit => format_limit(graph.total),
     }
 }
@@ -430,10 +430,7 @@ mod tests {
             muted_bars: Vec::new(),
         };
 
-        assert_eq!(
-            graph_lines(&graph),
-            vec!["AMOUNT DUE  Total: $0.000000 USD"]
-        );
+        assert_eq!(graph_lines(&graph), vec!["AMOUNT DUE  Total: $0.000000"]);
     }
 
     #[test]
