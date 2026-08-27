@@ -2290,7 +2290,7 @@ Amount due:  $0.125000 USD
         // message counts in the month total but belongs to no bar.
         assert!(bill.contains("REQUESTS    Total: 3"));
         assert!(bill.contains("AMOUNT DUE  Total: $0.625000 USD"));
-        assert!(bill.contains("LIMIT       Total: $250.000000 USD"));
+        assert!(bill.contains("LIMIT       Remaining: $249.375000"));
         assert!(bill.contains("1   2   3   4   5"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
@@ -2304,7 +2304,7 @@ Amount due:  $0.125000 USD
 
         let bill = generate_monthly_bill_with_limit(&context, 1970, 1, &[], 1_000_000)?;
 
-        assert!(bill.contains("LIMIT       Total: $1.000000 USD"));
+        assert!(bill.contains("LIMIT       Remaining: $0.875000"));
         assert!(bill.contains("-----"));
         Ok(())
     }

@@ -84,8 +84,11 @@ pub struct BarGraph {
     /// One label per bar, e.g. "Jan" for a year bill or "31" for a month
     /// bill's calendar weeks.
     pub labels: Vec<String>,
-    /// The whole-window total of the metric, displayed as a value.
+    /// The whole-window total of the metric, or the remaining amount for a
+    /// LIMIT graph.
     pub total: u64,
+    /// Configured spending limit used to scale and annotate a LIMIT graph.
+    pub limit: Option<u64>,
     /// How the total is formatted for display.
     pub kind: MetricKind,
     /// Whether each bar represents a calendar period that has not started.
@@ -207,6 +210,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.requests).to_vec(),
             labels: labels.clone(),
             total: total.requests,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -215,6 +219,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.tokens.input).to_vec(),
             labels: labels.clone(),
             total: total.tokens.input,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -223,6 +228,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.tokens.cache_read).to_vec(),
             labels: labels.clone(),
             total: total.tokens.cache_read,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -231,6 +237,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.tokens.cache_write).to_vec(),
             labels: labels.clone(),
             total: total.tokens.cache_write,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -239,6 +246,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.tokens.output).to_vec(),
             labels: labels.clone(),
             total: total.tokens.output,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -247,6 +255,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.tokens.reasoning).to_vec(),
             labels: labels.clone(),
             total: total.tokens.reasoning,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -255,6 +264,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
             bars: months.map(|month| month.api_ms).to_vec(),
             labels: labels.clone(),
             total: total.api_ms,
+            limit: None,
             kind: MetricKind::Duration,
             muted_bars: Vec::new(),
         },
@@ -265,6 +275,7 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
                 .to_vec(),
             labels: labels.clone(),
             total: cost_to_micros(total.cost).max(0) as u64,
+            limit: None,
             kind: MetricKind::Cost,
             muted_bars: Vec::new(),
         },
@@ -277,8 +288,9 @@ pub(crate) fn year_graphs(months: [Totals; 12], total: &Totals) -> Vec<BarGraph>
 /// `week_numbers` the matching ISO week numbers, which name the bars; `total`
 /// is the whole-month total, shown as a value instead of a bar. The LIMIT
 /// graph contains cumulative weekly costs and uses `limit_micros` as its
-/// displayed limit. An empty week list yields no graphs, so an out-of-range
-/// month falls back to the plain TOTAL table.
+/// scale; its displayed value is the remaining limit. An empty week
+/// list yields no graphs, so an out-of-range month falls back to the plain
+/// TOTAL table.
 pub(crate) fn month_graphs(
     year: i32,
     month: u32,
@@ -320,6 +332,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.requests).collect(),
             labels: labels.clone(),
             total: total.requests,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -328,6 +341,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.tokens.input).collect(),
             labels: labels.clone(),
             total: total.tokens.input,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -336,6 +350,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.tokens.cache_read).collect(),
             labels: labels.clone(),
             total: total.tokens.cache_read,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -344,6 +359,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.tokens.cache_write).collect(),
             labels: labels.clone(),
             total: total.tokens.cache_write,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -352,6 +368,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.tokens.output).collect(),
             labels: labels.clone(),
             total: total.tokens.output,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -360,6 +377,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.tokens.reasoning).collect(),
             labels: labels.clone(),
             total: total.tokens.reasoning,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -368,6 +386,7 @@ pub(crate) fn month_graphs(
             bars: weeks.iter().map(|week| week.api_ms).collect(),
             labels: labels.clone(),
             total: total.api_ms,
+            limit: None,
             kind: MetricKind::Duration,
             muted_bars: Vec::new(),
         },
@@ -379,6 +398,7 @@ pub(crate) fn month_graphs(
                 .collect(),
             labels: labels.clone(),
             total: cost_to_micros(total.cost).max(0) as u64,
+            limit: None,
             kind: MetricKind::Cost,
             muted_bars: Vec::new(),
         },
@@ -387,7 +407,8 @@ pub(crate) fn month_graphs(
         label: "LIMIT",
         bars: cumulative_costs,
         labels,
-        total: limit_micros,
+        total: limit_micros.saturating_sub(cost_to_micros(total.cost).max(0) as u64),
+        limit: Some(limit_micros),
         kind: MetricKind::Limit,
         muted_bars,
     });
@@ -421,6 +442,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.requests).to_vec(),
             labels: labels.clone(),
             total: total.requests,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -429,6 +451,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.tokens.input).to_vec(),
             labels: labels.clone(),
             total: total.tokens.input,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -437,6 +460,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.tokens.cache_read).to_vec(),
             labels: labels.clone(),
             total: total.tokens.cache_read,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -445,6 +469,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.tokens.cache_write).to_vec(),
             labels: labels.clone(),
             total: total.tokens.cache_write,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -453,6 +478,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.tokens.output).to_vec(),
             labels: labels.clone(),
             total: total.tokens.output,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -461,6 +487,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.tokens.reasoning).to_vec(),
             labels: labels.clone(),
             total: total.tokens.reasoning,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         },
@@ -469,6 +496,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
             bars: weekdays.map(|day| day.api_ms).to_vec(),
             labels: labels.clone(),
             total: total.api_ms,
+            limit: None,
             kind: MetricKind::Duration,
             muted_bars: Vec::new(),
         },
@@ -479,6 +507,7 @@ pub(crate) fn week_graphs(weekdays: [Totals; 7], total: &Totals) -> Vec<BarGraph
                 .to_vec(),
             labels,
             total: cost_to_micros(total.cost).max(0) as u64,
+            limit: None,
             kind: MetricKind::Cost,
             muted_bars: Vec::new(),
         },
@@ -903,7 +932,8 @@ mod tests {
         assert_eq!(graphs[7].total, 30);
         assert_eq!(graphs[8].label, "LIMIT");
         assert_eq!(graphs[8].bars, [5, 30, 30]);
-        assert_eq!(graphs[8].total, 250_000_000);
+        assert_eq!(graphs[8].total, 249_999_970);
+        assert_eq!(graphs[8].limit, Some(250_000_000));
         assert_eq!(graphs[8].muted_bars, vec![false, false, true]);
     }
 

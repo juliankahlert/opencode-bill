@@ -1651,6 +1651,7 @@ mod tests {
             bars: vec![1; 12],
             labels: month_labels(),
             total: 12,
+            limit: None,
             kind: opencode_bill::MetricKind::Count,
             muted_bars: Vec::new(),
         });
@@ -1710,6 +1711,7 @@ mod tests {
             bars: vec![1; 12],
             labels: month_labels(),
             total: 12,
+            limit: None,
             kind: opencode_bill::MetricKind::Count,
             muted_bars: Vec::new(),
         })
@@ -1739,6 +1741,11 @@ mod tests {
                 .map(str::to_owned)
                 .collect(),
             total: if label == "LIMIT" { 250_000_000 } else { 6 },
+            limit: if label == "LIMIT" {
+                Some(250_000_000)
+            } else {
+                None
+            },
             kind: if label == "LIMIT" {
                 opencode_bill::MetricKind::Limit
             } else {
@@ -1824,6 +1831,7 @@ mod tests {
             bars: vec![1, 1],
             labels: vec!["31".to_owned(), "32".to_owned()],
             total: 2,
+            limit: Some(2),
             kind: opencode_bill::MetricKind::Limit,
             muted_bars: vec![false, true],
         };

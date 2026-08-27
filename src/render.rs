@@ -149,7 +149,12 @@ pub fn graph_lines(graph: &BarGraph) -> Vec<String> {
 /// Callers that show the label elsewhere -- the TUI puts it in the block's
 /// border -- use this instead of [`graph_lines`].
 pub fn graph_body_lines(graph: &BarGraph) -> Vec<String> {
-    let mut lines = vec![format!("Total: {}", graph_total(graph))];
+    let value_label = if matches!(graph.kind, MetricKind::Limit) {
+        "Remaining"
+    } else {
+        "Total"
+    };
+    let mut lines = vec![format!("{value_label}: {}", graph_total(graph))];
     let max = graph_max(graph);
 
     if max > 0 || matches!(graph.kind, MetricKind::Limit) {
@@ -204,10 +209,10 @@ fn graph_max(graph: &BarGraph) -> u64 {
     let bars_max = graph.bars.iter().copied().max().unwrap_or(0);
 
     if matches!(graph.kind, MetricKind::Limit) {
-        if graph.total == 0 {
+        if graph.limit.unwrap_or(0) == 0 {
             bars_max
         } else {
-            graph.total
+            graph.limit.unwrap_or(0)
         }
     } else {
         bars_max
@@ -225,7 +230,7 @@ fn limit_reference_row(graph: &BarGraph, max: u64) -> Option<u64> {
     }
 
     let scaled_midpoint =
-        (u128::from(graph.total) * u128::from(GRAPH_HEIGHT)) / (2 * u128::from(max));
+        (u128::from(graph.limit.unwrap_or(0)) * u128::from(GRAPH_HEIGHT)) / (2 * u128::from(max));
 
     Some(
         u64::try_from(scaled_midpoint)
@@ -246,13 +251,13 @@ fn limit_line(graph: &BarGraph) -> String {
     "-".repeat(width)
 }
 
-/// Formats a graph's window total per its metric kind.
+/// Formats a graph's displayed value per its metric kind.
 fn graph_total(graph: &BarGraph) -> String {
     match graph.kind {
         MetricKind::Count => compact_count(graph.total),
         MetricKind::Duration => format_duration(graph.total),
         MetricKind::Cost => format!("{} USD", format_cost(graph.total as i64)),
-        MetricKind::Limit => format!("{} USD", format_limit(graph.total)),
+        MetricKind::Limit => format_limit(graph.total),
     }
 }
 
@@ -374,6 +379,7 @@ mod tests {
             .map(str::to_owned)
             .collect(),
             total: 16,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         };
@@ -400,6 +406,7 @@ mod tests {
                 .map(str::to_owned)
                 .collect(),
             total: 16,
+            limit: None,
             kind: MetricKind::Count,
             muted_bars: Vec::new(),
         };
@@ -418,6 +425,7 @@ mod tests {
             bars: vec![0; 12],
             labels: vec!["Jan".to_owned()],
             total: 0,
+            limit: None,
             kind: MetricKind::Cost,
             muted_bars: Vec::new(),
         };
@@ -435,6 +443,7 @@ mod tests {
             bars: vec![0; 12],
             labels: vec!["Jan".to_owned()],
             total: 3_600_000,
+            limit: None,
             kind: MetricKind::Duration,
             muted_bars: Vec::new(),
         };
@@ -446,19 +455,20 @@ mod tests {
     fn renders_limit_graph_with_cumulative_bars_and_half_line() {
         let graph = BarGraph {
             label: "LIMIT",
-            bars: vec![25, 50, 125],
+            bars: vec![25, 50, 75],
             labels: vec!["31", "32", "33"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            total: 100,
+            total: 25,
+            limit: Some(100),
             kind: MetricKind::Limit,
             muted_bars: Vec::new(),
         };
 
         let lines = graph_lines(&graph);
 
-        assert_eq!(lines[0], "LIMIT       Total: $0.000100 USD");
+        assert_eq!(lines[0], "LIMIT       Remaining: $0.000025");
         assert!(lines.iter().any(|line| line == "------------"));
         assert_eq!(lines.len(), 10);
     }
@@ -467,14 +477,30 @@ mod tests {
     fn formats_large_limit_without_signed_overflow() {
         let graph = BarGraph {
             label: "LIMIT",
-            bars: vec![u64::MAX],
+            bars: vec![0],
             labels: vec!["1".to_owned()],
             total: u64::MAX,
+            limit: Some(u64::MAX),
             kind: MetricKind::Limit,
             muted_bars: Vec::new(),
         };
 
-        assert!(graph_lines(&graph)[0].contains("$18446744073709.551615 USD"));
+        assert!(graph_lines(&graph)[0].contains("$18446744073709.551615"));
+    }
+
+    #[test]
+    fn clamps_remaining_limit_at_zero_after_overspending() {
+        let graph = BarGraph {
+            label: "LIMIT",
+            bars: vec![125],
+            labels: vec!["1".to_owned()],
+            total: 0,
+            limit: Some(100),
+            kind: MetricKind::Limit,
+            muted_bars: Vec::new(),
+        };
+
+        assert_eq!(graph_lines(&graph)[0], "LIMIT       Remaining: $0.000000");
     }
 
     #[test]
@@ -484,6 +510,7 @@ mod tests {
             bars: vec![1],
             labels: vec!["1".to_owned()],
             total: 1,
+            limit: Some(1),
             kind: MetricKind::Limit,
             muted_bars: Vec::new(),
         };
