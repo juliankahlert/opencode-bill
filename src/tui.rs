@@ -615,6 +615,8 @@ fn picker_height(count: usize, terminal_height: u16) -> u16 {
 enum Pick {
     /// One root session.
     Session(RecentRoot),
+    /// One calendar day of a year.
+    Day { year: u32, month: u32, day: u32 },
     /// One ISO calendar week of a year.
     Week { year: u32, week: u32 },
     /// One calendar month of a year.
@@ -634,6 +636,11 @@ impl Pick {
 
                 format!("{created}  {}", root.title)
             }
+            Pick::Day { year, month, day } => NaiveDate::from_ymd_opt(*year as i32, *month, *day)
+                .map_or_else(
+                    || format!("{year}-{month:02}-{day:02}"),
+                    |date| format!("{} {} {}", date.format("%B"), date.day(), date.year()),
+                ),
             Pick::Week { year, week } => format!("Week {week}, {year}"),
             Pick::Month { year, month } => {
                 let date = NaiveDate::from_ymd_opt(*year as i32, *month, 1);
@@ -656,16 +663,20 @@ struct Tab {
     options: Vec<Pick>,
 }
 
-/// Builds the four picker tabs: session, week, month, and year.
+/// Builds the five picker tabs: session, day, week, month, and year.
 ///
-/// The session tab lists the most recent root sessions; the week, month, and
-/// year tabs list the last [`PICKER_LIMIT`] windows counting back from
-/// `today`.  The session tab opens first.
+/// The session tab lists the most recent root sessions; the day, week, month,
+/// and year tabs list the last [`PICKER_LIMIT`] windows counting back from
+/// `today`. The session tab opens first.
 fn build_tabs(roots: Vec<RecentRoot>, today: NaiveDate) -> Vec<Tab> {
     vec![
         Tab {
             title: "session",
             options: roots.into_iter().map(Pick::Session).collect(),
+        },
+        Tab {
+            title: "day",
+            options: last_days(today),
         },
         Tab {
             title: "week",
@@ -680,6 +691,22 @@ fn build_tabs(roots: Vec<RecentRoot>, today: NaiveDate) -> Vec<Tab> {
             options: last_years(today),
         },
     ]
+}
+
+/// The last [`PICKER_LIMIT`] calendar days, newest first, counting back from
+/// `today`.
+fn last_days(today: NaiveDate) -> Vec<Pick> {
+    (0..PICKER_LIMIT)
+        .map(|index| {
+            let date = today - ChronoDuration::days(index as i64);
+
+            Pick::Day {
+                year: date.year() as u32,
+                month: date.month(),
+                day: date.day(),
+            }
+        })
+        .collect()
 }
 
 /// The last [`PICKER_LIMIT`] ISO weeks, newest first, counting back from
@@ -729,6 +756,7 @@ fn last_years(today: NaiveDate) -> Vec<Pick> {
 fn request_for(option: &Pick) -> crate::Request {
     match option {
         Pick::Session(root) => crate::Request::Session(root.id.clone()),
+        Pick::Day { year, month, day } => crate::Request::Day(*year, *month, *day),
         Pick::Week { year, week } => crate::Request::Week(*year, *week),
         Pick::Month { year, month } => crate::Request::Month(*year, *month),
         Pick::Year { year } => crate::Request::Year(*year),
@@ -2084,11 +2112,12 @@ mod tests {
     fn picker_opens_on_the_session_tab_first() {
         let tabs = build_tabs(Vec::new(), NaiveDate::from_ymd_opt(2026, 8, 11).unwrap());
 
-        assert_eq!(tabs.len(), 4);
+        assert_eq!(tabs.len(), 5);
         assert_eq!(tabs[0].title, "session");
-        assert_eq!(tabs[1].title, "week");
-        assert_eq!(tabs[2].title, "month");
-        assert_eq!(tabs[3].title, "year");
+        assert_eq!(tabs[1].title, "day");
+        assert_eq!(tabs[2].title, "week");
+        assert_eq!(tabs[3].title, "month");
+        assert_eq!(tabs[4].title, "year");
     }
 
     #[test]
@@ -2098,10 +2127,15 @@ mod tests {
         let tab_line = lines[0].to_string();
 
         assert!(tab_line.contains("[ session ]"), "line: {tab_line}");
+        assert!(tab_line.contains("[ day ]"), "line: {tab_line}");
         assert!(tab_line.contains("[ week ]"), "line: {tab_line}");
         assert!(tab_line.contains("[ month ]"), "line: {tab_line}");
         assert!(tab_line.contains("[ year ]"), "line: {tab_line}");
-        assert!(lines[1].to_string().contains("Week "), "line: {}", lines[1]);
+        assert!(
+            lines[1].to_string().contains("August 11 2026"),
+            "line: {}",
+            lines[1]
+        );
     }
 
     #[test]
@@ -2122,6 +2156,29 @@ mod tests {
             Pick::Week {
                 year: 2026,
                 week: 46
+            }
+        );
+    }
+
+    #[test]
+    fn picker_lists_the_last_eight_days_across_month_boundaries() {
+        let days = last_days(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+
+        assert_eq!(days.len(), 8);
+        assert_eq!(
+            days[0],
+            Pick::Day {
+                year: 2026,
+                month: 8,
+                day: 3
+            }
+        );
+        assert_eq!(
+            days[7],
+            Pick::Day {
+                year: 2026,
+                month: 7,
+                day: 27
             }
         );
     }
@@ -2180,6 +2237,15 @@ mod tests {
     #[test]
     fn window_options_carry_their_bill_labels() {
         assert_eq!(
+            Pick::Day {
+                year: 2026,
+                month: 2,
+                day: 8
+            }
+            .label(),
+            "February 8 2026"
+        );
+        assert_eq!(
             Pick::Week {
                 year: 2026,
                 week: 32
@@ -2209,6 +2275,14 @@ mod tests {
         assert_eq!(
             request_for(&Pick::Session(root.clone())),
             crate::Request::Session("ses_a".to_owned())
+        );
+        assert_eq!(
+            request_for(&Pick::Day {
+                year: 2026,
+                month: 8,
+                day: 8
+            }),
+            crate::Request::Day(2026, 8, 8)
         );
         assert_eq!(
             request_for(&Pick::Week {
