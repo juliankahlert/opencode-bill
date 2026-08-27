@@ -21,6 +21,9 @@ use crate::store::{
 };
 use crate::timing::{earliest, latest};
 
+/// Default monthly spending limit in micro-dollars.
+pub const DEFAULT_SPENDING_LIMIT_MICROS: u64 = 250_000_000;
+
 /// Lockless progress counters of one bill pipeline run.
 ///
 /// Every counter is an atomic updated from the parallel workers, so no lock
@@ -128,7 +131,33 @@ pub fn generate_monthly_bill(
     month: u32,
     providers: &[String],
 ) -> Result<String, BillError> {
-    let report = load_month_report_with_progress(context, year, month, providers, |_| {})?;
+    generate_monthly_bill_with_limit(
+        context,
+        year,
+        month,
+        providers,
+        DEFAULT_SPENDING_LIMIT_MICROS,
+    )
+}
+
+/// Generates a deterministic plain-text bill for one calendar month with a
+/// configurable cumulative weekly spending limit graph.
+pub fn generate_monthly_bill_with_limit(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    providers: &[String],
+    limit_micros: u64,
+) -> Result<String, BillError> {
+    let report = load_month_report_with_progress_counted_with_limit(
+        context,
+        year,
+        month,
+        providers,
+        |_| {},
+        &BillProgress::default(),
+        limit_micros,
+    )?;
 
     render_bill(&report)
 }
@@ -264,7 +293,15 @@ pub fn load_month_report_with_progress(
 ) -> Result<BillReport, BillError> {
     let counters = BillProgress::default();
 
-    load_month_report_with_progress_counted(context, year, month, providers, on_task, &counters)
+    load_month_report_with_progress_counted_with_limit(
+        context,
+        year,
+        month,
+        providers,
+        on_task,
+        &counters,
+        DEFAULT_SPENDING_LIMIT_MICROS,
+    )
 }
 
 /// Loads one calendar month and builds the report data, reporting each work
@@ -281,6 +318,27 @@ pub fn load_month_report_with_progress_counted(
     on_task: impl FnMut(&str),
     counters: &BillProgress,
 ) -> Result<BillReport, BillError> {
+    load_month_report_with_progress_counted_with_limit(
+        context,
+        year,
+        month,
+        providers,
+        on_task,
+        counters,
+        DEFAULT_SPENDING_LIMIT_MICROS,
+    )
+}
+
+/// Loads one calendar month and builds the report data with a spending limit.
+pub fn load_month_report_with_progress_counted_with_limit(
+    context: &StorageContext,
+    year: u32,
+    month: u32,
+    providers: &[String],
+    on_task: impl FnMut(&str),
+    counters: &BillProgress,
+    limit_micros: u64,
+) -> Result<BillReport, BillError> {
     let mut on_task = on_task;
     let progress = PipelineProgress::with_counters(counters.clone());
 
@@ -289,6 +347,7 @@ pub fn load_month_report_with_progress_counted(
         year,
         month,
         providers,
+        limit_micros,
         &mut on_task,
         &progress,
     ))?
@@ -464,6 +523,7 @@ async fn load_month_report_async(
     year: u32,
     month: u32,
     providers: &[String],
+    limit_micros: u64,
     on_task: &mut impl FnMut(&str),
     progress: &PipelineProgress,
 ) -> Result<BillReport, BillError> {
@@ -471,10 +531,16 @@ async fn load_month_report_async(
     progress.note_phase(0);
     let window = CalendarWindow::month(year, month)?;
     let weeks = month_weeks(year as i32, month).unwrap_or_default();
+    let today = chrono::Utc::now().date_naive();
     let streamed = load_streaming_system(
         context,
         &window,
-        GraphMode::Month,
+        GraphMode::Month {
+            year: year as i32,
+            month,
+            limit_micros,
+            today,
+        },
         weeks,
         providers,
         progress,
@@ -482,7 +548,18 @@ async fn load_month_report_async(
     )
     .await?;
 
-    summarize_streamed_async(streamed, providers, GraphMode::Month, on_task, progress)
+    summarize_streamed_async(
+        streamed,
+        providers,
+        GraphMode::Month {
+            year: year as i32,
+            month,
+            limit_micros,
+            today,
+        },
+        on_task,
+        progress,
+    )
 }
 
 /// The async day pipeline: streams the store on the blocking pool (a day
@@ -583,7 +660,12 @@ enum GraphMode {
     /// No graphs: the TOTAL table.
     None,
     /// One graph per calendar week of the billed month.
-    Month,
+    Month {
+        year: i32,
+        month: u32,
+        limit_micros: u64,
+        today: chrono::NaiveDate,
+    },
     /// One graph per calendar day of the billed week.
     Week,
     /// One graph per calendar month of the billed year.
@@ -731,7 +813,7 @@ async fn load_streaming_system(
         aggregates.seed_agents(&world.sessions);
         match mode {
             GraphMode::None | GraphMode::Year => {}
-            GraphMode::Month => aggregates.set_weeks(weeks),
+            GraphMode::Month { .. } => aggregates.set_weeks(weeks),
             GraphMode::Week => aggregates.set_weekday_fold(),
         }
 
@@ -934,10 +1016,19 @@ fn summarize_streamed_async(
     let total = streamed.aggregates.total();
     let graphs = match mode {
         GraphMode::None => Vec::new(),
-        GraphMode::Month => month_graphs(
+        GraphMode::Month {
+            year,
+            month,
+            limit_micros,
+            today,
+        } => month_graphs(
+            year,
+            month,
             &streamed.aggregates.week_totals,
             &streamed.aggregates.weeks,
             &total,
+            limit_micros,
+            today,
         ),
         GraphMode::Week => week_graphs(streamed.aggregates.weekdays, &total),
         GraphMode::Year => year_graphs(streamed.aggregates.months, &total),
@@ -2199,9 +2290,22 @@ Amount due:  $0.125000 USD
         // message counts in the month total but belongs to no bar.
         assert!(bill.contains("REQUESTS    Total: 3"));
         assert!(bill.contains("AMOUNT DUE  Total: $0.625000 USD"));
+        assert!(bill.contains("LIMIT       Total: $250.000000 USD"));
         assert!(bill.contains("1   2   3   4   5"));
         assert!(!bill.contains("Amount due:"));
         assert!(!bill.contains("TOTAL\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn monthly_limit_graph_uses_custom_limit_and_cumulative_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture()?;
+
+        let bill = generate_monthly_bill_with_limit(&context, 1970, 1, &[], 1_000_000)?;
+
+        assert!(bill.contains("LIMIT       Total: $1.000000 USD"));
+        assert!(bill.contains("-----"));
         Ok(())
     }
 

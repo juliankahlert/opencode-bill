@@ -1,16 +1,22 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use chrono::{Datelike, NaiveDate};
 use clap::Parser;
 use log::debug;
 use opencode_bill::{
-    StorageContext, generate_bill, generate_daily_bill, generate_monthly_bill,
-    generate_weekly_bill, generate_yearly_bill,
+    DEFAULT_SPENDING_LIMIT_MICROS, StorageContext, generate_bill, generate_daily_bill,
+    generate_monthly_bill_with_limit, generate_weekly_bill, generate_yearly_bill,
 };
+use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::ToPrimitive;
 
 mod tui;
+
+const MICRO_PER_DOLLAR: u32 = 1_000_000;
 
 /// Command-line arguments for one bill request.
 #[derive(Parser)]
@@ -74,6 +80,34 @@ struct Arguments {
     /// Only include usage from this provider; repeatable
     #[arg(long = "provider", value_name = "PROVIDER")]
     providers: Vec<String>,
+
+    /// Monthly spending limit in dollars; only used by the month report
+    #[arg(
+        long,
+        value_name = "DOLLAR",
+        value_parser = parse_limit,
+        conflicts_with_all = ["year", "week", "today", "session"]
+    )]
+    limit: Option<u64>,
+}
+
+/// Parses a non-negative dollar amount into micro-dollars.
+fn parse_limit(value: &str) -> Result<u64, String> {
+    let dollars =
+        Decimal::from_str(value).map_err(|_| "limit must be a dollar amount".to_owned())?;
+
+    if dollars.is_sign_negative() {
+        return Err("limit must not be negative".to_owned());
+    }
+
+    dollars
+        .checked_mul(Decimal::from(MICRO_PER_DOLLAR))
+        .and_then(|micros| {
+            micros
+                .round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven)
+                .to_u64()
+        })
+        .ok_or_else(|| "limit is too large".to_owned())
 }
 
 /// What the user asked to bill.
@@ -103,6 +137,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let today = chrono::Local::now().date_naive();
     let has_session = arguments.session.is_some();
+    let has_limit = arguments.limit.is_some();
+    let limit_micros = arguments.limit.unwrap_or(DEFAULT_SPENDING_LIMIT_MICROS);
     let request = resolve_request(
         arguments.month,
         arguments.year,
@@ -122,13 +158,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             arguments.today,
             arguments.week,
             has_session,
+            has_limit,
         ) {
             Request::Pick
         } else {
             request
         };
 
-        return match tui::run(context, request, arguments.providers).await? {
+        return match tui::run(context, request, arguments.providers, limit_micros).await? {
             tui::TuiOutcome::Success => Ok(()),
             tui::TuiOutcome::Failed(failure) => Err(failure.into()),
         };
@@ -137,7 +174,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let providers = &arguments.providers;
     let bill = match &request {
         Request::Session(reference) => generate_bill(&context, reference, providers)?,
-        Request::Month(year, month) => generate_monthly_bill(&context, *year, *month, providers)?,
+        Request::Month(year, month) => {
+            generate_monthly_bill_with_limit(&context, *year, *month, providers, limit_micros)?
+        }
         Request::Year(year) => generate_yearly_bill(&context, *year, providers)?,
         Request::Day(year, month, day) => {
             generate_daily_bill(&context, *year, *month, *day, providers)?
@@ -165,8 +204,9 @@ fn wants_picker(
     today: bool,
     week: Option<u8>,
     has_session: bool,
+    has_limit: bool,
 ) -> bool {
-    month.is_none() && year.is_none() && !today && week.is_none() && !has_session
+    month.is_none() && year.is_none() && !today && week.is_none() && !has_session && !has_limit
 }
 
 /// Map the CLI arguments to one bill request.
@@ -238,17 +278,50 @@ mod tests {
 
     #[test]
     fn bare_invocation_opens_the_picker() {
-        assert!(wants_picker(None, None, false, None, false));
+        assert!(wants_picker(None, None, false, None, false, false));
+    }
+
+    #[test]
+    fn parses_spending_limit_as_micro_dollars() {
+        assert_eq!(parse_limit("250"), Ok(250_000_000));
+        assert_eq!(parse_limit("12.345678"), Ok(12_345_678));
+        assert!(parse_limit("-1").is_err());
+        assert!(parse_limit("not-money").is_err());
+    }
+
+    #[test]
+    fn limit_flag_selects_the_month_report_without_a_window_flag() {
+        let arguments = Arguments::try_parse_from(["opencode-bill", "--limit", "125"])
+            .expect("valid limit arguments");
+
+        assert_eq!(arguments.limit, Some(125_000_000));
+        assert!(!wants_picker(
+            arguments.month,
+            arguments.year,
+            arguments.today,
+            arguments.week,
+            arguments.session.is_some(),
+            arguments.limit.is_some(),
+        ));
+    }
+
+    #[test]
+    fn limit_flag_conflicts_with_non_month_reports() {
+        assert!(Arguments::try_parse_from(["opencode-bill", "--limit", "1", "--year"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--limit", "1", "--week"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--limit", "1", "--today"]).is_err());
+        assert!(Arguments::try_parse_from(["opencode-bill", "--limit", "1", "abc123"]).is_err());
     }
 
     #[test]
     fn every_window_arg_and_session_skips_the_picker() {
-        assert!(!wants_picker(Some(0), None, false, None, false));
-        assert!(!wants_picker(Some(2), None, false, None, false));
-        assert!(!wants_picker(None, Some(0), false, None, false));
-        assert!(!wants_picker(None, None, true, None, false));
-        assert!(!wants_picker(None, None, false, Some(0), false));
-        assert!(!wants_picker(None, None, false, None, true));
+        assert!(!wants_picker(Some(0), None, false, None, false, false));
+        assert!(!wants_picker(Some(2), None, false, None, false, false));
+        assert!(!wants_picker(None, Some(0), false, None, false, false));
+        assert!(!wants_picker(None, None, true, None, false, false));
+        assert!(!wants_picker(None, None, false, Some(0), false, false));
+        assert!(!wants_picker(None, None, false, None, true, false));
+        assert!(!wants_picker(None, None, false, None, false, true));
     }
 
     #[test]

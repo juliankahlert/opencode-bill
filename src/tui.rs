@@ -21,7 +21,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use opencode_bill::{
     BarGraph, BillError, BillHeader, BillProgress, BillReport, ESTIMATED_NOTE, RecentRoot,
     StorageContext, format_local_iso, graph_body_lines, load_day_report_with_progress_counted,
-    load_month_report_with_progress_counted, load_report_with_progress_counted,
+    load_month_report_with_progress_counted_with_limit, load_report_with_progress_counted,
     load_week_report_with_progress_counted, load_year_report_with_progress_counted, recent_roots,
 };
 use ratatui::backend::CrosstermBackend;
@@ -83,6 +83,7 @@ async fn worker(
     context: StorageContext,
     request: crate::Request,
     providers: Vec<String>,
+    limit_micros: u64,
     counters: BillProgress,
     sender: mpsc::UnboundedSender<Progress>,
 ) {
@@ -96,7 +97,7 @@ async fn worker(
             },
             &counters,
         ),
-        crate::Request::Month(year, month) => load_month_report_with_progress_counted(
+        crate::Request::Month(year, month) => load_month_report_with_progress_counted_with_limit(
             &context,
             year,
             month,
@@ -105,6 +106,7 @@ async fn worker(
                 let _ = sender.send(Progress::Task(task.to_owned()));
             },
             &counters,
+            limit_micros,
         ),
         crate::Request::Day(year, month, day) => load_day_report_with_progress_counted(
             &context,
@@ -186,6 +188,7 @@ pub async fn run(
     context: StorageContext,
     request: crate::Request,
     providers: Vec<String>,
+    limit_micros: u64,
 ) -> Result<TuiOutcome, String> {
     let mut guard = TerminalGuard::enter()?;
     // Start on a fresh row so the viewport does not overwrite the shell prompt line.
@@ -248,7 +251,14 @@ pub async fn run(
     let counters = BillProgress::default();
     let worker_counters = counters.clone();
 
-    let worker_task = tokio::spawn(worker(context, request, providers, worker_counters, sender));
+    let worker_task = tokio::spawn(worker(
+        context,
+        request,
+        providers,
+        limit_micros,
+        worker_counters,
+        sender,
+    ));
 
     let mut app = App {
         view: View::Loading {
@@ -1072,7 +1082,11 @@ fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
                     &mut buffer,
                 );
                 ratatui::widgets::Widget::render(
-                    Paragraph::new(styled_graph_lines(lines, row_height)),
+                    Paragraph::new(styled_graph_lines(
+                        lines,
+                        row_height,
+                        &graphs[row_index * columns + column],
+                    )),
                     content_area,
                     &mut buffer,
                 );
@@ -1085,9 +1099,9 @@ fn render_graph_grid(graphs: &[BarGraph], terminal_width: u16) -> Vec<String> {
         .collect()
 }
 
-/// Pads a graph's lines to a row height and styles them: the total line
-/// bold, the month labels dim.
-fn styled_graph_lines(lines: &[String], row_height: u16) -> Vec<Line<'static>> {
+/// Pads graph lines to a row height and styles them: the total line bold, the
+/// calendar labels dim, and LIMIT bars for future weeks dim.
+fn styled_graph_lines(lines: &[String], row_height: u16, graph: &BarGraph) -> Vec<Line<'static>> {
     let padded_len = usize::from(row_height);
 
     (0..padded_len)
@@ -1101,7 +1115,31 @@ fn styled_graph_lines(lines: &[String], row_height: u16) -> Vec<Line<'static>> {
                 Modifier::empty()
             };
 
-            Line::from(Span::styled(text, Style::new().add_modifier(modifier)))
+            if index == 0
+                || index + 1 == padded_len
+                || graph.muted_bars.is_empty()
+                || text.chars().all(|character| character == '-')
+            {
+                return Line::from(Span::styled(text, Style::new().add_modifier(modifier)));
+            }
+
+            let characters = text.chars().collect::<Vec<_>>();
+            let spans = characters
+                .chunks(4)
+                .enumerate()
+                .map(|(bar, characters)| {
+                    let segment = characters.iter().collect::<String>();
+                    let style = if graph.muted_bars.get(bar).copied().unwrap_or(false) {
+                        Style::new().add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default()
+                    };
+
+                    Span::styled(segment, style)
+                })
+                .collect::<Vec<_>>();
+
+            Line::from(spans).style(Style::new().add_modifier(modifier))
         })
         .collect()
 }
@@ -1614,6 +1652,7 @@ mod tests {
             labels: month_labels(),
             total: 12,
             kind: opencode_bill::MetricKind::Count,
+            muted_bars: Vec::new(),
         });
 
         let rows = build_rows(&report);
@@ -1672,11 +1711,12 @@ mod tests {
             labels: month_labels(),
             total: 12,
             kind: opencode_bill::MetricKind::Count,
+            muted_bars: Vec::new(),
         })
         .collect()
     }
 
-    /// The eight month graphs mirroring the day TOTAL rows, with bars for
+    /// The month graphs mirroring the day TOTAL rows, with bars for
     /// the six calendar weeks of August 2026.
     fn month_graphs() -> Vec<BarGraph> {
         [
@@ -1688,6 +1728,7 @@ mod tests {
             "REASONING",
             "API TIME",
             "AMOUNT DUE",
+            "LIMIT",
         ]
         .into_iter()
         .map(|label| BarGraph {
@@ -1697,8 +1738,17 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            total: 6,
-            kind: opencode_bill::MetricKind::Count,
+            total: if label == "LIMIT" { 250_000_000 } else { 6 },
+            kind: if label == "LIMIT" {
+                opencode_bill::MetricKind::Limit
+            } else {
+                opencode_bill::MetricKind::Count
+            },
+            muted_bars: if label == "LIMIT" {
+                vec![false; 6]
+            } else {
+                Vec::new()
+            },
         })
         .collect()
     }
@@ -1765,6 +1815,29 @@ mod tests {
     #[test]
     fn renders_an_empty_graph_grid() {
         assert!(render_graph_grid(&[], 200).is_empty());
+    }
+
+    #[test]
+    fn mutes_future_limit_bars_but_not_started_bars() {
+        let graph = BarGraph {
+            label: "LIMIT",
+            bars: vec![1, 1],
+            labels: vec!["31".to_owned(), "32".to_owned()],
+            total: 2,
+            kind: opencode_bill::MetricKind::Limit,
+            muted_bars: vec![false, true],
+        };
+
+        let lines = styled_graph_lines(&graph_body_lines(&graph), 10, &graph);
+        let bar_line = lines
+            .iter()
+            .find(|line| {
+                line.spans.len() == 2 && line.spans.iter().all(|span| span.content.contains('█'))
+            })
+            .expect("LIMIT graph should contain a row of bars");
+
+        assert!(!bar_line.spans[0].style.add_modifier.contains(Modifier::DIM));
+        assert!(bar_line.spans[1].style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

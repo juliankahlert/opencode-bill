@@ -27,10 +27,12 @@ mod store;
 mod timing;
 
 pub use bill::{
-    generate_bill, generate_daily_bill, generate_monthly_bill, generate_weekly_bill,
-    generate_yearly_bill, load_day_report_with_progress, load_day_report_with_progress_counted,
+    DEFAULT_SPENDING_LIMIT_MICROS, generate_bill, generate_daily_bill, generate_monthly_bill,
+    generate_monthly_bill_with_limit, generate_weekly_bill, generate_yearly_bill,
+    load_day_report_with_progress, load_day_report_with_progress_counted,
     load_month_report_with_progress, load_month_report_with_progress_counted,
-    load_report_with_progress, load_report_with_progress_counted, load_week_report_with_progress,
+    load_month_report_with_progress_counted_with_limit, load_report_with_progress,
+    load_report_with_progress_counted, load_week_report_with_progress,
     load_week_report_with_progress_counted, load_year_report_with_progress,
     load_year_report_with_progress_counted, recent_roots,
 };
