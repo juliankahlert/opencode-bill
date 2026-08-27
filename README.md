@@ -82,7 +82,7 @@ Usage
 -----
 
     opencode-bill [<session-id-or-prefix>] [--data-dir PATH]
-    opencode-bill [--month [MONTH]] [--data-dir PATH]
+    opencode-bill [--month [MONTH]] [--limit DOLLAR] [--data-dir PATH]
     opencode-bill [--year [YEAR]] [--data-dir PATH]
     opencode-bill [--week [WEEK]] [--data-dir PATH]
     opencode-bill [--today] [--data-dir PATH]
@@ -106,7 +106,10 @@ Usage
                          per total metric: each graph has a vertical bar
                          for every calendar week the month spans (four to
                          six) plus the month total as a value (the total is
-                         not a bar).
+                         not a bar). The LIMIT graph adds cumulative weekly
+                         spending bars against a $250 default limit; use
+                         --limit to change it. Its dashed line marks 50% of
+                         the limit.
 
   --year [YEAR]          Bill the calendar year instead of one session
                          and its sub-agents. With no value the current
@@ -136,7 +139,7 @@ Usage
                          month bill: the same data a `--month` bill covers,
                          restricted to messages recorded today.
 
-  --provider PROVIDER    Only include usage from this provider; repeatable.
+  --provider PROVIDER     Only include usage from this provider; repeatable.
                          When at least one is given, the usage, agent,
                          pricing, and total sections cover only the given
                          providers' requests, tokens, costs, and times, and
@@ -144,6 +147,10 @@ Usage
                          the billed period itself is unchanged. Names match
                          the stored provider IDs exactly, case-sensitive
                          (e.g. openai, anthropic, github-copilot).
+
+  --limit DOLLAR          Monthly spending limit for the LIMIT graph.
+                          Defaults to $250; dollar amounts may include
+                          fractional decimal places.
 
   --data-dir PATH        Path to the OpenCode data directory.
                          Defaults to the platform data directory
