@@ -167,7 +167,7 @@ pub fn graph_body_lines(graph: &BarGraph) -> Vec<String> {
 
         (0..GRAPH_HEIGHT).rev().for_each(|row| {
             if reference_row == Some(row) {
-                lines.push(limit_line(graph));
+                lines.push(limit_line(graph, &heights, row));
             } else {
                 lines.push(
                     heights
@@ -239,8 +239,20 @@ fn limit_reference_row(graph: &BarGraph, max: u64) -> Option<u64> {
     )
 }
 
-/// Renders the LIMIT graph's horizontal 50% reference line.
-fn limit_line(graph: &BarGraph) -> String {
+/// Renders the LIMIT graph's horizontal 50% reference line.  Bars that
+/// reach the row stay visible; dashes fill the space around them.  When no
+/// bar reaches the row the line is all dashes, at least
+/// [`GRAPH_LIMIT_MARKER`] wide so the marker never disappears.
+fn limit_line(graph: &BarGraph, heights: &[u64], row: u64) -> String {
+    let overlaid = heights
+        .iter()
+        .map(|height| if *height > row { "██--" } else { "----" })
+        .collect::<String>();
+
+    if overlaid.contains("██") {
+        return overlaid;
+    }
+
     let width = graph
         .bars
         .len()
@@ -466,7 +478,10 @@ mod tests {
         let lines = graph_lines(&graph);
 
         assert_eq!(lines[0], "LIMIT       Remaining: $0.000025");
-        assert!(lines.iter().any(|line| line == "------------"));
+        // The 50% line overlays the row: bars reaching it stay visible and
+        // dashes fill the rest, so no bar row is wiped out.
+        assert!(lines.iter().any(|line| line == "----██--██--"));
+        assert!(!lines.iter().any(|line| line == "------------"));
         assert_eq!(lines.len(), 10);
     }
 
@@ -514,6 +529,8 @@ mod tests {
 
         let lines = graph_lines(&graph);
 
-        assert_eq!(lines[5], "-----");
+        // The 50% line falls on the bar's row: the bar stays visible and the
+        // trailing gap carries the dashes.
+        assert_eq!(lines[5], "██--");
     }
 }

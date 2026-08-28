@@ -1806,11 +1806,10 @@ mod tests {
     fn grids_month_graphs_into_blocks_that_fit_the_terminal_width() {
         let grid = render_graph_grid(&month_graphs(), 200);
 
-        // The week graphs are narrower than the year graphs, so six blocks fit
-        // per row with the LIMIT graph's wider Remaining title: two rows of
-        // 12 lines.
+        // The week graphs are narrower than the year graphs, so seven blocks
+        // fit per row: two rows for the nine graphs.
         assert_eq!(grid.len(), 24);
-        assert_eq!(grid[0].matches('┌').count(), 6);
+        assert_eq!(grid[0].matches('┌').count(), 7);
         assert!(grid[0].contains("REQUESTS"), "row: {}", grid[0]);
         assert!(
             grid[10].contains("31  32  33  34  35  36"),
