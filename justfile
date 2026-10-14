@@ -65,3 +65,7 @@ doit: check-distro
 # Print the detected distro
 which-distro:
     @echo "{{distro}}"
+
+clean:
+    cargo clean
+
