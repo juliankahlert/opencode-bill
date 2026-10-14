@@ -13,7 +13,7 @@ use crate::data::{
     usd_to_micros,
 };
 use crate::error::BillError;
-use crate::store::{RawLoad, RawMessage, RawPart, RawWindowMeta};
+use crate::store::{Layout, RawLoad, RawMessage, RawPart, RawWindowMeta};
 use crate::timing::{earliest, latest, message_api_ms};
 
 /// Parses a JSON string, tagging failures with its location.
@@ -67,6 +67,15 @@ impl MessageFields {
             agent: string_at(values, 11),
             mode: string_at(values, 12),
         }
+    }
+
+    /// Whether any token lane of the message was recorded.
+    fn has_any_token(&self) -> bool {
+        self.tokens_input.is_some()
+            || self.tokens_output.is_some()
+            || self.tokens_reasoning.is_some()
+            || self.cache_read.is_some()
+            || self.cache_write.is_some()
     }
 }
 
@@ -170,37 +179,164 @@ struct GiantCache {
     write: Option<i64>,
 }
 
+/// Streaming envelope for oversized v2 payloads.
+///
+/// v2 stores the message kind in the table column (the payload JSON omits
+/// it) and nests the provider and model inside a `model` object; the tool
+/// spans live in the `content` array.  Like the v1 envelope, serde skips
+/// the unknown fields without building them.  The v1 `mode` fallback field
+/// does not exist in v2 (assistant messages always declare `agent`), so its
+/// lane stays empty here.
+#[allow(non_snake_case)]
+#[derive(serde::Deserialize)]
+struct GiantV2Envelope {
+    #[serde(default)]
+    model: Option<GiantV2Model>,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    time: Option<GiantV2Time>,
+    #[serde(default)]
+    tokens: Option<GiantTokens>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    content: Option<Vec<GiantV2Content>>,
+}
+
+/// The nested model object of an oversized v2 payload.
+#[allow(non_snake_case)]
+#[derive(serde::Deserialize)]
+struct GiantV2Model {
+    #[serde(default)]
+    providerID: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// The message-level time object of an oversized v2 payload.
+#[derive(serde::Deserialize)]
+struct GiantV2Time {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+/// The time object of one content item of an oversized v2 payload.
+#[derive(serde::Deserialize)]
+struct GiantV2ContentTime {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    ran: Option<i64>,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+/// One content item of an oversized v2 payload: only tool items carry a
+/// busy span.
+#[allow(non_snake_case)]
+#[derive(serde::Deserialize)]
+struct GiantV2Content {
+    #[serde(default)]
+    r#type: Option<String>,
+    #[serde(default)]
+    time: Option<GiantV2ContentTime>,
+}
+
 /// Extracts one oversized message's internable fields, as the positional
-/// array text the pipeline parses.
+/// array text the pipeline parses, plus its tool-span rows.
+///
+/// v1 payloads carry no tool spans (the `part` table owns them); v2
+/// payloads extract their spans from the message `content` array, and the
+/// message kind comes from the `type` column the caller passes.
 pub(crate) fn extract_giant_message_fields(
     json: &str,
+    kind: Option<&str>,
     location: &str,
-) -> Result<String, BillError> {
-    let envelope: GiantEnvelope =
-        serde_json::from_str(json).map_err(|failure| BillError::InvalidData {
-            location: location.to_owned(),
-            detail: failure.to_string(),
-        })?;
-    let time = envelope.time.as_ref();
-    let tokens = envelope.tokens.as_ref();
-    let cache = tokens.and_then(|tokens| tokens.cache.as_ref());
+    layout: Layout,
+) -> Result<(String, Vec<String>), BillError> {
+    match layout {
+        Layout::V1 => {
+            let envelope: GiantEnvelope =
+                serde_json::from_str(json).map_err(|failure| BillError::InvalidData {
+                    location: location.to_owned(),
+                    detail: failure.to_string(),
+                })?;
+            let time = envelope.time.as_ref();
+            let tokens = envelope.tokens.as_ref();
+            let cache = tokens.and_then(|tokens| tokens.cache.as_ref());
 
-    Ok(serde_json::json!([
-        envelope.role.as_deref(),
-        envelope.providerID.as_deref(),
-        envelope.modelID.as_deref(),
-        envelope.cost,
-        time.and_then(|time| time.created),
-        time.and_then(|time| time.completed),
-        tokens.and_then(|tokens| tokens.input),
-        tokens.and_then(|tokens| tokens.output),
-        tokens.and_then(|tokens| tokens.reasoning),
-        cache.and_then(|cache| cache.read),
-        cache.and_then(|cache| cache.write),
-        envelope.agent.as_deref(),
-        envelope.mode.as_deref(),
-    ])
-    .to_string())
+            let fields = serde_json::json!([
+                envelope.role.as_deref(),
+                envelope.providerID.as_deref(),
+                envelope.modelID.as_deref(),
+                envelope.cost,
+                time.and_then(|time| time.created),
+                time.and_then(|time| time.completed),
+                tokens.and_then(|tokens| tokens.input),
+                tokens.and_then(|tokens| tokens.output),
+                tokens.and_then(|tokens| tokens.reasoning),
+                cache.and_then(|cache| cache.read),
+                cache.and_then(|cache| cache.write),
+                envelope.agent.as_deref(),
+                envelope.mode.as_deref(),
+            ])
+            .to_string();
+
+            Ok((fields, Vec::new()))
+        }
+        Layout::V2 => {
+            let envelope: GiantV2Envelope =
+                serde_json::from_str(json).map_err(|failure| BillError::InvalidData {
+                    location: location.to_owned(),
+                    detail: failure.to_string(),
+                })?;
+            let kind = kind.ok_or_else(|| invalid_field(location, "type"))?;
+            let time = envelope.time.as_ref();
+            let tokens = envelope.tokens.as_ref();
+            let cache = tokens.and_then(|tokens| tokens.cache.as_ref());
+            let model = envelope.model.as_ref();
+
+            let fields = serde_json::json!([
+                kind,
+                model.and_then(|model| model.providerID.as_deref()),
+                model.and_then(|model| model.id.as_deref()),
+                envelope.cost,
+                time.and_then(|time| time.created),
+                time.and_then(|time| time.completed),
+                tokens.and_then(|tokens| tokens.input),
+                tokens.and_then(|tokens| tokens.output),
+                tokens.and_then(|tokens| tokens.reasoning),
+                cache.and_then(|cache| cache.read),
+                cache.and_then(|cache| cache.write),
+                envelope.agent.as_deref(),
+                Option::<&str>::None,
+            ])
+            .to_string();
+
+            // Tool items exist only in assistant content; mirroring the SQL
+            // span gate (assistant payloads only) keeps both paths equal.
+            let spans = if kind == "assistant" {
+                envelope
+                    .content
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item.r#type.as_deref() == Some("tool"))
+                    .filter_map(|item| item.time)
+                    .map(|time| {
+                        serde_json::json!(["tool", time.ran.or(time.created), time.completed,])
+                            .to_string()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            Ok((fields, spans))
+        }
+    }
 }
 
 /// Extracts one message's internable fields from its parsed JSON, as the
@@ -365,6 +501,7 @@ struct ParsedRow {
 /// `parse_system` interns it, preserving the interning order.
 fn parse_message(
     message: &RawMessage,
+    layout: Layout,
     session_agents: &BTreeMap<String, Option<AgentId>>,
     tools: &ToolSpans,
 ) -> Result<ParsedMessage, BillError> {
@@ -374,10 +511,30 @@ fn parse_message(
         non_negative(fields.time_completed),
     );
     let session_agent = session_agents.get(&message.session_id).copied().flatten();
+    let billed = match fields.role.as_deref() {
+        Some("assistant") => true,
+        // A v2 compaction records the usage of the compaction request
+        // itself: a real model call with a real cost.  Running or failed
+        // compactions carry no model or tokens and bill nothing.
+        Some("compaction") => {
+            layout == Layout::V2
+                && fields
+                    .providerID
+                    .as_deref()
+                    .is_some_and(|provider| !provider.is_empty())
+                && fields
+                    .modelID
+                    .as_deref()
+                    .is_some_and(|model| !model.is_empty())
+                && fields.has_any_token()
+        }
+        _ => false,
+    };
 
-    let row = if fields.role.as_deref() == Some("assistant") {
+    let row = if billed {
         Some(parse_assistant_row(
             &fields,
+            layout,
             &message.location,
             session_agent,
             tools.get(&message.id).map_or(&[][..], Vec::as_slice),
@@ -399,20 +556,39 @@ fn parse_message(
 /// Mirrors the pre-Phase-5 `parse_assistant` exactly, except that nothing is
 /// interned: the message-level agent fallback is only extracted when the
 /// session declares no agent, so the interning order stays byte-identical.
+///
+/// v2 relaxes the recorded-field requirements where opencode itself stores
+/// nothing: its assistant rows may lack a cost (the client had no price)
+/// and a token inventory, which v1 always recorded.  Such rows bill as
+/// unknown-cost calls with zero tokens, like their zero-cost v1 cousins.
 fn parse_assistant_row(
     fields: &MessageFields,
+    layout: Layout,
     location: &str,
     session_agent: Option<AgentId>,
     tools: &[(u64, u64)],
 ) -> Result<ParsedRow, BillError> {
     let provider = required_envelope_string(&fields.providerID, location, "providerID")?;
     let model = required_envelope_string(&fields.modelID, location, "modelID")?;
-    let usage = Tokens {
-        input: required_envelope_u64(fields.tokens_input, location, "tokens.input")?,
-        output: required_envelope_u64(fields.tokens_output, location, "tokens.output")?,
-        reasoning: required_envelope_u64(fields.tokens_reasoning, location, "tokens.reasoning")?,
-        cache_read: required_envelope_u64(fields.cache_read, location, "tokens.cache.read")?,
-        cache_write: required_envelope_u64(fields.cache_write, location, "tokens.cache.write")?,
+    let usage = match layout {
+        Layout::V1 => Tokens {
+            input: required_envelope_u64(fields.tokens_input, location, "tokens.input")?,
+            output: required_envelope_u64(fields.tokens_output, location, "tokens.output")?,
+            reasoning: required_envelope_u64(
+                fields.tokens_reasoning,
+                location,
+                "tokens.reasoning",
+            )?,
+            cache_read: required_envelope_u64(fields.cache_read, location, "tokens.cache.read")?,
+            cache_write: required_envelope_u64(fields.cache_write, location, "tokens.cache.write")?,
+        },
+        Layout::V2 => Tokens {
+            input: defaulted_u64(fields.tokens_input),
+            output: defaulted_u64(fields.tokens_output),
+            reasoning: defaulted_u64(fields.tokens_reasoning),
+            cache_read: defaulted_u64(fields.cache_read),
+            cache_write: defaulted_u64(fields.cache_write),
+        },
     };
     let message_agent = if session_agent.is_some() {
         None
@@ -431,7 +607,11 @@ fn parse_assistant_row(
         non_negative(fields.time_created),
         non_negative(fields.time_completed),
     );
-    let cost = fields.cost.ok_or_else(|| invalid_field(location, "cost"))?;
+    let cost = match layout {
+        Layout::V1 => fields.cost.ok_or_else(|| invalid_field(location, "cost"))?,
+        // opencode's own usage stats treat a missing cost as zero cost.
+        Layout::V2 => fields.cost.unwrap_or(0.0),
+    };
 
     if !cost.is_finite() {
         return Err(invalid_field(location, "cost must be finite"));
@@ -482,6 +662,14 @@ fn required_envelope_u64(field: Option<i64>, location: &str, name: &str) -> Resu
         .ok_or_else(|| invalid_field(location, name))
 }
 
+/// Reads a typed integer field that v2 may omit, clamping negative
+/// corrections to zero and defaulting missing lanes to zero.
+fn defaulted_u64(field: Option<i64>) -> u64 {
+    field
+        .map(|count| u64::try_from(count.max(0)).unwrap_or(0))
+        .unwrap_or(0)
+}
+
 /// Reads a required non-empty string field.
 pub(crate) fn required_string(
     value: &Value,
@@ -526,11 +714,13 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
         sessions,
         messages,
         parts,
+        layout,
     } = raw;
     let meta = RawWindowMeta {
         header,
         session_count,
         sessions,
+        layout,
     };
     let (mut world, parse) = parse_metadata(meta, progress)?;
     let mut messages = messages;
@@ -561,6 +751,9 @@ pub(crate) fn parse_system(raw: RawLoad, progress: &PipelineProgress) -> Result<
 pub(crate) struct ParseContext {
     /// Declared agent of every session, for message rows that need it.
     session_agents: BTreeMap<String, Option<AgentId>>,
+    /// The storage layout the rows came from: v2 messages gate differently
+    /// (compaction usage is billed) and relax the recorded-field rules.
+    layout: Layout,
 }
 
 /// Parses one window's metadata (sessions) into a world with an empty entity
@@ -576,6 +769,7 @@ pub(crate) fn parse_metadata(
     let mut interner = Interner::default();
     let mut sessions = SessionTree::new();
     let mut session_agents = BTreeMap::new();
+    let layout = meta.layout;
 
     meta.sessions.into_iter().for_each(|session| {
         progress.parsed_row();
@@ -599,7 +793,10 @@ pub(crate) fn parse_metadata(
             wall_end: None,
             interner,
         },
-        ParseContext { session_agents },
+        ParseContext {
+            session_agents,
+            layout,
+        },
     ))
 }
 
@@ -636,7 +833,7 @@ pub(crate) fn parse_message_batch(
         .map(|message| {
             progress.parsed_row();
 
-            parse_message(message, &context.session_agents, &tools)
+            parse_message(message, context.layout, &context.session_agents, &tools)
         })
         .collect_into_vec(results);
 
@@ -713,7 +910,7 @@ fn part_span(fields: &PartFields) -> Option<(u64, u64)> {
 mod tests {
     use super::*;
     use crate::report::BillHeader;
-    use crate::store::{RawLoad, RawMessage, RawPart, RawSession, RawWindowMeta};
+    use crate::store::{Layout, RawLoad, RawMessage, RawPart, RawSession, RawWindowMeta};
 
     /// Raw rows of one session: two assistant calls plus a user message.
     fn raw_fixture() -> RawLoad {
@@ -756,6 +953,7 @@ mod tests {
                 json: r#"["tool",1000,2500]"#
                     .to_owned(),
             }],
+            layout: Layout::V1,
         }
     }
 
@@ -769,11 +967,13 @@ mod tests {
             sessions,
             messages,
             parts,
+            layout,
         } = raw;
         let meta = RawWindowMeta {
             header,
             session_count,
             sessions,
+            layout,
         };
         let (mut world, parse) = parse_metadata(meta, &PipelineProgress::default())?;
 
@@ -876,6 +1076,7 @@ mod tests {
                 json: r#"["tool",1000,2500]"#
                     .to_owned(),
             }],
+            layout: Layout::V1,
         };
 
         let world = parse_system(raw, &PipelineProgress::default())?;
@@ -920,6 +1121,7 @@ mod tests {
             ],
             messages: Vec::new(),
             parts: Vec::new(),
+            layout: Layout::V1,
         };
 
         let world = parse_system(raw, &PipelineProgress::default())?;
@@ -974,6 +1176,7 @@ mod tests {
                 },
             ],
             parts: Vec::new(),
+            layout: Layout::V1,
         };
 
         let world = parse_system(raw, &PipelineProgress::default())?;
@@ -993,5 +1196,244 @@ mod tests {
     /// Assistant message fields whose agent comes only from the message.
     fn assistant_json(agent: &str) -> String {
         format!(r#"["assistant","prov","model",0.1,1000,2000,1,1,0,0,0,"{agent}",null]"#,)
+    }
+
+    #[test]
+    fn v2_compaction_usage_bills_and_shares_the_agent_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A v2 compaction with a model and a token inventory is a real
+        // model call; with no session agent, the unknown agent class gets it.
+        let raw = RawLoad {
+            header: BillHeader::Month {
+                label: "October 2026".to_owned(),
+            },
+            session_count: 1,
+            sessions: vec![RawSession {
+                id: "ses_comp".to_owned(),
+                agent: None,
+            }],
+            messages: vec![RawMessage {
+                id: "msg_comp".to_owned(),
+                session_id: "ses_comp".to_owned(),
+                location: "fixture".to_owned(),
+                json: r#"["compaction","prov","model",0.5,1000,2000,20,10,5,2,1,null,null]"#
+                    .to_owned(),
+            }],
+            parts: Vec::new(),
+            layout: Layout::V2,
+        };
+
+        let world = parse_system(raw, &PipelineProgress::default())?;
+
+        let row = world
+            .entities
+            .rows()
+            .next()
+            .ok_or("expected one usage row")?;
+        assert_eq!(world.interner.resolve_provider(row.provider), "prov");
+        assert_eq!(world.interner.resolve_model(row.model), "model");
+        assert_eq!(world.interner.resolve_agent(row.agent), "unknown");
+        assert_eq!(row.cost_micros, 500000);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_compaction_without_tokens_or_model_skips_usage() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for json in [
+            // Running compaction: no model, no tokens.
+            r#"["compaction",null,null,null,1000,2000,null,null,null,null,null,null,null]"#,
+            // Model present but no token inventory.
+            r#"["compaction","prov","model",null,1000,2000,null,null,null,null,null,null,null]"#,
+        ] {
+            let raw = RawLoad {
+                header: BillHeader::Month {
+                    label: "October 2026".to_owned(),
+                },
+                session_count: 1,
+                sessions: vec![RawSession {
+                    id: "ses_comp".to_owned(),
+                    agent: None,
+                }],
+                messages: vec![RawMessage {
+                    id: "msg_comp".to_owned(),
+                    session_id: "ses_comp".to_owned(),
+                    location: "fixture".to_owned(),
+                    json: json.to_owned(),
+                }],
+                parts: Vec::new(),
+                layout: Layout::V2,
+            };
+
+            let world = parse_system(raw, &PipelineProgress::default())?;
+
+            assert_eq!(world.entities.len(), 0, "row must not bill: {json}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v1_compaction_stays_unbilled() -> Result<(), Box<dyn std::error::Error>> {
+        // The v1 role gate never admitted compaction rows, whatever they
+        // carried.
+        let raw = RawLoad {
+            header: BillHeader::Month {
+                label: "October 2026".to_owned(),
+            },
+            session_count: 1,
+            sessions: vec![RawSession {
+                id: "ses_comp".to_owned(),
+                agent: None,
+            }],
+            messages: vec![RawMessage {
+                id: "msg_comp".to_owned(),
+                session_id: "ses_comp".to_owned(),
+                location: "fixture".to_owned(),
+                json: r#"["compaction","prov","model",0.5,1000,2000,20,10,5,2,1,null,null]"#
+                    .to_owned(),
+            }],
+            parts: Vec::new(),
+            layout: Layout::V1,
+        };
+
+        let world = parse_system(raw, &PipelineProgress::default())?;
+
+        assert_eq!(world.entities.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_relaxes_missing_cost_and_tokens() -> Result<(), Box<dyn std::error::Error>> {
+        // opencode v2 stores complete assistant rows without a cost or a
+        // token inventory; they bill as unknown-cost zero-token calls.
+        let raw = RawLoad {
+            header: BillHeader::Month {
+                label: "October 2026".to_owned(),
+            },
+            session_count: 1,
+            sessions: vec![RawSession {
+                id: "ses_bare".to_owned(),
+                agent: Some("build".to_owned()),
+            }],
+            messages: vec![RawMessage {
+                id: "msg_bare".to_owned(),
+                session_id: "ses_bare".to_owned(),
+                location: "fixture".to_owned(),
+                json: r#"["assistant","prov","model",null,1000,2000,null,null,null,null,null,"build",null]"#.to_owned(),
+            }],
+            parts: Vec::new(),
+            layout: Layout::V2,
+        };
+
+        let world = parse_system(raw, &PipelineProgress::default())?;
+
+        let row = world
+            .entities
+            .rows()
+            .next()
+            .ok_or("expected one usage row")?;
+        assert!(row.cost_unknown);
+        assert_eq!(row.cost_micros, 0);
+        assert_eq!(row.tokens.input, 0);
+        assert_eq!(row.tokens.cache_read, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v1_still_requires_cost_and_tokens() -> Result<(), Box<dyn std::error::Error>> {
+        for (json, field) in [
+            (
+                r#"["assistant","prov","model",null,1000,2000,1,1,1,1,1,null,null]"#,
+                "cost",
+            ),
+            (
+                r#"["assistant","prov","model",0.1,1000,2000,1,1,1,1,null,null,null]"#,
+                "tokens.cache.write",
+            ),
+        ] {
+            let raw = RawLoad {
+                header: BillHeader::Month {
+                    label: "October 2026".to_owned(),
+                },
+                session_count: 1,
+                sessions: vec![RawSession {
+                    id: "ses_missing".to_owned(),
+                    agent: None,
+                }],
+                messages: vec![RawMessage {
+                    id: "msg_missing".to_owned(),
+                    session_id: "ses_missing".to_owned(),
+                    location: "fixture".to_owned(),
+                    json: json.to_owned(),
+                }],
+                parts: Vec::new(),
+                layout: Layout::V1,
+            };
+
+            let error = match parse_system(raw, &PipelineProgress::default()) {
+                Err(error) => error,
+                Ok(_) => panic!("v1 row must stay required: {json}"),
+            };
+
+            assert!(
+                error.to_string().contains(field),
+                "error names the missing field: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v2_giant_payload_extracts_kind_model_and_spans() -> Result<(), Box<dyn std::error::Error>> {
+        // A two-megabyte filler rides an unread field; the envelope must
+        // skip it linearly and still produce the fields plus tool spans.
+        let filler = "x".repeat(2 * 1024 * 1024);
+        let json = format!(
+            r#"{{"agent":"build","model":{{"providerID":"prov","id":"model"}},"cost":0.5,"tokens":{{"input":1,"output":2,"reasoning":0,"cache":{{"read":3,"write":4}}}},"time":{{"created":1000,"completed":3000}},"filler":"{filler}","content":[{{"type":"tool","time":{{"created":1000,"ran":1100,"completed":2500}}}},{{"type":"tool","time":{{"created":2600}}}}]}}"#
+        );
+
+        let (fields, spans) =
+            extract_giant_message_fields(&json, Some("assistant"), "fixture", Layout::V2)?;
+
+        assert_eq!(
+            fields,
+            r#"["assistant","prov","model",0.5,1000,3000,1,2,0,3,4,"build",null]"#
+        );
+        assert_eq!(
+            spans,
+            [
+                r#"["tool",1100,2500]"#.to_owned(),
+                // A running tool keeps the array shape; its open comes from
+                // `time.created` and it drops out of the spans map later.
+                r#"["tool",2600,null]"#.to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_giant_payload_requires_the_kind_column() {
+        let json = r#"{"agent":"build","model":{"providerID":"prov","id":"model"},"time":{"created":1},"content":[]}"#;
+
+        let error = extract_giant_message_fields(json, None, "fixture", Layout::V2)
+            .err()
+            .ok_or("expected an error")
+            .unwrap_or_else(|failure| panic!("sequencing: {failure}"));
+
+        assert!(error.to_string().contains("type"), "error: {error}");
+    }
+
+    #[test]
+    fn v1_giant_payload_yields_no_spans() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{"role":"assistant","providerID":"prov","modelID":"model","cost":0.1,"tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1}}"#;
+
+        let (fields, spans) = extract_giant_message_fields(json, None, "fixture", Layout::V1)?;
+
+        assert_eq!(
+            fields,
+            r#"["assistant","prov","model",0.1,1,null,1,1,0,0,0,null,null]"#
+        );
+        assert!(spans.is_empty());
+        Ok(())
     }
 }

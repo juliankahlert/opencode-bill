@@ -10,8 +10,9 @@ use crate::data::BillProgress;
 use crate::error::BillError;
 use crate::report::BillHeader;
 use crate::store::{
-    CalendarWindow, DATA_SLICE, DAY_MILLIS, MESSAGE_BATCH_LIMIT, RawLoad, RawMessage, RawPart,
-    RawSession, RawWindowMeta, RecentRoot, SessionStore, StreamBatch, batch_full, unique_match,
+    CalendarWindow, DATA_SLICE, DAY_MILLIS, Layout, MESSAGE_BATCH_LIMIT, RawLoad, RawMessage,
+    RawPart, RawSession, RawWindowMeta, RecentRoot, SessionStore, StreamBatch, batch_full,
+    unique_match,
 };
 
 /// Sessions stored in OpenCode's SQLite database.
@@ -28,14 +29,22 @@ impl SqliteStore {
 impl SessionStore for SqliteStore {
     fn load(&self, reference: &str, progress: &BillProgress) -> Result<RawLoad, BillError> {
         let connection = open_database(&self.path)?;
-        let matches = database_matches(&connection, &self.path, reference)?;
+        let layout = database_layout(&connection, &self.path)?;
+        let matches = database_matches(&connection, &self.path, layout, reference)?;
         let id = unique_match(reference, matches)?;
-        let title = database_title(&connection, &self.path, &id)?;
-        let created_ms = database_created_ms(&connection, &self.path, &id)?;
-        let sessions = database_session_rows(&connection, &self.path, &id, progress)?;
+        let title = database_title(&connection, &self.path, layout, &id)?;
+        let created_ms = database_created_ms(&connection, &self.path, layout, &id)?;
+        let sessions = database_session_rows(&connection, &self.path, layout, &id, progress)?;
         let session_count = sessions.len();
-        let parts = database_tool_parts(&connection, &self.path, &id, progress)?;
-        let messages = database_messages(&connection, &self.path, &id, progress)?;
+        let (messages, parts) = match layout {
+            Layout::V1 => {
+                let parts = database_tool_parts(&connection, &self.path, &id, progress)?;
+                let messages = database_messages(&connection, &self.path, &id, progress)?;
+
+                (messages, parts)
+            }
+            Layout::V2 => database_v2_messages(&connection, &self.path, &id, progress)?,
+        };
 
         debug!(
             "loaded {} raw messages from {session_count} SQLite sessions",
@@ -51,6 +60,7 @@ impl SessionStore for SqliteStore {
             sessions,
             messages,
             parts,
+            layout,
         })
     }
 
@@ -60,14 +70,17 @@ impl SessionStore for SqliteStore {
         progress: &BillProgress,
     ) -> Result<RawWindowMeta, BillError> {
         let connection = open_database(&self.path)?;
-        let sessions = database_window_session_rows(&connection, &self.path, window, progress)?;
-        let session_count = database_window_session_count(&connection, &self.path, window)?;
+        let layout = database_layout(&connection, &self.path)?;
+        let sessions =
+            database_window_session_rows(&connection, &self.path, layout, window, progress)?;
+        let session_count = database_window_session_count(&connection, &self.path, layout, window)?;
 
         debug!("loaded {} raw sessions in {}", sessions.len(), window.label);
         Ok(RawWindowMeta {
             header: window.header.clone(),
             session_count,
             sessions,
+            layout,
         })
     }
 
@@ -92,11 +105,19 @@ impl SessionStore for SqliteStore {
             .unchecked_transaction()
             .map_err(|source| database_error(&self.path, source))?;
         let location = self.path.display().to_string();
-        let has_parts = if database_has_table(&transaction, &self.path, "part")? {
-            true
-        } else {
-            warn!("no 'part' table: API time will still include tool calls");
-            false
+        let layout = database_layout(&transaction, &self.path)?;
+        let has_parts = match layout {
+            Layout::V1 => {
+                if database_has_table(&transaction, &self.path, "part")? {
+                    true
+                } else {
+                    warn!("no 'part' table: API time will still include tool calls");
+                    false
+                }
+            }
+            // v2 carries no tool-part rows: the spans ride each message
+            // field slice instead.
+            Layout::V2 => false,
         };
 
         let mut batch = Vec::new();
@@ -128,7 +149,7 @@ impl SessionStore for SqliteStore {
         };
 
         let mut chunk =
-            database_window_message_keys(&transaction, &self.path, window, None, progress)?;
+            database_window_message_keys(&transaction, &self.path, layout, window, None, progress)?;
 
         while !chunk.is_empty() {
             let chunk_len = chunk.len();
@@ -138,56 +159,72 @@ impl SessionStore for SqliteStore {
                 let end = (index + DATA_SLICE).min(chunk.len());
                 let slice = &chunk[index..end];
 
-                let data = database_batch_message_fields(&transaction, &self.path, slice)?;
-                let mut by_id = data.into_iter().collect::<HashMap<_, _>>();
+                let data = match layout {
+                    Layout::V1 => database_batch_message_fields(&transaction, &self.path, slice)?,
+                    Layout::V2 => {
+                        database_batch_v2_message_fields(&transaction, &self.path, slice)?
+                    }
+                };
+                let mut by_id = data
+                    .into_iter()
+                    .map(|(id, json, spans)| (id, (json, spans)))
+                    .collect::<HashMap<_, _>>();
 
-                slice
-                    .iter()
-                    .try_for_each(|(created, message_id, session_id)| {
-                        let next_day = ((*created as u64 - window.start_ms) / DAY_MILLIS) as usize;
+                for (created, message_id, session_id) in slice.iter() {
+                    let next_day = ((*created as u64 - window.start_ms) / DAY_MILLIS) as usize;
 
-                        if batch_day.is_none() {
-                            batch_day = Some(next_day);
-                        } else if batch_day.is_some_and(|day| day != next_day) {
-                            flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
-                            batch_day = Some(next_day);
-                        }
+                    if batch_day.is_none() {
+                        batch_day = Some(next_day);
+                    } else if batch_day.is_some_and(|day| day != next_day) {
+                        flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
+                        batch_day = Some(next_day);
+                    }
 
-                        last_created = *created;
-                        last_id = message_id.clone();
-                        let json = by_id
+                    last_created = *created;
+                    last_id = message_id.clone();
+                    let (json, spans) =
+                        by_id
                             .remove(message_id)
                             .ok_or_else(|| BillError::Database {
                                 path: self.path.clone(),
                                 source: rusqlite::Error::QueryReturnedNoRows,
                             })?;
 
-                        // A giant payload (a tool result embedded in the
-                        // message) can dwarf the byte budget on its own: flush
-                        // before it joins, so no batch ever stacks more than one
-                        // such row at a time.
-                        if !batch.is_empty()
-                            && batch_full(
-                                batch.len(),
-                                batch_bytes.saturating_add(json.len()),
-                                false,
-                            )
-                        {
-                            flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
-                            batch_day = Some(next_day);
-                        }
+                    // A giant payload (a tool result embedded in the
+                    // message) can dwarf the byte budget on its own: flush
+                    // before it joins, so no batch ever stacks more than one
+                    // such row at a time.
+                    if !batch.is_empty()
+                        && batch_full(batch.len(), batch_bytes.saturating_add(json.len()), false)
+                    {
+                        flush(&mut batch, &mut parts, &mut batch_bytes, &mut batch_day)?;
+                        batch_day = Some(next_day);
+                    }
 
-                        batch_bytes += json.len();
-                        streamed_bytes += json.len();
-                        streamed_messages += 1;
-                        batch.push(RawMessage {
-                            id: message_id.clone(),
-                            session_id: session_id.clone(),
+                    batch_bytes += json.len();
+                    streamed_bytes += json.len();
+                    streamed_messages += 1;
+                    batch.push(RawMessage {
+                        id: message_id.clone(),
+                        session_id: session_id.clone(),
+                        location: location.clone(),
+                        json,
+                    });
+
+                    // v2 tool spans ride the message slice; each counts as a
+                    // loaded row, exactly like a v1 part row.
+                    for span in spans {
+                        batch_bytes += span.len();
+                        streamed_parts += 1;
+                        streamed_bytes += span.len();
+                        progress.loaded_row();
+                        parts.push(RawPart {
+                            message_id: message_id.clone(),
                             location: location.clone(),
-                            json,
+                            json: span,
                         });
-                        Ok(())
-                    })?;
+                    }
+                }
 
                 if has_parts {
                     let ids = slice
@@ -231,6 +268,7 @@ impl SessionStore for SqliteStore {
             chunk = database_window_message_keys(
                 &transaction,
                 &self.path,
+                layout,
                 window,
                 Some((last_created, last_id.clone())),
                 progress,
@@ -250,7 +288,16 @@ impl SessionStore for SqliteStore {
 
     fn recent_roots(&self, limit: usize) -> Result<Vec<RecentRoot>, BillError> {
         let connection = open_database(&self.path)?;
-        let has_created = database_has_column(&connection, &self.path, "session", "time_created")?;
+        let layout = database_layout(&connection, &self.path)?;
+        let sessions_table = layout.sessions_table();
+        // A v2 title may be absent (the column is nullable); the session's
+        // id stands in for it, like `database_title` does.
+        let title_column = match layout {
+            Layout::V1 => "title".to_owned(),
+            Layout::V2 => "COALESCE(title, id)".to_owned(),
+        };
+        let has_created =
+            database_has_column(&connection, &self.path, sessions_table, "time_created")?;
         let (created_column, order) = if has_created {
             (", time_created", "time_created DESC, id")
         } else {
@@ -260,7 +307,7 @@ impl SessionStore for SqliteStore {
         };
         let mut statement = connection
             .prepare(&format!(
-                "SELECT id, title{created_column} FROM session \
+                "SELECT id, {title_column}{created_column} FROM {sessions_table} \
                  WHERE parent_id IS NULL ORDER BY {order} LIMIT ?1"
             ))
             .map_err(|source| database_error(&self.path, source))?;
@@ -307,10 +354,14 @@ fn open_database(path: &Path) -> Result<Connection, BillError> {
 fn database_matches(
     connection: &Connection,
     path: &Path,
+    layout: Layout,
     reference: &str,
 ) -> Result<Vec<String>, BillError> {
     let mut statement = connection
-        .prepare("SELECT id FROM session WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id LIMIT 11")
+        .prepare(&format!(
+            "SELECT id FROM {} WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id LIMIT 11",
+            layout.sessions_table(),
+        ))
         .map_err(|source| database_error(path, source))?;
     let rows = statement
         .query_map(params![reference], |row| row.get::<_, String>(0))
@@ -323,10 +374,25 @@ fn database_matches(
 }
 
 /// Title of one session row.
-fn database_title(connection: &Connection, path: &Path, id: &str) -> Result<String, BillError> {
+///
+/// A v2 title may be absent (the column is nullable); the session's id
+/// stands in for it.
+fn database_title(
+    connection: &Connection,
+    path: &Path,
+    layout: Layout,
+    id: &str,
+) -> Result<String, BillError> {
+    let title = match layout {
+        Layout::V1 => "title".to_owned(),
+        Layout::V2 => "COALESCE(title, id)".to_owned(),
+    };
     connection
         .query_row(
-            "SELECT title FROM session WHERE id = ?1",
+            &format!(
+                "SELECT {title} FROM {} WHERE id = ?1",
+                layout.sessions_table()
+            ),
             params![id],
             |row| row.get(0),
         )
@@ -342,15 +408,17 @@ fn database_title(connection: &Connection, path: &Path, id: &str) -> Result<Stri
 fn database_created_ms(
     connection: &Connection,
     path: &Path,
+    layout: Layout,
     id: &str,
 ) -> Result<Option<i64>, BillError> {
-    if !database_has_column(connection, path, "session", "time_created")? {
+    let sessions_table = layout.sessions_table();
+    if !database_has_column(connection, path, sessions_table, "time_created")? {
         return Ok(None);
     }
 
     connection
         .query_row(
-            "SELECT time_created FROM session WHERE id = ?1",
+            &format!("SELECT time_created FROM {sessions_table} WHERE id = ?1"),
             params![id],
             |row| row.get::<_, Option<i64>>(0),
         )
@@ -364,23 +432,29 @@ fn database_created_ms(
 fn database_session_rows(
     connection: &Connection,
     path: &Path,
+    layout: Layout,
     id: &str,
     progress: &BillProgress,
 ) -> Result<Vec<RawSession>, BillError> {
-    let has_agent = database_has_column(connection, path, "session", "agent")?;
-    let agent_column = if has_agent { ", session.agent" } else { "" };
+    let sessions_table = layout.sessions_table();
+    let has_agent = database_has_column(connection, path, sessions_table, "agent")?;
+    let agent_column = if has_agent {
+        format!(", {sessions_table}.agent")
+    } else {
+        String::new()
+    };
     let agent_index = if has_agent { Some(1usize) } else { None };
     let mut statement = connection
         .prepare(&format!(
             r#"WITH RECURSIVE descendants(id) AS (
-                   SELECT id FROM session WHERE id = ?1
+                   SELECT id FROM {sessions_table} WHERE id = ?1
                    UNION
-                   SELECT session.id FROM session
-                   JOIN descendants ON session.parent_id = descendants.id
+                   SELECT {sessions_table}.id FROM {sessions_table}
+                   JOIN descendants ON {sessions_table}.parent_id = descendants.id
                )
-               SELECT session.id{agent_column} FROM session
-               JOIN descendants ON session.id = descendants.id
-               ORDER BY session.id"#
+               SELECT {sessions_table}.id{agent_column} FROM {sessions_table}
+               JOIN descendants ON {sessions_table}.id = descendants.id
+               ORDER BY {sessions_table}.id"#
         ))
         .map_err(|source| database_error(path, source))?;
     let rows = statement
@@ -415,20 +489,23 @@ fn database_session_rows(
 fn database_window_session_rows(
     connection: &Connection,
     path: &Path,
+    layout: Layout,
     window: &CalendarWindow,
     progress: &BillProgress,
 ) -> Result<Vec<RawSession>, BillError> {
-    if !database_has_column(connection, path, "session", "agent")? {
+    let sessions_table = layout.sessions_table();
+    let messages_table = layout.messages_table();
+    if !database_has_column(connection, path, sessions_table, "agent")? {
         return Ok(Vec::new());
     }
 
     let mut statement = connection
-        .prepare(
-            r#"SELECT DISTINCT session.id, session.agent FROM session
-               JOIN message ON message.session_id = session.id
-               WHERE message.time_created >= ?1 AND message.time_created < ?2
-               ORDER BY session.id"#,
-        )
+        .prepare(&format!(
+            r#"SELECT DISTINCT {sessions_table}.id, {sessions_table}.agent FROM {sessions_table}
+               JOIN {messages_table} ON {messages_table}.session_id = {sessions_table}.id
+               WHERE {messages_table}.time_created >= ?1 AND {messages_table}.time_created < ?2
+               ORDER BY {sessions_table}.id"#,
+        ))
         .map_err(|source| database_error(path, source))?;
     let rows = statement
         .query_map(params![window.start_ms, window.end_ms], |row| {
@@ -457,7 +534,8 @@ fn database_window_session_rows(
     Ok(sessions)
 }
 
-/// Every raw message row in the session tree, in wall-clock order.
+/// Every raw message row in the session tree, in wall-clock order (v1
+/// layout: the `message` table with its JSON envelope fields).
 fn database_messages(
     connection: &Connection,
     path: &Path,
@@ -520,19 +598,22 @@ fn database_messages(
 fn database_window_message_keys(
     connection: &Connection,
     path: &Path,
+    layout: Layout,
     window: &CalendarWindow,
     after: Option<(i64, String)>,
     progress: &BillProgress,
 ) -> Result<Vec<(i64, String, String)>, BillError> {
+    let messages_table = layout.messages_table();
     let mut statement = connection
-        .prepare(
-            r#"SELECT message.id, message.session_id, message.time_created FROM message
-               WHERE message.time_created >= ?1 AND message.time_created < ?2
-                 AND (?3 IS NULL OR message.time_created > ?3
-                      OR (message.time_created = ?3 AND message.id > ?4))
-               ORDER BY message.time_created, message.id
+        .prepare(&format!(
+            r#"SELECT {messages_table}.id, {messages_table}.session_id, {messages_table}.time_created
+               FROM {messages_table}
+               WHERE {messages_table}.time_created >= ?1 AND {messages_table}.time_created < ?2
+                 AND (?3 IS NULL OR {messages_table}.time_created > ?3
+                      OR ({messages_table}.time_created = ?3 AND {messages_table}.id > ?4))
+               ORDER BY {messages_table}.time_created, {messages_table}.id
                LIMIT ?5"#,
-        )
+        ))
         .map_err(|source| database_error(path, source))?;
     let (after_created, after_id) = match after {
         Some((created, id)) => (Some(created), Some(id)),
@@ -568,18 +649,21 @@ fn database_window_message_keys(
     Ok(chunk)
 }
 
-/// Extracted fields of one key slice, by primary key.
+/// Extracted fields of one key slice, by primary key (v1 layout).
 ///
 /// The `IN (...)` lookup returns rows in an arbitrary order; the caller
 /// reorders them against the slice's keyset order.  Only the internable
 /// fields are extracted here — a message whose payload is hundreds of
 /// megabytes (a tool result embedded in the data) never crosses into the
 /// pipeline.  No row is counted here — the keys scan already counted it.
+///
+/// v1 keeps tool spans in the `part` table, so every slice yields empty
+/// spans; the return shape matches the v2 variant.
 fn database_batch_message_fields(
     connection: &Connection,
     path: &Path,
     slice: &[(i64, String, String)],
-) -> Result<Vec<(String, String)>, BillError> {
+) -> Result<Vec<(String, String, Vec<String>)>, BillError> {
     let placeholders = vec!["?"; slice.len()].join(",");
     let mut statement = connection
         .prepare(&format!(
@@ -615,7 +699,9 @@ fn database_batch_message_fields(
             // is built for the giant tool result).
             let fields = match (fields, raw) {
                 (Some(fields), _) => fields,
-                (None, Some(raw)) => crate::parse::extract_giant_message_fields(&raw, &location)?,
+                (None, Some(raw)) => {
+                    crate::parse::extract_giant_message_fields(&raw, None, &location, Layout::V1)?.0
+                }
                 (None, None) => {
                     return Err(BillError::InvalidData {
                         location: location.clone(),
@@ -624,14 +710,15 @@ fn database_batch_message_fields(
                 }
             };
 
-            Ok((id, fields))
+            Ok((id, fields, Vec::new()))
         })
         .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(data)
 }
 
-/// Extracted tool part fields of one key slice, into a reusable buffer.
+/// Extracted tool part fields of one key slice, into a reusable buffer
+/// (v1 layout, which keeps parts in their own table).
 ///
 /// The `message_id IN (...)` lookup rides the part table's message index
 /// (present in the real OpenCode database), so a million-part table is
@@ -681,19 +768,23 @@ fn database_batch_parts(
 fn database_window_session_count(
     connection: &Connection,
     path: &Path,
+    layout: Layout,
     window: &CalendarWindow,
 ) -> Result<usize, BillError> {
     connection
         .query_row(
-            "SELECT COUNT(DISTINCT session_id) FROM message \
-             WHERE time_created >= ?1 AND time_created < ?2",
+            &format!(
+                "SELECT COUNT(DISTINCT session_id) FROM {} \
+                 WHERE time_created >= ?1 AND time_created < ?2",
+                layout.messages_table(),
+            ),
             params![window.start_ms, window.end_ms],
             |row| row.get(0),
         )
         .map_err(|source| database_error(path, source))
 }
 
-/// Raw tool part rows of every message in the session tree.
+/// Raw tool part rows of every message in the session tree (v1 layout).
 fn database_tool_parts(
     connection: &Connection,
     path: &Path,
@@ -738,6 +829,250 @@ fn database_tool_parts(
         .collect::<Result<Vec<_>, BillError>>()?;
 
     Ok(parts)
+}
+
+/// Payload length above which a message is stream-parsed in Rust instead
+/// of extracted by SQLite's JSON engine.
+///
+/// A tool result embedded in the payload can be hundreds of megabytes;
+/// handing one to SQLite's JSON tree costs far more than a linear serde
+/// scan.  Both SQL guards compare `LENGTH`, which counts characters rather
+/// than bytes — right field either way (both reduce the oversized rows to
+/// the Rust path), so only the threshold precision wobbles on multibyte
+/// payloads.
+const GIANT_PAYLOAD_LIMIT: usize = 1_048_576;
+
+/// v2 extraction of the positional fields array.
+///
+/// The message kind lives in the `type` table column — the payload JSON
+/// omits it — so the extraction opens with the missing `$.type` path (a
+/// NULL placeholder at position 0) and replaces that placeholder with the
+/// column value: `json_insert` cannot prepend, it no-ops when the array
+/// index already exists.  The provider and model flatten out of the nested
+/// `model` object (migrated v1 rows and fresh v2 rows share that shape),
+/// and the payload JSON is parsed once for all twelve payload paths.
+const V2_FIELD_EXPRESSION: &str = concat!(
+    "json_replace(",
+    "json_extract(m.data, ",
+    "'$.type','$.model.providerID','$.model.id','$.cost',",
+    "'$.time.created','$.time.completed','$.tokens.input',",
+    "'$.tokens.output','$.tokens.reasoning','$.tokens.cache.read',",
+    "'$.tokens.cache.write','$.agent','$.mode'),",
+    "'$[0]', json_quote(m.type))"
+);
+
+/// v2 extraction of one message's tool busy spans, from its `content`
+/// array.
+///
+/// A tool item's span opens at `time.ran` (falling back to `time.created`,
+/// which exists on every item) and closes at `time.completed` — exactly how
+/// opencode itself computes tool durations.  Running tools carry no
+/// completed time and drop out of the spans map, matching a v1 part row
+/// without `state.time.end`.
+const V2_TOOL_SPANS_EXPRESSION: &str = concat!(
+    "(SELECT json_group_array(json_array('tool', ",
+    "coalesce(json_extract(c.value, '$.time.ran'), ",
+    "json_extract(c.value, '$.time.created')), ",
+    "json_extract(c.value, '$.time.completed'))) ",
+    "FROM json_each(m.data, '$.content') c ",
+    "WHERE json_extract(c.value, '$.type') = 'tool')"
+);
+
+/// Which storage layout the database opened maps onto.
+///
+/// v2 tables win when both generations exist: migrated databases keep the
+/// stale v1 tables (`message` and `part` are never written again after the
+/// v1-to-v2 port), so the old tables must never be consulted for v2 bills.
+fn database_layout(connection: &Connection, path: &Path) -> Result<Layout, BillError> {
+    if database_has_table(connection, path, "session_v2")?
+        && database_has_table(connection, path, "session_message")?
+    {
+        return Ok(Layout::V2);
+    }
+
+    if database_has_table(connection, path, "session")? {
+        return Ok(Layout::V1);
+    }
+
+    Err(BillError::UnsupportedLayout(path.to_path_buf()))
+}
+
+/// Every raw v2 message row in the session tree, in wall-clock order,
+/// together with the tool spans extracted from each message's content.
+///
+/// One query produces both the messages and their spans: the payload JSON
+/// is parsed once by SQLite's JSON engine, and each span arrives in the
+/// same `["tool",start,end]` positional shape a v1 part row carries.  Each
+/// message counts one loaded row, each span one more — exactly how the v1
+/// path counts its part rows.
+///
+/// Unlike the streaming variant, this load-batch path has no giant-payload
+/// guard: the v1 session load never guarded payload size either, and the
+/// session path is a single bounded set of rows.
+fn database_v2_messages(
+    connection: &Connection,
+    path: &Path,
+    id: &str,
+    progress: &BillProgress,
+) -> Result<(Vec<RawMessage>, Vec<RawPart>), BillError> {
+    let mut statement = connection
+        .prepare(&format!(
+            r#"WITH RECURSIVE descendants(id) AS (
+                   SELECT id FROM session_v2 WHERE id = ?1
+                   UNION
+                   SELECT session_v2.id FROM session_v2
+                   JOIN descendants ON session_v2.parent_id = descendants.id
+               )
+               SELECT m.id, m.session_id, {V2_FIELD_EXPRESSION},
+                      {V2_TOOL_SPANS_EXPRESSION}
+               FROM session_message m
+               JOIN descendants ON m.session_id = descendants.id
+               ORDER BY m.time_created, m.id"#
+        ))
+        .map_err(|source| database_error(path, source))?;
+    let rows = statement
+        .query_map(params![id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|source| database_error(path, source))?;
+    let location = path.display().to_string();
+    let mut messages = Vec::new();
+    let mut parts = Vec::new();
+
+    for row in rows {
+        let (message_id, session_id, json, spans) =
+            row.map_err(|source| database_error(path, source))?;
+
+        progress.loaded_row();
+        messages.push(RawMessage {
+            id: message_id.clone(),
+            session_id,
+            location: location.clone(),
+            json,
+        });
+
+        for span in v2_span_rows(spans, &location)? {
+            progress.loaded_row();
+            parts.push(RawPart {
+                message_id: message_id.clone(),
+                location: location.clone(),
+                json: span,
+            });
+        }
+    }
+
+    Ok((messages, parts))
+}
+
+/// Converts a v2 spans aggregate into one row text per span.
+///
+/// The aggregate is a JSON array of `["tool",start,end]` arrays; SQLite
+/// builds without `json_group_array` yield NULL for an empty aggregate
+/// instead of `[]`, so `None` and `[]` both mean no spans.
+fn v2_span_rows(spans: Option<String>, location: &str) -> Result<Vec<String>, BillError> {
+    let Some(spans) = spans else {
+        return Ok(Vec::new());
+    };
+
+    let value = serde_json::from_str::<serde_json::Value>(&spans).map_err(|failure| {
+        BillError::InvalidData {
+            location: location.to_owned(),
+            detail: format!("tool span aggregate is not JSON: {failure}"),
+        }
+    })?;
+
+    Ok(value
+        .as_array()
+        .ok_or_else(|| BillError::InvalidData {
+            location: location.to_owned(),
+            detail: "tool span aggregate is not a JSON array".to_owned(),
+        })?
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect())
+}
+
+/// Extracted fields and tool spans of one v2 key slice, by primary key.
+///
+/// Same slice contract as the v1 variant; the spans ride the same
+/// `IN (...)` lookup instead of a separate part query, so the payloads of a
+/// slice cross into the pipeline in one pass.  Rows over the giant
+/// threshold are stream-parsed in Rust, whose scan also yields the spans.
+fn database_batch_v2_message_fields(
+    connection: &Connection,
+    path: &Path,
+    slice: &[(i64, String, String)],
+) -> Result<Vec<(String, String, Vec<String>)>, BillError> {
+    let placeholders = vec!["?"; slice.len()].join(",");
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT m.id, \
+             CASE WHEN LENGTH(m.data) <= {giants} THEN {fields} END, \
+             CASE WHEN LENGTH(m.data) > {giants} THEN m.data END, \
+             m.type, \
+             CASE WHEN m.type = 'assistant' AND LENGTH(m.data) <= {giants} \
+                  THEN {spans} END \
+             FROM session_message m WHERE m.id IN ({placeholders})",
+            giants = GIANT_PAYLOAD_LIMIT,
+            fields = V2_FIELD_EXPRESSION,
+            spans = V2_TOOL_SPANS_EXPRESSION,
+            placeholders = placeholders,
+        ))
+        .map_err(|source| database_error(path, source))?;
+    let rows = statement
+        .query_map(
+            params_from_iter(slice.iter().map(|(_, id, _)| id.as_str())),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .map_err(|source| database_error(path, source))?;
+    let location = path.display().to_string();
+    let data = rows
+        .map(|row| {
+            let (id, fields, raw, kind, spans) =
+                row.map_err(|source| database_error(path, source))?;
+            // Small payloads arrive already extracted; oversized ones are
+            // stream-parsed here (serde skips the unknown fields, so no tree
+            // is built for the giant tool result), and their spans are
+            // extracted from the same scan.
+            let (json, spans) = match (fields, raw) {
+                (Some(json), _) => (json, spans),
+                (None, Some(raw)) => {
+                    let (json, giant_spans) = crate::parse::extract_giant_message_fields(
+                        &raw,
+                        Some(&kind),
+                        &location,
+                        Layout::V2,
+                    )?;
+
+                    (json, Some(format!("[{}]", giant_spans.join(","))))
+                }
+                (None, None) => {
+                    return Err(BillError::InvalidData {
+                        location: location.clone(),
+                        detail: "unparseable message payload".to_owned(),
+                    });
+                }
+            };
+            let spans = v2_span_rows(spans, &location)?;
+
+            Ok((id, json, spans))
+        })
+        .collect::<Result<Vec<_>, BillError>>()?;
+
+    Ok(data)
 }
 
 /// Whether the database has a table with the given name.

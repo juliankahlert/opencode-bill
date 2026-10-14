@@ -14,9 +14,9 @@ use crate::parse::{
 };
 use crate::report::BillHeader;
 use crate::store::{
-    CalendarWindow, DAY_MILLIS, MESSAGE_BATCH_BYTES, MESSAGE_BATCH_LIMIT, RawLoad, RawMessage,
-    RawPart, RawSession, RawWindowMeta, RecentRoot, SessionStore, StreamBatch, batch_full,
-    unique_match,
+    CalendarWindow, DAY_MILLIS, Layout, MESSAGE_BATCH_BYTES, MESSAGE_BATCH_LIMIT, RawLoad,
+    RawMessage, RawPart, RawSession, RawWindowMeta, RecentRoot, SessionStore, StreamBatch,
+    batch_full, unique_match,
 };
 
 /// Sessions stored in OpenCode's legacy JSON directory layout.
@@ -76,6 +76,7 @@ impl SessionStore for LegacyStore {
             sessions,
             messages,
             parts,
+            layout: Layout::V1,
         })
     }
 
@@ -108,6 +109,7 @@ impl SessionStore for LegacyStore {
             header: window.header.clone(),
             session_count: sessions.len(),
             sessions,
+            layout: Layout::V1,
         })
     }
 

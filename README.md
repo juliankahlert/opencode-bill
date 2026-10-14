@@ -9,6 +9,13 @@ the GitHub Copilot model pricing page, falls back to a built-in generic
 models.dev-style price list for well-known models when no API pricing is
 available, and prints a formatted bill to stdout.
 
+Both SQLite storage generations are read: the pre-v2 `session`/`message`/
+`part` layout and the v2 `session_v2`/`session_message` layout (where the
+tool spans ride the assistant message content and compaction usage joins
+the bill).  When a database holds both generations — the mark of a
+v1-to-v2 migration — the v2 tables win, because the old tables are never
+written again.
+
 Pricing is looked up in this order: the local models.json catalog, the
 GitHub Copilot pricing page (for github-copilot provider usage), the
 built-in generic models.dev-style price list, and finally the pricing page

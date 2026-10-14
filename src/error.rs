@@ -73,6 +73,13 @@ pub enum BillError {
         detail: String,
     },
 
+    /// OpenCode's SQLite database matches neither known storage layout.
+    #[error(
+        "unsupported OpenCode database layout in {0}: found neither v2 \
+         ('session_v2' + 'session_message') nor v1 ('session') tables"
+    )]
+    UnsupportedLayout(PathBuf),
+
     /// The tokio runtime could not be started, or a runtime task failed.
     #[error("async runtime failure: {0}")]
     Runtime(#[source] std::io::Error),

@@ -3722,4 +3722,506 @@ Amount due:  $0.125000 USD
         assert_eq!(progress.counters.folded_rows(), 2);
         Ok(())
     }
+
+    // --- OpenCode v2 storage layout ---------------------------------------
+
+    /// The fixture assistant's payload in v2 shape: the kind is a table
+    /// column, the provider and model nest inside `model`, and the tool
+    /// span rides the `content` array.
+    fn v2_assistant_data(created: i64, completed: i64, tool: Option<(i64, i64)>) -> String {
+        let tool_item = tool.map_or_else(String::new, |(start, end)| {
+            format!(
+                r#",{{"type":"tool","id":"tool_1","name":"run","state":{{"status":"completed"}},"time":{{"created":{start},"ran":{start},"completed":{end}}}}}"#
+            )
+        });
+
+        format!(
+            r#"{{"agent":"build","model":{{"providerID":"openai","id":"gpt-test"}},"cost":0.125,"tokens":{{"input":10,"output":4,"reasoning":2,"cache":{{"read":6,"write":1}}}},"time":{{"created":{created},"completed":{completed}}},"content":[{{"type":"text","text":"hi"}}{tool_item}]}}"#
+        )
+    }
+
+    /// An OpenCode v2 database: `session_v2` plus `session_message`, no
+    /// `part` table — the mirror image of [`fixture`] with the same usage.
+    fn fixture_v2() -> Result<(TempDir, StorageContext), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let connection = Connection::open(temporary.path().join(DATABASE_FILE))?;
+
+        connection.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, parent_id TEXT, \
+             time_created INTEGER NOT NULL, agent TEXT);\
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, \
+             time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created, agent) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["ses_abcdef123456", "Test session", None::<String>, 1000_i64, "build"],
+        )?;
+        // Same message as the v1 fixture; the completion timestamp minus
+        // the one-millisecond creation matches its zero-millisecond v1 API
+        // time closely enough to keep the same rendered cell.
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'assistant', 1, 1000, 1000, ?3)",
+            params!["msg_1", "ses_abcdef123456", v2_assistant_data(1000, 1000, None)],
+        )?;
+        drop(connection);
+
+        let context = StorageContext::builder()
+            .data_dir(temporary.path())
+            .build()?;
+        Ok((temporary, context))
+    }
+
+    /// The same usage as [`twin_v1`] in v2 tables.
+    fn twin_v2(dir: &std::path::Path) -> Result<StorageContext, Box<dyn std::error::Error>> {
+        let connection = Connection::open(dir.join(DATABASE_FILE))?;
+        connection.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, parent_id TEXT, \
+             time_created INTEGER NOT NULL, agent TEXT);\
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, \
+             time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created, agent) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["ses_twin12345678", "Twin", None::<String>, 1000_i64, "build"],
+        )?;
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'assistant', 1, 1000, 3000, ?3)",
+            params!["msg_1", "ses_twin12345678", v2_assistant_data(1, 3000, Some((1000, 2500)))],
+        )?;
+        drop(connection);
+
+        Ok(StorageContext::builder().data_dir(dir).build()?)
+    }
+
+    /// The same usage as [`twin_v2`] in v1 tables.
+    fn twin_v1(dir: &std::path::Path) -> Result<StorageContext, Box<dyn std::error::Error>> {
+        let connection = Connection::open(dir.join(DATABASE_FILE))?;
+        connection.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT, \
+             time_created INTEGER, agent TEXT);\
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             time_created INTEGER NOT NULL, data TEXT NOT NULL);\
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, \
+             session_id TEXT NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title, parent_id, time_created, agent) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["ses_twin12345678", "Twin", None::<String>, 1000_i64, "build"],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_1",
+                "ses_twin12345678",
+                1,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","agent":"build","cost":0.125,"tokens":{"input":10,"output":4,"reasoning":2,"cache":{"read":6,"write":1}},"time":{"created":1,"completed":3000}}"#
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "part_1",
+                "msg_1",
+                "ses_twin12345678",
+                r#"{"type":"tool","state":{"time":{"start":1000,"end":2500}}}"#
+            ],
+        )?;
+        drop(connection);
+
+        Ok(StorageContext::builder().data_dir(dir).build()?)
+    }
+
+    #[test]
+    fn generates_bill_from_v2_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+
+        let bill = generate_bill(&context, "ses_abcdef", &[])?;
+
+        assert!(bill.contains("Session: ses_abcdef123456"));
+        assert!(bill.contains("Sessions: 1 (root + descendants)"));
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "1",
+                "10",
+                "6",
+                "1",
+                "35.29%",
+                "4",
+                "2",
+                "0ms",
+                "$0.125000"
+            ]
+        ));
+        assert!(bill.contains("Amount due:  $0.125000 USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_monthly_bill_matches_v1_monthly_bill() -> Result<(), Box<dyn std::error::Error>> {
+        // The same usage in both storage generations must bill identically:
+        // the nested model object and the content-carried tool span change
+        // nothing downstream.
+        let v1_dir = TempDir::new()?;
+        let v1 = twin_v1(v1_dir.path())?;
+        let v2_dir = TempDir::new()?;
+        let v2 = twin_v2(v2_dir.path())?;
+
+        let v1_bill = generate_monthly_bill(&v1, 1970, 1, &[])?;
+        let v2_bill = generate_monthly_bill(&v2, 1970, 1, &[])?;
+
+        assert_eq!(v2_bill, v1_bill);
+        assert!(v2_bill.contains("AMOUNT DUE  Total: $0.125000"));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_window_session_rows_carry_the_agent_component() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // The window metadata must read session_v2.agent, exactly like the
+        // v1 window join read session.agent.
+        let v2_dir = TempDir::new()?;
+        let v2 = twin_v2(v2_dir.path())?;
+        let bill = generate_monthly_bill(&v2, 1970, 1, &[])?;
+
+        assert!(has_table_row(
+            &bill,
+            &[
+                "build",
+                "1",
+                "1",
+                "10",
+                "6",
+                "1",
+                "4",
+                "2",
+                "1s",
+                "$0.125000"
+            ]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_month_streaming_pumps_one_batch_per_day() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // A second assistant call on the following day: the streamer must
+        // cut a batch boundary exactly there, with the spans riding the
+        // messages.
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'assistant', 2, 90000000, 90000000, ?3)",
+            params![
+                "msg_day2",
+                "ses_abcdef123456",
+                v2_assistant_data(90000000, 90000000, None)
+            ],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(context.data_dir.join(DATABASE_FILE));
+        let window = CalendarWindow::month(1970, 1)?;
+        let progress = BillProgress::default();
+        let mut batches = Vec::new();
+
+        store.stream_window_messages(&window, &progress, &mut |mut batch| {
+            batches.push(
+                batch
+                    .messages
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            batch.messages.clear();
+
+            Ok(batch)
+        })?;
+
+        assert_eq!(
+            batches,
+            [vec!["msg_1".to_owned()], vec!["msg_day2".to_owned()]],
+            "v2 windows stream one batch per calendar day too"
+        );
+        // The loaded == parsed universe holds across generations (the parse
+        // phase provably counts the same rows — see parse.rs's batching
+        // tests); this store-only stream counts each key and each riding
+        // span exactly once (both fixture calls carry no tool spans).
+        assert_eq!(progress.loaded_rows(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_compaction_usage_bills_into_the_month() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // The compaction request itself is a real model call: a session
+        // with no agent declared and a compaction message without a
+        // message-level agent — the usage lands in the unknown agent class
+        // and joins the payable totals.
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_comp12345678", "Compacted", None::<String>, 1000_i64],
+        )?;
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'compaction', 1, 1000, 2000, ?3)",
+            params![
+                "msg_compaction",
+                "ses_comp12345678",
+                r#"{"model":{"providerID":"openai","id":"gpt-test"},"cost":0.5,"tokens":{"input":20,"output":10,"reasoning":5,"cache":{"read":2,"write":1}},"time":{"created":1000,"completed":2000},"summary":"x","recent":"y"}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("Sessions: 2"));
+        // The fixture call has no API time (equal timestamps); the
+        // compaction call spans one second with no tool, so the merged row
+        // shows both calls and the compaction's API second.
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "2",
+                "30",
+                "8",
+                "2",
+                "20.00%",
+                "14",
+                "7",
+                "1s",
+                "$0.625000"
+            ]
+        ));
+        assert!(bill.contains("unknown"));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_compaction_without_tokens_skips_usage() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // A running or failed compaction carries no model and no tokens: it
+        // parses but bills nothing.
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'compaction', 2, 1000, 1000, ?3)",
+            params![
+                "msg_running_compaction",
+                "ses_abcdef123456",
+                r#"{"status":"running","reason":"auto","summary":"x","recent":"y","time":{"created":1000}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("REQUESTS    Total: 1"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.125000"));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_assistant_rows_without_cost_and_tokens_bill_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // opencode v2 records complete assistant rows without a cost or a
+        // token inventory; they bill as unknown-cost, zero-token calls
+        // instead of aborting the bill.
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'assistant', 2, 1000, 1000, ?3)",
+            params![
+                "msg_bare",
+                "ses_abcdef123456",
+                r#"{"agent":"build","model":{"providerID":"openai","id":"gpt-test"},"time":{"created":1000},"content":[]}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("REQUESTS    Total: 2"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.125000"));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_giant_content_streams_and_carries_its_spans() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // A tool result embedded in the content dwarfs the extraction
+        // threshold: the row streams through the Rust giant path, and its
+        // span still reduces the API time.  The filler is a field the
+        // streaming envelope never reads, so serde skips it linearly.
+        let filler = "x".repeat(2 * 1024 * 1024);
+        connection.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) \
+             VALUES (?1, ?2, 'assistant', 2, 1000, 3000, ?3)",
+            params![
+                "msg_giant",
+                "ses_abcdef123456",
+                format!(
+                    r#"{{"agent":"build","model":{{"providerID":"openai","id":"gpt-test"}},"cost":0.5,"tokens":{{"input":20,"output":8,"reasoning":4,"cache":{{"read":12,"write":2}}}},"time":{{"created":1000,"completed":3000}},"filler":"{FILLER}","content":[{{"type":"tool","id":"tool_giant","name":"run","state":{{"status":"completed"}},"time":{{"created":1000,"ran":1000,"completed":2500}}}}]}}"#,
+                    FILLER = filler
+                )
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("REQUESTS    Total: 2"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.625000"));
+        // A complete message spans 2000ms minus the 1500ms tool span.
+        // Both calls share the model, so their rows merge in the table.
+        assert!(has_table_row(
+            &bill,
+            &[
+                "openai / gpt-test",
+                "2",
+                "30",
+                "18",
+                "3",
+                "35.29%",
+                "12",
+                "6",
+                "500ms",
+                "$0.625000"
+            ]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_tables_win_over_stale_v1_tables() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, context) = fixture_v2()?;
+        let connection = Connection::open(context.data_dir.join(DATABASE_FILE))?;
+
+        // A migrated database keeps the never-again-written v1 tables; a
+        // juicy stale row in them must never join the v2 bill.
+        connection.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT NOT NULL, parent_id TEXT, \
+             time_created INTEGER, agent TEXT);\
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             time_created INTEGER NOT NULL, data TEXT NOT NULL);\
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, \
+             session_id TEXT NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session (id, title, parent_id, time_created, agent) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["ses_stale1234567", "Stale", None::<String>, 1000_i64, "build"],
+        )?;
+        connection.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "msg_stale",
+                "ses_stale1234567",
+                1000,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-test","cost":9.99,"tokens":{"input":900,"output":900,"reasoning":900,"cache":{"read":900,"write":900}},"time":{"created":1000}}"#
+            ],
+        )?;
+        drop(connection);
+
+        let bill = generate_monthly_bill(&context, 1970, 1, &[])?;
+
+        assert!(bill.contains("Sessions: 1"));
+        assert!(bill.contains("REQUESTS    Total: 1"));
+        assert!(bill.contains("AMOUNT DUE  Total: $0.125000"));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_recent_roots_list_newest_first_without_children() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = TempDir::new()?;
+        let connection = Connection::open(temporary.path().join(DATABASE_FILE))?;
+
+        connection.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, parent_id TEXT, \
+             time_created INTEGER NOT NULL, agent TEXT);\
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, \
+             time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_old", "Old root", None::<String>, 1000_i64],
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_new", "New root", None::<String>, 3000_i64],
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_child", "Child", "ses_new", 2000_i64],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(temporary.path().join(DATABASE_FILE));
+        let roots = store.recent_roots(8)?;
+
+        assert_eq!(roots.len(), 2, "children are not roots");
+        assert_eq!(roots[0].id, "ses_new");
+        assert_eq!(roots[0].title, "New root");
+        assert_eq!(roots[0].created_ms, Some(3000));
+        assert_eq!(roots[1].id, "ses_old");
+        assert_eq!(roots[1].created_ms, Some(1000));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_recent_roots_survive_a_null_title() -> Result<(), Box<dyn std::error::Error>> {
+        // opencode v2 titles are optional on sessions: the root picker must
+        // still list the newest root, with the id standing in for the title.
+        let temporary = TempDir::new()?;
+        let connection = Connection::open(temporary.path().join(DATABASE_FILE))?;
+
+        connection.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT, parent_id TEXT, \
+             time_created INTEGER NOT NULL, agent TEXT);\
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+             type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, \
+             time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "ses_untitled123456",
+                None::<String>,
+                None::<String>,
+                5000_i64
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO session_v2 (id, title, parent_id, time_created) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_titled1234567", "Titled root", None::<String>, 1000_i64],
+        )?;
+        drop(connection);
+
+        let store = SqliteStore::new(temporary.path().join(DATABASE_FILE));
+        let roots = store.recent_roots(8)?;
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].id, "ses_untitled123456");
+        assert_eq!(
+            roots[0].title, "ses_untitled123456",
+            "the id stands in for the title"
+        );
+        assert_eq!(roots[1].title, "Titled root");
+        Ok(())
+    }
 }

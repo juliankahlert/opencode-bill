@@ -11,6 +11,40 @@ use crate::report::BillHeader;
 /// A session reference must contain at least this many characters.
 const MINIMUM_REFERENCE_LENGTH: usize = 6;
 
+/// Which SQLite storage layout a database uses.
+///
+/// OpenCode v1 keeps sessions, messages, and tool parts in three tables
+/// (`session`, `message`, `part`); v2 keeps sessions in `session_v2`,
+/// messages in `session_message`, and folds the tool spans into the
+/// assistant message's `content` array.  Migrated databases keep the stale
+/// v1 tables beside the fresh ones, so the layout — not the table names
+/// alone — decides what the store reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// OpenCode v1: `session`, `message`, and `part` tables.
+    V1,
+    /// OpenCode v2: `session_v2` and `session_message` tables.
+    V2,
+}
+
+impl Layout {
+    /// The sessions table of this layout.
+    pub(crate) fn sessions_table(self) -> &'static str {
+        match self {
+            Layout::V1 => "session",
+            Layout::V2 => "session_v2",
+        }
+    }
+
+    /// The message table of this layout.
+    pub(crate) fn messages_table(self) -> &'static str {
+        match self {
+            Layout::V1 => "message",
+            Layout::V2 => "session_message",
+        }
+    }
+}
+
 /// One calendar period (a month, a day, a year, or an ISO week) as a billing
 /// window.
 #[derive(Clone)]
@@ -236,6 +270,10 @@ pub(crate) struct RawWindowMeta {
     pub(crate) header: BillHeader,
     pub(crate) session_count: usize,
     pub(crate) sessions: Vec<RawSession>,
+    /// The storage layout the rows came from: v2 messages carry their
+    /// tool spans inside the message payload, and compaction usage is
+    /// billed.
+    pub(crate) layout: Layout,
 }
 
 /// One root session's identity for the interactive picker.
@@ -263,6 +301,8 @@ pub(crate) struct RawLoad {
     pub(crate) sessions: Vec<RawSession>,
     pub(crate) messages: Vec<RawMessage>,
     pub(crate) parts: Vec<RawPart>,
+    /// The storage layout the rows came from.
+    pub(crate) layout: Layout,
 }
 
 /// One session row: identity plus its agent component.
