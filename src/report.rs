@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use chrono::{Datelike, Duration, NaiveDate};
 
 use crate::data::{
-    AgentId, AgentUsage, Interner, MICRO_PER_DOLLAR, ModelKey, ModelRates, Tokens, Totals, World,
-    cost_to_micros,
+    AgentId, AgentUsage, Interner, LongContextRates, MICRO_PER_DOLLAR, ModelKey, ModelRates,
+    Tokens, Totals, World, cost_to_micros,
 };
 use crate::timing::{format_duration, format_timestamp, span_ms};
 
@@ -174,7 +174,7 @@ pub(crate) fn build_report(
         agent_rows,
         pricing_rows: sorted_usage(pricing, interner)
             .into_iter()
-            .map(|entry| pricing_row(entry, interner))
+            .flat_map(|entry| pricing_rows(entry, interner))
             .collect(),
         usage_cost_estimated: usage_estimated,
         agent_cost_estimated: agent_estimated,
@@ -618,22 +618,61 @@ fn hit_rate(tokens: &Tokens) -> String {
     format!("{}.{:02}%", basis / 100, basis % 100)
 }
 
-/// One model pricing row.
-fn pricing_row(entry: (&ModelKey, &ModelRates), interner: &Interner) -> Vec<String> {
-    let ((provider, model), rates) = entry;
+/// Default and long-context pricing rows for one model.
+fn pricing_rows(entry: (&ModelKey, &ModelRates), interner: &Interner) -> Vec<Vec<String>> {
+    let (_, rates) = entry;
+    let mut rows = vec![pricing_row(entry, None, interner)];
 
-    vec![
-        // Every rate comes from an external source, never from the parsed
-        // bill data, so the whole row carries the estimated marker.
-        format!(
+    if let Some(long_context) = rates.long_context {
+        rows.push(pricing_row(entry, Some(long_context), interner));
+    }
+
+    rows
+}
+
+/// One default-tier or long-context model pricing row.
+fn pricing_row(
+    entry: (&ModelKey, &ModelRates),
+    long_context: Option<LongContextRates>,
+    interner: &Interner,
+) -> Vec<String> {
+    let ((provider, model), rates) = entry;
+    let (input, cache_read, cache_write, output) = match long_context {
+        Some(rates) => (
+            rates.input,
+            rates.cache_read,
+            rates.cache_write,
+            rates.output,
+        ),
+        None => (
+            rates.input,
+            rates.cache_read,
+            rates.cache_write,
+            rates.output,
+        ),
+    };
+    let model_name = match long_context {
+        Some(rates) => format!(
+            "{} / {} > {}k*",
+            interner.resolve_provider(*provider),
+            interner.resolve_model(*model),
+            rates.threshold_tokens / 1_000
+        ),
+        None => format!(
             "{} / {}*",
             interner.resolve_provider(*provider),
             interner.resolve_model(*model)
         ),
-        format_rate(rates.input),
-        format_rate(rates.cache_read),
-        format_rate(rates.cache_write),
-        format_rate(rates.output),
+    };
+
+    vec![
+        // Every rate comes from an external source, never from the parsed
+        // bill data, so the whole row carries the estimated marker.
+        model_name,
+        format_rate(input),
+        format_rate(cache_read),
+        format_rate(cache_write),
+        format_rate(output),
     ]
 }
 
@@ -767,6 +806,34 @@ mod tests {
         assert_eq!(compact_count(48_579), "48.6k");
         assert_eq!(compact_count(1_000_000), "1.0M");
         assert_eq!(compact_count(1_958_181), "2.0M");
+    }
+
+    #[test]
+    fn pricing_rows_include_long_context_tier_and_threshold() {
+        let mut interner = Interner::default();
+        let provider = interner.intern_provider("github-copilot");
+        let model = interner.intern_model("gpt-5.6-sol");
+        let key = (provider, model);
+        let rates = ModelRates {
+            input: Some(5.0),
+            cache_read: Some(0.5),
+            cache_write: None,
+            output: Some(30.0),
+            long_context: Some(LongContextRates {
+                threshold_tokens: 272_000,
+                input: Some(10.0),
+                cache_read: Some(1.0),
+                cache_write: None,
+                output: Some(45.0),
+            }),
+        };
+
+        let rows = pricing_rows((&key, &rates), &interner);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "github-copilot / gpt-5.6-sol*");
+        assert_eq!(rows[1][0], "github-copilot / gpt-5.6-sol > 272k*");
+        assert_eq!(rows[1][1], "$10.000");
     }
 
     #[test]
@@ -1080,6 +1147,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 output: Some(1.0),
+                long_context: None,
             },
         );
         pricing.insert(
@@ -1089,6 +1157,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 output: Some(1.0),
+                long_context: None,
             },
         );
 
@@ -1167,6 +1236,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 output: Some(2.0),
+                long_context: None,
             },
         );
 
@@ -1385,6 +1455,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 output: Some(2.0),
+                long_context: None,
             },
         );
 

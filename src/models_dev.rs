@@ -37,11 +37,12 @@ pub(crate) struct PriceInfo {
 // Effort suffixes — model-id variants share their base price
 // ---------------------------------------------------------------------------
 
-/// Effort-variant suffixes stripped before catalog lookup.
+/// Model-variant suffixes stripped before catalog lookup.
 ///
-/// OpenCode model ids carry these suffixes (e.g. `gpt-4o-high`); the base
-/// id's list price is the best generic approximation.
-pub(crate) const EFFORT_SUFFIXES: [&str; 5] = ["-xhigh", "-high", "-medium", "-low", "-none"];
+/// OpenCode model ids carry suffixes such as `-high` and `-max`; the base
+/// model's list price is the best generic approximation.
+pub(crate) const EFFORT_SUFFIXES: [&str; 6] =
+    ["-xhigh", "-high", "-medium", "-low", "-max", "-none"];
 
 // ---------------------------------------------------------------------------
 // ModelCatalog — dense SoA static lookup
@@ -163,6 +164,7 @@ impl PricingSource for ModelsDevFallback {
             cache_read: None,
             cache_write: None,
             output: Some(info.output_per_mtok),
+            long_context: None,
         })
     }
 }
@@ -275,6 +277,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 output: Some(10.00),
+                long_context: None,
             })
         );
     }

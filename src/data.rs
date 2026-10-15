@@ -370,12 +370,11 @@ pub(crate) struct UsageRow {
     pub(crate) tokens: Tokens,
     /// Cost of the call in micro-dollars.
     pub(crate) cost_micros: i64,
-    /// Whether the recorded cost is zero because no price was known.
+    /// Whether any part of this row's cost was estimated from model rates.
     ///
-    /// Subscription usage usually carries no per-call price; such calls can
-    /// be billed at a known rate instead of showing a zero row.  Negative
-    /// provider corrections also clamp to zero but are never re-priced.
-    pub(crate) cost_unknown: bool,
+    /// Includes zero-cost calls priced from known rates and Copilot calls
+    /// whose default-tier recorded cost was adjusted for long context.
+    pub(crate) cost_estimated: bool,
     /// Time the model endpoint was busy, in milliseconds.
     pub(crate) api_ms: u64,
     /// Message creation timestamp (Unix millis).
@@ -403,8 +402,8 @@ pub(crate) struct UsageStore {
     pub(crate) tokens: Vec<Tokens>,
     /// Cost component lane, in micro-dollars.
     pub(crate) costs_micros: Vec<i64>,
-    /// Unknown-cost flag lane (zero-cost calls that may be re-priced).
-    pub(crate) cost_unknown: Vec<bool>,
+    /// Whether each cost contains an estimated amount.
+    pub(crate) cost_estimated: Vec<bool>,
     /// Endpoint-busy time component lane, in milliseconds.
     pub(crate) api_ms: Vec<u64>,
     /// Created timestamps of every call with one recorded.
@@ -433,7 +432,7 @@ impl UsageStore {
         self.models.push(row.model);
         self.tokens.push(row.tokens);
         self.costs_micros.push(row.cost_micros);
-        self.cost_unknown.push(row.cost_unknown);
+        self.cost_estimated.push(row.cost_estimated);
         self.api_ms.push(row.api_ms);
         self.created.push(row.created.unwrap_or(0));
         self.created_mask.push(present_bit(row.created.is_some()));
@@ -454,17 +453,22 @@ impl UsageStore {
             .is_some_and(|generation| *generation == entity.generation())
     }
 
-    /// Overwrites one call's cost lane slot; `false` when the entity is
-    /// stale or out of range (checked access, never a panic).
-    pub(crate) fn set_cost_micros(&mut self, entity: Entity, micros: i64) -> bool {
+    /// Overwrites an estimated call cost and marks its estimate lane; `false`
+    /// when the entity is stale or out of range.
+    pub(crate) fn set_estimated_cost_micros(&mut self, entity: Entity, micros: i64) -> bool {
         if !self.validate(entity) {
             return false;
         }
-        let Some(slot) = self.costs_micros.get_mut(entity.id() as usize) else {
+        let index = entity.id() as usize;
+        let Some(cost_slot) = self.costs_micros.get_mut(index) else {
+            return false;
+        };
+        let Some(estimated_slot) = self.cost_estimated.get_mut(index) else {
             return false;
         };
 
-        *slot = micros;
+        *cost_slot = micros;
+        *estimated_slot = true;
         true
     }
 
@@ -476,9 +480,9 @@ impl UsageStore {
         debug_assert_eq!(self.tokens.len(), self.len(), "tokens lane length");
         debug_assert_eq!(self.costs_micros.len(), self.len(), "cost lane length");
         debug_assert_eq!(
-            self.cost_unknown.len(),
+            self.cost_estimated.len(),
             self.len(),
-            "unknown-cost lane length"
+            "estimated-cost lane length"
         );
         debug_assert_eq!(self.api_ms.len(), self.len(), "api-time lane length");
         debug_assert_eq!(self.created.len(), self.len(), "created lane length");
@@ -503,7 +507,7 @@ impl UsageStore {
             .zip(self.models.iter().copied())
             .zip(self.tokens.iter().copied())
             .zip(self.costs_micros.iter().copied())
-            .zip(self.cost_unknown.iter().copied())
+            .zip(self.cost_estimated.iter().copied())
             .zip(self.api_ms.iter().copied())
             .zip(self.created.iter().copied())
             .zip(self.created_mask.iter().copied())
@@ -515,7 +519,7 @@ impl UsageStore {
                 let (row, created_mask) = row;
                 let (row, created) = row;
                 let (row, api_ms) = row;
-                let (row, cost_unknown) = row;
+                let (row, cost_estimated) = row;
                 let (row, cost_micros) = row;
                 let (row, tokens) = row;
                 let (row, model) = row;
@@ -529,7 +533,7 @@ impl UsageStore {
                     model,
                     tokens,
                     cost_micros,
-                    cost_unknown,
+                    cost_estimated,
                     api_ms,
                     created: presence_bit(created_mask).then_some(created),
                     completed: presence_bit(completed_mask).then_some(completed),
@@ -615,7 +619,7 @@ impl Totals {
         self.requests += 1;
         self.tokens += &row.tokens;
         self.cost = cost_add(self.cost, cost_from_micros(row.cost_micros));
-        if row.cost_unknown && row.cost_micros > 0 {
+        if row.cost_estimated && row.cost_micros > 0 {
             self.estimated_cost = cost_add(self.estimated_cost, cost_from_micros(row.cost_micros));
         }
         self.api_ms = self.api_ms.saturating_add(row.api_ms);
@@ -647,6 +651,23 @@ pub(crate) struct AgentUsage {
 /// Model pricing per million tokens.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ModelRates {
+    /// Input token rate in USD per million.
+    pub(crate) input: Option<f64>,
+    /// Cached-input token rate in USD per million.
+    pub(crate) cache_read: Option<f64>,
+    /// Cache-write token rate in USD per million.
+    pub(crate) cache_write: Option<f64>,
+    /// Output token rate in USD per million.
+    pub(crate) output: Option<f64>,
+    /// Optional higher rates for requests above a model's context threshold.
+    pub(crate) long_context: Option<LongContextRates>,
+}
+
+/// Pricing tier for requests above the default context threshold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LongContextRates {
+    /// Total input-context tokens that activate this tier when exceeded.
+    pub(crate) threshold_tokens: u64,
     /// Input token rate in USD per million.
     pub(crate) input: Option<f64>,
     /// Cached-input token rate in USD per million.
@@ -706,7 +727,7 @@ mod tests {
             model: interner.intern_model("gpt-test"),
             tokens: Tokens::default(),
             cost_micros: 125_000,
-            cost_unknown: false,
+            cost_estimated: false,
             api_ms: 0,
             created: Some(1),
             completed: None,
@@ -722,7 +743,7 @@ mod tests {
         assert_eq!(store.models.len(), 2);
         assert_eq!(store.tokens.len(), 2);
         assert_eq!(store.costs_micros.len(), 2);
-        assert_eq!(store.cost_unknown.len(), 2);
+        assert_eq!(store.cost_estimated.len(), 2);
         assert_eq!(store.api_ms.len(), 2);
         assert_eq!(store.created.len(), 2);
         assert_eq!(store.created_mask.len(), 2);
@@ -778,15 +799,15 @@ mod tests {
     }
 
     #[test]
-    fn set_cost_micros_refuses_stale_or_foreign_entities() {
+    fn set_estimated_cost_micros_refuses_stale_or_foreign_entities() {
         let mut store = UsageStore::default();
         store.push(usage_row_default());
 
-        assert!(!store.set_cost_micros(Entity::new(0, 1), 7));
-        assert!(!store.set_cost_micros(Entity::new(1, 0), 7));
+        assert!(!store.set_estimated_cost_micros(Entity::new(0, 1), 7));
+        assert!(!store.set_estimated_cost_micros(Entity::new(1, 0), 7));
         assert_eq!(store.costs_micros[0], 0);
 
-        assert!(store.set_cost_micros(Entity::new(0, 0), 7));
+        assert!(store.set_estimated_cost_micros(Entity::new(0, 0), 7));
         assert_eq!(store.costs_micros[0], 7);
     }
 
@@ -804,9 +825,9 @@ mod tests {
         assert!(store.validate(Entity::new(0, 5)));
         assert!(!store.validate(Entity::new(0, 0)));
 
-        assert!(store.set_cost_micros(Entity::new(0, 5), 9));
+        assert!(store.set_estimated_cost_micros(Entity::new(0, 5), 9));
         assert_eq!(store.costs_micros[0], 9);
-        assert!(!store.set_cost_micros(Entity::new(0, 0), 1));
+        assert!(!store.set_estimated_cost_micros(Entity::new(0, 0), 1));
         assert_eq!(store.costs_micros[0], 9);
     }
 
@@ -896,7 +917,7 @@ mod tests {
             model: ModelId(0),
             tokens: Tokens::default(),
             cost_micros: 0,
-            cost_unknown: false,
+            cost_estimated: false,
             api_ms: 0,
             created: None,
             completed: None,

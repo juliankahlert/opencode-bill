@@ -483,8 +483,8 @@ struct ParsedRow {
     tokens: Tokens,
     /// Cost of the call in micro-dollars.
     cost_micros: i64,
-    /// Whether the recorded cost is zero because no price was known.
-    cost_unknown: bool,
+    /// Whether the recorded cost is zero and eligible for rate estimation.
+    cost_estimated: bool,
     /// Time the model endpoint was busy, in milliseconds.
     api_ms: u64,
     /// Message creation timestamp (Unix millis).
@@ -621,7 +621,7 @@ fn parse_assistant_row(
     // example subscription usage) and the call can be billed at a known
     // rate; a negative cost is a provider correction, which is clamped to
     // zero and must never be re-priced.
-    let cost_unknown = cost == 0.0;
+    let cost_estimated = cost == 0.0;
 
     // Providers correct over-counted usage with a negative charge; a bill
     // cannot show negative usage, so clamp the charge to zero.
@@ -634,7 +634,7 @@ fn parse_assistant_row(
         model,
         tokens: usage,
         cost_micros,
-        cost_unknown,
+        cost_estimated,
         api_ms: message_api_ms(created, completed, tools),
         created,
         completed,
@@ -862,7 +862,7 @@ pub(crate) fn parse_message_batch(
             model: world.interner.intern_model(&row.model),
             tokens: row.tokens,
             cost_micros: row.cost_micros,
-            cost_unknown: row.cost_unknown,
+            cost_estimated: row.cost_estimated,
             api_ms: row.api_ms,
             created: row.created,
             completed: row.completed,
@@ -1033,7 +1033,7 @@ mod tests {
                 assert_eq!(batched.tokens.cache_read, whole.tokens.cache_read);
                 assert_eq!(batched.tokens.cache_write, whole.tokens.cache_write);
                 assert_eq!(batched.cost_micros, whole.cost_micros);
-                assert_eq!(batched.cost_unknown, whole.cost_unknown);
+                assert_eq!(batched.cost_estimated, whole.cost_estimated);
                 assert_eq!(batched.api_ms, whole.api_ms);
                 assert_eq!(batched.created, whole.created);
                 assert_eq!(batched.completed, whole.completed);
@@ -1332,7 +1332,7 @@ mod tests {
             .rows()
             .next()
             .ok_or("expected one usage row")?;
-        assert!(row.cost_unknown);
+        assert!(row.cost_estimated);
         assert_eq!(row.cost_micros, 0);
         assert_eq!(row.tokens.input, 0);
         assert_eq!(row.tokens.cache_read, 0);

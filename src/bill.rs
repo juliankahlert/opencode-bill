@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::aggregate::{StreamedAggregates, aggregate, aggregate_agents, month_weeks};
 use crate::context::{StorageContext, Store};
 use crate::data::{
-    AgentId, AgentUsage, BillProgress, ModelKey, ModelRates, SessionId, Totals, UsageRow,
+    AgentId, AgentUsage, BillProgress, Interner, ModelKey, ModelRates, SessionId, Totals, UsageRow,
     UsageStore, World,
 };
 use crate::error::BillError;
@@ -951,7 +951,7 @@ fn blocking_block_on<F: Future>(future: F) -> Result<F::Output, BillError> {
     Ok(handle.block_on(future))
 }
 
-/// Folds one row with the estimated cost of its unknown-price call.
+/// Folds one row with its missing or context-adjusted estimated cost.
 ///
 /// Rates resolve lazily per model key, exactly like a whole-window
 /// [`pricing::load_pricing`] lookup: catalog, GitHub, generic fallback, then
@@ -964,7 +964,9 @@ fn estimate_streamed_cost(
     github: &pricing::GithubSource,
     world: &World,
 ) -> UsageRow {
-    if !row.cost_unknown {
+    let is_copilot = world.interner.resolve_provider(row.provider) == "github-copilot";
+
+    if !row.cost_estimated && !is_copilot {
         return row;
     }
 
@@ -982,9 +984,20 @@ fn estimate_streamed_cost(
         }
     };
 
-    match rates {
-        Some(rates) => UsageRow {
-            cost_micros: pricing::estimated_cost_micros(&row.tokens, &rates),
+    let estimated_cost = rates.and_then(|rates| {
+        if row.cost_estimated {
+            Some(pricing::estimated_cost_micros(&row.tokens, &rates))
+        } else if is_copilot {
+            pricing::reprice_default_context_cost(row.cost_micros, &row.tokens, &rates)
+        } else {
+            None
+        }
+    });
+
+    match estimated_cost {
+        Some(cost_micros) => UsageRow {
+            cost_micros,
+            cost_estimated: true,
             ..row
         },
         None => row,
@@ -1155,7 +1168,7 @@ async fn price_system_async(
         &github,
     )?;
 
-    estimate_zero_costs(&mut world.entities, &pricing);
+    apply_estimated_pricing(&mut world.entities, &pricing, &world.interner);
     Ok(pricing)
 }
 
@@ -1208,34 +1221,41 @@ fn render_system(
     )
 }
 
-/// Fills in an estimated cost for calls whose recorded cost is unknown.
+/// Estimates unknown costs and corrects default-priced Copilot long contexts.
 ///
 /// Subscription usage often has no per-call price recorded; when a rate is
 /// known for the provider/model pair, the call is billed at that rate
 /// instead of leaving a zero row.  Provider corrections are never re-priced.
-fn estimate_zero_costs(store: &mut UsageStore, pricing: &BTreeMap<ModelKey, ModelRates>) {
-    // The store is borrowed read-only while its rows enumerate, so the cost
-    // writes are deferred until after the walk: only the rows that actually
-    // need a price are kept, never a full store copy.
+fn apply_estimated_pricing(
+    store: &mut UsageStore,
+    pricing: &BTreeMap<ModelKey, ModelRates>,
+    interner: &Interner,
+) {
+    // The store is borrowed read-only while its rows enumerate, so cost writes
+    // are deferred until after the walk; only adjusted rows are retained.
     let writes = store
         .entities()
-        .filter(|(entity, row)| {
-            // Every lookup is gated through validate: stale or foreign
-            // handles are never written, even though this store's own
-            // enumeration can only produce valid handles.
-            store.validate(*entity) && row.cost_unknown
-        })
         .filter_map(|(entity, row)| {
-            pricing
-                .get(&(row.provider, row.model))
-                .map(|rates| (entity, pricing::estimated_cost_micros(&row.tokens, rates)))
+            if !store.validate(entity) {
+                return None;
+            }
+
+            let rates = pricing.get(&(row.provider, row.model))?;
+            let estimated_cost = if row.cost_estimated {
+                Some(pricing::estimated_cost_micros(&row.tokens, rates))
+            } else if interner.resolve_provider(row.provider) == "github-copilot" {
+                pricing::reprice_default_context_cost(row.cost_micros, &row.tokens, rates)
+            } else {
+                None
+            }?;
+
+            Some((entity, estimated_cost))
         })
         .collect::<Vec<_>>();
 
     writes.into_iter().for_each(|(entity, micros)| {
-        // The entity came from this store's own lanes, so the checked
-        // write cannot miss; ignore the defensive `false`.
-        let _ = store.set_cost_micros(entity, micros);
+        // Each write contains an external-rate estimate, not a recorded cost.
+        let _ = store.set_estimated_cost_micros(entity, micros);
     });
 }
 
@@ -1318,6 +1338,7 @@ fn keep_agents_with_usage(
 mod tests {
     use super::*;
     use crate::context::DATABASE_FILE;
+    use crate::data::LongContextRates;
     use crate::database::SqliteStore;
     use crate::legacy::LegacyStore;
     use crate::store::MESSAGE_BATCH_LIMIT;
@@ -2988,6 +3009,71 @@ Amount due:  $0.125000 USD
             ]
         ));
         assert!(bill.contains("Amount due:  $0.000043* USD"));
+        Ok(())
+    }
+
+    #[test]
+    fn reprices_default_costs_for_copilot_long_context() -> Result<(), Box<dyn std::error::Error>> {
+        let mut interner = Interner::default();
+        let provider = interner.intern_provider("github-copilot");
+        let model = interner.intern_model("gpt-5.6-sol");
+        let row = UsageRow {
+            session_id: interner.intern_session("ses_1"),
+            agent: interner.intern_agent("build"),
+            provider,
+            model,
+            tokens: crate::data::Tokens {
+                input: 271_000,
+                cache_read: 1_001,
+                ..crate::data::Tokens::default()
+            },
+            cost_micros: 1_355_500,
+            cost_estimated: false,
+            api_ms: 0,
+            created: None,
+            completed: None,
+        };
+        let rates = ModelRates {
+            input: Some(5.0),
+            cache_read: Some(0.5),
+            cache_write: None,
+            output: Some(30.0),
+            long_context: Some(LongContextRates {
+                threshold_tokens: 272_000,
+                input: Some(10.0),
+                cache_read: Some(1.0),
+                cache_write: None,
+                output: Some(45.0),
+            }),
+        };
+        let mut pricing = BTreeMap::from([((provider, model), rates)]);
+        let catalog = pricing::CatalogSource::new(None)?;
+        let github = pricing::GithubSource::default();
+        let world = World {
+            header: crate::report::BillHeader::Session {
+                id: "ses_1".to_owned(),
+                title: "Test".to_owned(),
+                created_ms: None,
+            },
+            session_count: 0,
+            sessions: crate::data::SessionTree::new(),
+            entities: UsageStore::default(),
+            wall_start: None,
+            wall_end: None,
+            interner,
+        };
+
+        let streamed = estimate_streamed_cost(row, &mut pricing, &catalog, &github, &world);
+        assert_eq!(streamed.cost_micros, 2_711_001);
+        assert!(streamed.cost_estimated);
+
+        let mut store = UsageStore::default();
+        store.push(row);
+        apply_estimated_pricing(&mut store, &pricing, &world.interner);
+        let stored = store.rows().next();
+
+        assert_eq!(stored.map(|row| row.cost_micros), Some(2_711_001));
+        assert_eq!(stored.map(|row| row.cost_estimated), Some(true));
         Ok(())
     }
 

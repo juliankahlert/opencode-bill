@@ -25,6 +25,13 @@ billed at the best known rate for its provider/model pair, so subscription
 usage shows an estimated cost instead of a zero row. Provider corrections
 with negative costs are clamped to zero and never re-priced.
 
+GitHub Copilot models with a long-context tier are priced per request using
+the documented threshold and rates. Input, cache-read, and cache-write
+tokens determine the request's context size. If a recorded Copilot cost
+matches the default-tier estimate but the request exceeds the threshold, the
+bill applies the long-context rate and marks that cost as estimated. The
+MODEL PRICING table shows a separate row for each long-context tier.
+
 Estimated figures are marked so they can be told apart from historic
 recorded prices: in plain-text bills every cost that includes any estimated
 amount (the COST column and the Amount due total) carries an asterisk, and
